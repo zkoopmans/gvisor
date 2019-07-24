@@ -1,6 +1,6 @@
 """Defines a rule for syscall test targets."""
 
-load("//tools:defs.bzl", "loopback")
+load("//tools:defs.bzl", "loopback", "runsc_platforms")
 
 def syscall_test(
         test,
@@ -34,25 +34,16 @@ def syscall_test(
         tags = tags,
     )
 
-    _syscall_test(
-        test = test,
-        shard_count = shard_count,
-        size = size,
-        platform = "kvm",
-        use_tmpfs = use_tmpfs,
-        add_uds_tree = add_uds_tree,
-        tags = tags,
-    )
-
-    _syscall_test(
-        test = test,
-        shard_count = shard_count,
-        size = size,
-        platform = "ptrace",
-        use_tmpfs = use_tmpfs,
-        add_uds_tree = add_uds_tree,
-        tags = tags,
-    )
+    for platform in runsc_platforms():
+        _syscall_test(
+            test = test,
+            shard_count = shard_count,
+            size = size,
+            platform = platform,
+            use_tmpfs = use_tmpfs,
+            add_uds_tree = add_uds_tree,
+            tags = tags,
+        )
 
     if add_overlay:
         _syscall_test(

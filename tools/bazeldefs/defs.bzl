@@ -92,3 +92,6 @@ def default_installer():
 
 def default_net_util():
     return []  # Nothing needed.
+
+def runsc_platforms():
+    return ["ptrace", "kvm"]
