@@ -39,7 +39,9 @@ import (
 
 func newNetDir(root *auth.Credentials, inoGen InoGenerator, k *kernel.Kernel) *kernfs.Dentry {
 	var contents map[string]*kernfs.Dentry
-	if stack := k.NetworkStack(); stack != nil {
+	// TODO(gvisor.dev/issue/1833): Support for using the network stack in the
+	// network namespace of the calling process.
+	if stack := k.RootNetworkNamespace().Stack(); stack != nil {
 		const (
 			arp       = "IP address       HW type     Flags       HW address            Mask     Device\n"
 			netlink   = "sk       Eth Pid    Groups   Rmem     Wmem     Dump     Locks     Drops     Inode\n"

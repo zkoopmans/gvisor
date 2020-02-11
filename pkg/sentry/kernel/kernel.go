@@ -105,7 +105,7 @@ type Kernel struct {
 	timekeeper                  *Timekeeper
 	tasks                       *TaskSet
 	rootUserNamespace           *auth.UserNamespace
-	networkStack                inet.Stack `state:"nosave"`
+	rootNetworkNamespace        *inet.NetworkNamespace
 	applicationCores            uint
 	useHostCores                bool
 	extraAuxv                   []arch.AuxEntry
@@ -251,8 +251,9 @@ type InitKernelArgs struct {
 	// RootUserNamespace is the root user namespace.
 	RootUserNamespace *auth.UserNamespace
 
-	// NetworkStack is the TCP/IP network stack. NetworkStack may be nil.
-	NetworkStack inet.Stack
+	// RootNetworkNamespace is the root network namespace. If nil, no networking
+	// will be available.
+	RootNetworkNamespace *inet.NetworkNamespace
 
 	// ApplicationCores is the number of logical CPUs visible to sandboxed
 	// applications. The set of logical CPU IDs is [0, ApplicationCores); thus
@@ -311,7 +312,10 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.rootUTSNamespace = args.RootUTSNamespace
 	k.rootIPCNamespace = args.RootIPCNamespace
 	k.rootAbstractSocketNamespace = args.RootAbstractSocketNamespace
-	k.networkStack = args.NetworkStack
+	k.rootNetworkNamespace = args.RootNetworkNamespace
+	if k.rootNetworkNamespace == nil {
+		k.rootNetworkNamespace = inet.NewRootNetworkNamespace(nil, nil)
+	}
 	k.applicationCores = args.ApplicationCores
 	if args.UseHostCores {
 		k.useHostCores = true
@@ -534,8 +538,6 @@ func (ts *TaskSet) unregisterEpollWaiters() {
 func (k *Kernel) LoadFrom(r io.Reader, net inet.Stack, clocks sentrytime.Clocks) error {
 	loadStart := time.Now()
 
-	k.networkStack = net
-
 	initAppCores := k.applicationCores
 
 	// Load the pre-saved CPUID FeatureSet.
@@ -565,6 +567,10 @@ func (k *Kernel) LoadFrom(r io.Reader, net inet.Stack, clocks sentrytime.Clocks)
 	}
 	log.Infof("Kernel load stats: %s", &stats)
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
+
+	// rootNetworkNamespace should be populated after loading the state file.
+	// Restore the root network stack.
+	k.rootNetworkNamespace.RestoreRootStack(net)
 
 	// Load the memory file's state.
 	memoryStart := time.Now()
@@ -837,6 +843,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		FSContext:               newFSContext(root, wd, args.Umask),
 		FDTable:                 args.FDTable,
 		Credentials:             args.Credentials,
+		ParentNetworkNamespace:  k.RootNetworkNamespace(),
 		AllowedCPUMask:          sched.NewFullCPUSet(k.applicationCores),
 		UTSNamespace:            args.UTSNamespace,
 		IPCNamespace:            args.IPCNamespace,
@@ -1178,10 +1185,9 @@ func (k *Kernel) RootAbstractSocketNamespace() *AbstractSocketNamespace {
 	return k.rootAbstractSocketNamespace
 }
 
-// NetworkStack returns the network stack. NetworkStack may return nil if no
-// network stack is available.
-func (k *Kernel) NetworkStack() inet.Stack {
-	return k.networkStack
+// RootNetworkNamespace returns the root network namespace, always non-nil.
+func (k *Kernel) RootNetworkNamespace() *inet.NetworkNamespace {
+	return k.rootNetworkNamespace
 }
 
 // GlobalInit returns the thread group with ID 1 in the root PID namespace, or

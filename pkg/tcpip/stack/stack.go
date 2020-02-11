@@ -527,6 +527,15 @@ type Options struct {
 	OpaqueIIDOpts OpaqueInterfaceIdentifierOptions
 }
 
+func (opts *Options) initDefaults() {
+	if opts.Clock == nil {
+		opts.Clock = &tcpip.StdClock{}
+	}
+	if opts.UniqueID == nil {
+		opts.UniqueID = new(uniqueIDGenerator)
+	}
+}
+
 // TransportEndpointInfo holds useful information about a transport endpoint
 // which can be queried by monitoring tools.
 //
@@ -609,14 +618,7 @@ func (*TransportEndpointInfo) IsEndpointInfo() {}
 // stack. Please refer to individual protocol implementations as to what options
 // are supported.
 func New(opts Options) *Stack {
-	clock := opts.Clock
-	if clock == nil {
-		clock = &tcpip.StdClock{}
-	}
-
-	if opts.UniqueID == nil {
-		opts.UniqueID = new(uniqueIDGenerator)
-	}
+	opts.initDefaults()
 
 	// Make sure opts.NDPConfigs contains valid values only.
 	opts.NDPConfigs.validate()
@@ -629,7 +631,7 @@ func New(opts Options) *Stack {
 		cleanupEndpoints:     make(map[TransportEndpoint]struct{}),
 		linkAddrCache:        newLinkAddrCache(ageLimit, resolutionTimeout, resolutionAttempts),
 		PortManager:          ports.NewPortManager(),
-		clock:                clock,
+		clock:                opts.Clock,
 		stats:                opts.Stats.FillIn(),
 		handleLocal:          opts.HandleLocal,
 		icmpRateLimiter:      NewICMPRateLimiter(),

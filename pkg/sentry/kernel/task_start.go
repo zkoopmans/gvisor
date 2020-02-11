@@ -17,6 +17,7 @@ package kernel
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
@@ -64,9 +65,14 @@ type TaskConfig struct {
 	// Niceness is the niceness of the new task.
 	Niceness int
 
-	// If NetworkNamespaced is true, the new task should observe a non-root
-	// network namespace.
-	NetworkNamespaced bool
+	// If NewNetworkNamespace is true, the new task should observe a new network
+	// namespace.
+	NewNetworkNamespace bool
+
+	// ParentNetworkNamespace is the network namespace to be inherit from parent
+	// process, or to create network namespace from if NewNetworkNamespace is
+	// true.
+	ParentNetworkNamespace *inet.NetworkNamespace
 
 	// AllowedCPUMask contains the cpus that this task can run on.
 	AllowedCPUMask sched.CPUSet
@@ -129,7 +135,7 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
 		ioUsage:         &usage.IO{},
 		niceness:        cfg.Niceness,
-		netns:           cfg.NetworkNamespaced,
+		netns:           cfg.ParentNetworkNamespace,
 		utsns:           cfg.UTSNamespace,
 		ipcns:           cfg.IPCNamespace,
 		abstractSockets: cfg.AbstractSocketNamespace,
@@ -169,6 +175,10 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	// (since t now has thread IDs).
 	t.updateInfoLocked()
 
+	if cfg.NewNetworkNamespace {
+		pid := ts.rootIDOfTaskLocked(t)
+		t.netns = inet.NewNetworkNamespace(t.netns, inet.NSID(pid))
+	}
 	if cfg.InheritParent != nil {
 		t.parent = cfg.InheritParent.parent
 	}

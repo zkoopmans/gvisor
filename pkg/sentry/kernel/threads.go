@@ -105,6 +105,17 @@ func (ts *TaskSet) forEachThreadGroupLocked(f func(tg *ThreadGroup)) {
 	}
 }
 
+// rootIDOfTaskLocked returns the thread ID of the task in the root PID
+// namespace.
+//
+// Preconditions: ts.mu is locked for read or exclusively.
+func (ts *TaskSet) rootIDOfTaskLocked(t *Task) ThreadID {
+	if ts == ts.Root.owner {
+		return ts.Root.idOfTaskLocked(t)
+	}
+	return ts.Root.IDOfTask(t)
+}
+
 // A PIDNamespace represents a PID namespace, a bimap between thread IDs and
 // tasks. See the pid_namespaces(7) man page for further details.
 //
@@ -234,6 +245,11 @@ func (ns *PIDNamespace) IDOfTask(t *Task) ThreadID {
 	id := ns.tids[t]
 	ns.owner.mu.RUnlock()
 	return id
+}
+
+// Preconditions: ns.owner.mu is locked for read or exclusively.
+func (ns *PIDNamespace) idOfTaskLocked(t *Task) ThreadID {
+	return ns.tids[t]
 }
 
 // IDOfThreadGroup returns the TID assigned to tg's leader in PID namespace ns.

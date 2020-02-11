@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "context.go",
         "inet.go",
+        "network_namespace.go",
         "test_stack.go",
     ],
     deps = [

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package boot
+// Package pprof provides stub to initialize custom profilers.
+package pprof
 
-func initializePProf() {
+// InitializePProf will be called at boot for initializing custom profilers.
+func InitializePProf() {
 }
