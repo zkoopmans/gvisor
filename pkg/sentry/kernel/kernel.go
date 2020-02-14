@@ -1100,6 +1100,16 @@ func (k *Kernel) SendExternalSignal(info *arch.SignalInfo, context string) {
 	k.sendExternalSignal(info, context)
 }
 
+// SendExternalSignalTg injects a signal into an specific ThreadGroup. This
+// function doesn't skip signals like SendExternalSignal does.
+//
+// Preconditions: Kernel must have an init process.
+func (k *Kernel) SendExternalSignalTg(tg *ThreadGroup, info *arch.SignalInfo) error {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	return tg.SendSignal(info)
+}
+
 // SendContainerSignal sends the given signal to all processes inside the
 // namespace that match the given container ID.
 func (k *Kernel) SendContainerSignal(cid string, info *arch.SignalInfo) error {
