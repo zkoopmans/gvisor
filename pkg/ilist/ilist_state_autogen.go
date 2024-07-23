@@ -3,36 +3,68 @@
 package ilist
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *List) beforeSave() {}
-func (x *List) save(m state.Map) {
-	x.beforeSave()
-	m.Save("head", &x.head)
-	m.Save("tail", &x.tail)
+func (l *List) StateTypeName() string {
+	return "pkg/ilist.List"
 }
 
-func (x *List) afterLoad() {}
-func (x *List) load(m state.Map) {
-	m.Load("head", &x.head)
-	m.Load("tail", &x.tail)
+func (l *List) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
 }
 
-func (x *Entry) beforeSave() {}
-func (x *Entry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("next", &x.next)
-	m.Save("prev", &x.prev)
+func (l *List) beforeSave() {}
+
+// +checklocksignore
+func (l *List) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
 }
 
-func (x *Entry) afterLoad() {}
-func (x *Entry) load(m state.Map) {
-	m.Load("next", &x.next)
-	m.Load("prev", &x.prev)
+func (l *List) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *List) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *Entry) StateTypeName() string {
+	return "pkg/ilist.Entry"
+}
+
+func (e *Entry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *Entry) beforeSave() {}
+
+// +checklocksignore
+func (e *Entry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *Entry) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *Entry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func init() {
-	state.Register("pkg/ilist.List", (*List)(nil), state.Fns{Save: (*List).save, Load: (*List).load})
-	state.Register("pkg/ilist.Entry", (*Entry)(nil), state.Fns{Save: (*Entry).save, Load: (*Entry).load})
+	state.Register((*List)(nil))
+	state.Register((*Entry)(nil))
 }

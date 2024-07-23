@@ -90,9 +90,9 @@ func (s *SACKScoreboard) Insert(r header.SACKBlock) {
 		// There is some overlap at this point, merge the blocks and
 		// delete the other one.
 		//
-		// ----sS--------sE
-		// r.S---------------rE
-		//               -------sE
+		//	----sS--------sE
+		//	r.S---------------rE
+		//	              -------sE
 		if sacked.End.LessThan(r.End) {
 			// sacked is contained in the newly inserted range.
 			// Delete this block.
@@ -164,7 +164,7 @@ func (s *SACKScoreboard) IsSACKED(r header.SACKBlock) bool {
 	return found
 }
 
-// Dump prints the state of the scoreboard structure.
+// String returns human-readable state of the scoreboard structure.
 func (s *SACKScoreboard) String() string {
 	var str strings.Builder
 	str.WriteString("SACKScoreboard: {")

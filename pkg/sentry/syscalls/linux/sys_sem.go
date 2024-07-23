@@ -16,21 +16,23 @@ package linux
 
 import (
 	"math"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 )
 
 const opsMax = 500 // SEMOPM
 
 // Semget handles: semget(key_t key, int nsems, int semflg)
-func Semget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	key := args[0].Int()
+func Semget(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	key := ipc.Key(args[0].Int())
 	nsems := args[1].Int()
 	flag := args[2].Int()
 
@@ -44,50 +46,92 @@ func Semget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	if err != nil {
 		return 0, nil, err
 	}
-	return uintptr(set.ID), nil, nil
+	return uintptr(set.ID()), nil, nil
 }
 
-// Semop handles: semop(int semid, struct sembuf *sops, size_t nsops)
-func Semop(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := args[0].Int()
+// Semtimedop handles: semop(int semid, struct sembuf *sops, size_t nsops, const struct timespec *timeout)
+func Semtimedop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	// If the timeout argument is NULL, then semtimedop() behaves exactly like semop().
+	if args[3].Pointer() == 0 {
+		return Semop(t, sysno, args)
+	}
+
+	id := ipc.ID(args[0].Int())
 	sembufAddr := args[1].Pointer()
 	nsops := args[2].SizeT()
-
-	r := t.IPCNamespace().SemaphoreRegistry()
-	set := r.FindByID(id)
-	if set == nil {
-		return 0, nil, syserror.EINVAL
-	}
+	timespecAddr := args[3].Pointer()
 	if nsops <= 0 {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 	if nsops > opsMax {
-		return 0, nil, syserror.E2BIG
+		return 0, nil, linuxerr.E2BIG
 	}
 
 	ops := make([]linux.Sembuf, nsops)
-	if _, err := t.CopyIn(sembufAddr, ops); err != nil {
+	if _, err := linux.CopySembufSliceIn(t, sembufAddr, ops); err != nil {
 		return 0, nil, err
 	}
 
+	var timeout linux.Timespec
+	if _, err := timeout.CopyIn(t, timespecAddr); err != nil {
+		return 0, nil, err
+	}
+	if timeout.Sec < 0 || timeout.Nsec < 0 || timeout.Nsec >= 1e9 {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	if err := semTimedOp(t, id, ops, true, timeout.ToDuration()); err != nil {
+		if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
+			return 0, nil, linuxerr.EAGAIN
+		}
+		return 0, nil, err
+	}
+	return 0, nil, nil
+}
+
+// Semop handles: semop(int semid, struct sembuf *sops, size_t nsops)
+func Semop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	id := ipc.ID(args[0].Int())
+	sembufAddr := args[1].Pointer()
+	nsops := args[2].SizeT()
+
+	if nsops <= 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if nsops > opsMax {
+		return 0, nil, linuxerr.E2BIG
+	}
+
+	ops := make([]linux.Sembuf, nsops)
+	if _, err := linux.CopySembufSliceIn(t, sembufAddr, ops); err != nil {
+		return 0, nil, err
+	}
+	return 0, nil, semTimedOp(t, id, ops, false, time.Second)
+}
+
+func semTimedOp(t *kernel.Task, id ipc.ID, ops []linux.Sembuf, haveTimeout bool, timeout time.Duration) error {
+	set := t.IPCNamespace().SemaphoreRegistry().FindByID(id)
+
+	if set == nil {
+		return linuxerr.EINVAL
+	}
 	creds := auth.CredentialsFromContext(t)
 	pid := t.Kernel().GlobalInit().PIDNamespace().IDOfThreadGroup(t.ThreadGroup())
 	for {
 		ch, num, err := set.ExecuteOps(t, ops, creds, int32(pid))
 		if ch == nil || err != nil {
-			// We're done (either on success or a failure).
-			return 0, nil, err
+			return err
 		}
-		if err = t.Block(ch); err != nil {
+		if _, err = t.BlockWithTimeout(ch, haveTimeout, timeout); err != nil {
 			set.AbortWait(num, ch)
-			return 0, nil, err
+			return err
 		}
 	}
 }
 
 // Semctl handles: semctl(int semid, int semnum, int cmd, ...)
-func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := args[0].Int()
+func Semctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	id := ipc.ID(args[0].Int())
 	num := args[1].Int()
 	cmd := args[2].Int()
 
@@ -95,7 +139,7 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	case linux.SETVAL:
 		val := args[3].Int()
 		if val > math.MaxInt16 {
-			return 0, nil, syserror.ERANGE
+			return 0, nil, linuxerr.ERANGE
 		}
 		return 0, nil, setVal(t, id, num, int16(val))
 
@@ -116,79 +160,152 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 
 	case linux.IPC_SET:
 		arg := args[3].Pointer()
-		s := linux.SemidDS{}
-		if _, err := t.CopyIn(arg, &s); err != nil {
+		var s linux.SemidDS
+		if _, err := s.CopyIn(t, arg); err != nil {
 			return 0, nil, err
 		}
 
-		perms := fs.FilePermsFromMode(linux.FileMode(s.SemPerm.Mode & 0777))
-		return 0, nil, ipcSet(t, id, auth.UID(s.SemPerm.UID), auth.GID(s.SemPerm.GID), perms)
+		return 0, nil, ipcSet(t, id, &s)
 
 	case linux.GETPID:
 		v, err := getPID(t, id, num)
 		return uintptr(v), nil, err
 
-	case linux.IPC_INFO,
-		linux.SEM_INFO,
-		linux.IPC_STAT,
-		linux.SEM_STAT,
-		linux.SEM_STAT_ANY,
-		linux.GETNCNT,
-		linux.GETZCNT:
+	case linux.IPC_STAT:
+		arg := args[3].Pointer()
+		ds, err := ipcStat(t, id)
+		if err == nil {
+			_, err = ds.CopyOut(t, arg)
+		}
 
-		t.Kernel().EmitUnimplementedEvent(t)
-		fallthrough
+		return 0, nil, err
+
+	case linux.GETZCNT:
+		v, err := getZCnt(t, id, num)
+		return uintptr(v), nil, err
+
+	case linux.GETNCNT:
+		v, err := getNCnt(t, id, num)
+		return uintptr(v), nil, err
+
+	case linux.IPC_INFO:
+		buf := args[3].Pointer()
+		r := t.IPCNamespace().SemaphoreRegistry()
+		info := r.IPCInfo()
+		if _, err := info.CopyOut(t, buf); err != nil {
+			return 0, nil, err
+		}
+		return uintptr(r.HighestIndex()), nil, nil
+
+	case linux.SEM_INFO:
+		buf := args[3].Pointer()
+		r := t.IPCNamespace().SemaphoreRegistry()
+		info := r.SemInfo()
+		if _, err := info.CopyOut(t, buf); err != nil {
+			return 0, nil, err
+		}
+		return uintptr(r.HighestIndex()), nil, nil
+
+	case linux.SEM_STAT:
+		arg := args[3].Pointer()
+		// id is an index in SEM_STAT.
+		semid, ds, err := semStat(t, int32(id))
+		if err != nil {
+			return 0, nil, err
+		}
+		if _, err := ds.CopyOut(t, arg); err != nil {
+			return 0, nil, err
+		}
+		return uintptr(semid), nil, err
+
+	case linux.SEM_STAT_ANY:
+		arg := args[3].Pointer()
+		// id is an index in SEM_STAT.
+		semid, ds, err := semStatAny(t, int32(id))
+		if err != nil {
+			return 0, nil, err
+		}
+		if _, err := ds.CopyOut(t, arg); err != nil {
+			return 0, nil, err
+		}
+		return uintptr(semid), nil, err
 
 	default:
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 }
 
-func remove(t *kernel.Task, id int32) error {
+func remove(t *kernel.Task, id ipc.ID) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	creds := auth.CredentialsFromContext(t)
-	return r.RemoveID(id, creds)
+	return r.Remove(id, creds)
 }
 
-func ipcSet(t *kernel.Task, id int32, uid auth.UID, gid auth.GID, perms fs.FilePermissions) error {
+func ipcSet(t *kernel.Task, id ipc.ID, ds *linux.SemidDS) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
-
-	creds := auth.CredentialsFromContext(t)
-	kuid := creds.UserNamespace.MapToKUID(uid)
-	if !kuid.Ok() {
-		return syserror.EINVAL
-	}
-	kgid := creds.UserNamespace.MapToKGID(gid)
-	if !kgid.Ok() {
-		return syserror.EINVAL
-	}
-	owner := fs.FileOwner{UID: kuid, GID: kgid}
-	return set.Change(t, creds, owner, perms)
+	return set.Set(t, ds)
 }
 
-func setVal(t *kernel.Task, id int32, num int32, val int16) error {
+func ipcStat(t *kernel.Task, id ipc.ID) (*linux.SemidDS, error) {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return syserror.EINVAL
+		return nil, linuxerr.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.GetStat(creds)
+}
+
+func semStat(t *kernel.Task, index int32) (int32, *linux.SemidDS, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByIndex(index)
+	if set == nil {
+		return 0, nil, linuxerr.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	ds, err := set.GetStat(creds)
+	if err != nil {
+		return 0, ds, err
+	}
+	return int32(set.ID()), ds, nil
+}
+
+func semStatAny(t *kernel.Task, index int32) (int32, *linux.SemidDS, error) {
+	set := t.IPCNamespace().SemaphoreRegistry().FindByIndex(index)
+	if set == nil {
+		return 0, nil, linuxerr.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	ds, err := set.GetStatAny(creds)
+	if err != nil {
+		return 0, ds, err
+	}
+	return int32(set.ID()), ds, nil
+}
+
+func setVal(t *kernel.Task, id ipc.ID, num int32, val int16) error {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return linuxerr.EINVAL
 	}
 	creds := auth.CredentialsFromContext(t)
 	pid := t.Kernel().GlobalInit().PIDNamespace().IDOfThreadGroup(t.ThreadGroup())
 	return set.SetVal(t, num, val, creds, int32(pid))
 }
 
-func setValAll(t *kernel.Task, id int32, array usermem.Addr) error {
+func setValAll(t *kernel.Task, id ipc.ID, array hostarch.Addr) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	vals := make([]uint16, set.Size())
-	if _, err := t.CopyIn(array, vals); err != nil {
+	if _, err := primitive.CopyUint16SliceIn(t, array, vals); err != nil {
 		return err
 	}
 	creds := auth.CredentialsFromContext(t)
@@ -196,36 +313,36 @@ func setValAll(t *kernel.Task, id int32, array usermem.Addr) error {
 	return set.SetValAll(t, vals, creds, int32(pid))
 }
 
-func getVal(t *kernel.Task, id int32, num int32) (int16, error) {
+func getVal(t *kernel.Task, id ipc.ID, num int32) (int16, error) {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	creds := auth.CredentialsFromContext(t)
 	return set.GetVal(num, creds)
 }
 
-func getValAll(t *kernel.Task, id int32, array usermem.Addr) error {
+func getValAll(t *kernel.Task, id ipc.ID, array hostarch.Addr) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	creds := auth.CredentialsFromContext(t)
 	vals, err := set.GetValAll(creds)
 	if err != nil {
 		return err
 	}
-	_, err = t.CopyOut(array, vals)
+	_, err = primitive.CopyUint16SliceOut(t, array, vals)
 	return err
 }
 
-func getPID(t *kernel.Task, id int32, num int32) (int32, error) {
+func getPID(t *kernel.Task, id ipc.ID, num int32) (int32, error) {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	creds := auth.CredentialsFromContext(t)
 	gpid, err := set.GetPID(num, creds)
@@ -238,4 +355,24 @@ func getPID(t *kernel.Task, id int32, num int32) (int32, error) {
 		return 0, nil
 	}
 	return int32(tg.ID()), nil
+}
+
+func getZCnt(t *kernel.Task, id ipc.ID, num int32) (uint16, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return 0, linuxerr.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.CountZeroWaiters(num, creds)
+}
+
+func getNCnt(t *kernel.Task, id ipc.ID, num int32) (uint16, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return 0, linuxerr.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.CountNegativeWaiters(num, creds)
 }

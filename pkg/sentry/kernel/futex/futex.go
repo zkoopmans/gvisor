@@ -19,10 +19,10 @@ package futex
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // KeyKind indicates the type of a Key.
@@ -66,9 +66,9 @@ type Key struct {
 	Offset uint64
 }
 
-func (k *Key) release() {
+func (k *Key) release(t Target) {
 	if k.MappingIdentity != nil {
-		k.MappingIdentity.DecRef()
+		k.MappingIdentity.DecRef(t)
 	}
 	k.Mappable = nil
 	k.MappingIdentity = nil
@@ -82,8 +82,8 @@ func (k *Key) clone() Key {
 }
 
 // Preconditions: k.Kind == KindPrivate or KindSharedPrivate.
-func (k *Key) addr() usermem.Addr {
-	return usermem.Addr(k.Offset)
+func (k *Key) addr() hostarch.Addr {
+	return hostarch.Addr(k.Offset)
 }
 
 // matches returns true if a wakeup on k2 should wake a waiter waiting on k.
@@ -94,14 +94,16 @@ func (k *Key) matches(k2 *Key) bool {
 
 // Target abstracts memory accesses and keys.
 type Target interface {
-	// SwapUint32 gives access to usermem.IO.SwapUint32.
-	SwapUint32(addr usermem.Addr, new uint32) (uint32, error)
+	context.Context
 
-	// CompareAndSwap gives access to usermem.IO.CompareAndSwapUint32.
-	CompareAndSwapUint32(addr usermem.Addr, old, new uint32) (uint32, error)
+	// SwapUint32 gives access to hostarch.IO.SwapUint32.
+	SwapUint32(addr hostarch.Addr, new uint32) (uint32, error)
 
-	// LoadUint32 gives access to usermem.IO.LoadUint32.
-	LoadUint32(addr usermem.Addr) (uint32, error)
+	// CompareAndSwap gives access to hostarch.IO.CompareAndSwapUint32.
+	CompareAndSwapUint32(addr hostarch.Addr, old, new uint32) (uint32, error)
+
+	// LoadUint32 gives access to hostarch.IO.LoadUint32.
+	LoadUint32(addr hostarch.Addr) (uint32, error)
 
 	// GetSharedKey returns a Key with kind KindSharedPrivate or
 	// KindSharedMappable corresponding to the memory mapped at address addr.
@@ -109,23 +111,23 @@ type Target interface {
 	// If GetSharedKey returns a Key with a non-nil MappingIdentity, a
 	// reference is held on the MappingIdentity, which must be dropped by the
 	// caller when the Key is no longer in use.
-	GetSharedKey(addr usermem.Addr) (Key, error)
+	GetSharedKey(addr hostarch.Addr) (Key, error)
 }
 
 // check performs a basic equality check on the given address.
-func check(t Target, addr usermem.Addr, val uint32) error {
+func check(t Target, addr hostarch.Addr, val uint32) error {
 	cur, err := t.LoadUint32(addr)
 	if err != nil {
 		return err
 	}
 	if cur != val {
-		return syserror.EAGAIN
+		return linuxerr.EAGAIN
 	}
 	return nil
 }
 
 // atomicOp performs a complex operation on the given address.
-func atomicOp(t Target, addr usermem.Addr, opIn uint32) (bool, error) {
+func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 	opType := (opIn >> 28) & 0xf
 	cmp := (opIn >> 24) & 0xf
 	opArg := (opIn >> 12) & 0xfff
@@ -162,7 +164,7 @@ func atomicOp(t Target, addr usermem.Addr, opIn uint32) (bool, error) {
 			case linux.FUTEX_OP_XOR:
 				newVal = oldVal ^ opArg
 			default:
-				return false, syserror.ENOSYS
+				return false, linuxerr.ENOSYS
 			}
 			prev, err := t.CompareAndSwapUint32(addr, oldVal, newVal)
 			if err != nil {
@@ -188,7 +190,7 @@ func atomicOp(t Target, addr usermem.Addr, opIn uint32) (bool, error) {
 	case linux.FUTEX_OP_CMP_GE:
 		return oldVal >= cmpArg, nil
 	default:
-		return false, syserror.ENOSYS
+		return false, linuxerr.ENOSYS
 	}
 }
 
@@ -198,18 +200,18 @@ func atomicOp(t Target, addr usermem.Addr, opIn uint32) (bool, error) {
 type Waiter struct {
 	// Synchronization:
 	//
-	// - A Waiter that is not enqueued in a bucket is exclusively owned (no
-	// synchronization applies).
+	//	- A Waiter that is not enqueued in a bucket is exclusively owned (no
+	//		synchronization applies).
 	//
-	// - A Waiter is enqueued in a bucket by calling WaitPrepare(). After this,
-	// waiterEntry, bucket, and key are protected by the bucket.mu ("bucket
-	// lock") of the containing bucket, and bitmask is immutable. Note that
-	// since bucket is mutated using atomic memory operations, bucket.Load()
-	// may be called without holding the bucket lock, although it may change
-	// racily. See WaitComplete().
+	//	- A Waiter is enqueued in a bucket by calling WaitPrepare(). After this,
+	//		waiterEntry, bucket, and key are protected by the bucket.mu ("bucket
+	//		lock") of the containing bucket, and bitmask is immutable. Note that
+	//		since bucket is mutated using atomic memory operations, bucket.Load()
+	//		may be called without holding the bucket lock, although it may change
+	//		racily. See WaitComplete().
 	//
-	// - A Waiter is only guaranteed to be no longer queued after calling
-	// WaitComplete().
+	//	- A Waiter is only guaranteed to be no longer queued after calling
+	//		WaitComplete().
 
 	// waiterEntry links Waiter into bucket.waiters.
 	waiterEntry
@@ -249,7 +251,7 @@ func (w *Waiter) woken() bool {
 // +stateify savable
 type bucket struct {
 	// mu protects waiters and contained Waiter state. See comment in Waiter.
-	mu sync.Mutex `state:"nosave"`
+	mu futexBucketMutex `state:"nosave"`
 
 	waiters waiterList `state:"zerovalue"`
 }
@@ -296,7 +298,7 @@ func (b *bucket) wakeWaiterLocked(w *Waiter) {
 // bucket "to".
 //
 // Preconditions: b and to must be locked.
-func (b *bucket) requeueLocked(to *bucket, key, nkey *Key, n int) int {
+func (b *bucket) requeueLocked(t Target, to *bucket, key, nkey *Key, n int) int {
 	done := 0
 	for w := b.waiters.Front(); done < n && w != nil; {
 		if !w.key.matches(key) {
@@ -308,7 +310,7 @@ func (b *bucket) requeueLocked(to *bucket, key, nkey *Key, n int) int {
 		requeued := w
 		w = w.Next() // Next iteration.
 		b.waiters.Remove(requeued)
-		requeued.key.release()
+		requeued.key.release(t)
 		requeued.key = nkey.clone()
 		to.waiters.PushBack(requeued)
 		requeued.bucket.Store(to)
@@ -325,11 +327,11 @@ const (
 )
 
 // getKey returns a Key representing address addr in c.
-func getKey(t Target, addr usermem.Addr, private bool) (Key, error) {
+func getKey(t Target, addr hostarch.Addr, private bool) (Key, error) {
 	// Ensure the address is aligned.
 	// It must be a DWORD boundary.
 	if addr&0x3 != 0 {
-		return Key{}, syserror.EINVAL
+		return Key{}, linuxerr.EINVAL
 	}
 	if private {
 		return Key{Kind: KindPrivate, Offset: uint64(addr)}, nil
@@ -338,12 +340,12 @@ func getKey(t Target, addr usermem.Addr, private bool) (Key, error) {
 }
 
 // bucketIndexForAddr returns the index into Manager.buckets for addr.
-func bucketIndexForAddr(addr usermem.Addr) uintptr {
-	// - The bottom 2 bits of addr must be 0, per getKey.
+func bucketIndexForAddr(addr hostarch.Addr) uintptr {
+	//	- The bottom 2 bits of addr must be 0, per getKey.
 	//
-	// - On amd64, the top 16 bits of addr (bits 48-63) must be equal to bit 47
-	// for a canonical address, and (on all existing platforms) bit 47 must be
-	// 0 for an application address.
+	//	- On amd64, the top 16 bits of addr (bits 48-63) must be equal to bit 47
+	//		for a canonical address, and (on all existing platforms) bit 47 must be
+	//		0 for an application address.
 	//
 	// Thus 19 bits of addr are "useless" for hashing, leaving only 45 "useful"
 	// bits. We choose one of the simplest possible hash functions that at
@@ -394,8 +396,8 @@ func (m *Manager) Fork() *Manager {
 }
 
 // lockBucket returns a locked bucket for the given key.
-func (m *Manager) lockBucket(k *Key) *bucket {
-	var b *bucket
+// +checklocksacquire:b.mu
+func (m *Manager) lockBucket(k *Key) (b *bucket) {
 	if k.Kind == KindSharedMappable {
 		b = m.sharedBucket
 	} else {
@@ -406,7 +408,12 @@ func (m *Manager) lockBucket(k *Key) *bucket {
 }
 
 // lockBuckets returns locked buckets for the given keys.
-func (m *Manager) lockBuckets(k1, k2 *Key) (*bucket, *bucket) {
+// It returns which bucket was locked first and second. They may be nil in case the buckets are
+// identical or they did not need locking.
+//
+// +checklocksacquire:lockedFirst.mu
+// +checklocksacquire:lockedSecond.mu
+func (m *Manager) lockBuckets(k1, k2 *Key) (b1, b2, lockedFirst, lockedSecond *bucket) {
 	// Buckets must be consistently ordered to avoid circular lock
 	// dependencies. We order buckets in m.privateBuckets by index (lowest
 	// index first), and all buckets in m.privateBuckets precede
@@ -416,36 +423,53 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (*bucket, *bucket) {
 	if k1.Kind != KindSharedMappable && k2.Kind != KindSharedMappable {
 		i1 := bucketIndexForAddr(k1.addr())
 		i2 := bucketIndexForAddr(k2.addr())
-		b1 := &m.privateBuckets[i1]
-		b2 := &m.privateBuckets[i2]
+		b1 = &m.privateBuckets[i1]
+		b2 = &m.privateBuckets[i2]
 		switch {
 		case i1 < i2:
 			b1.mu.Lock()
-			b2.mu.Lock()
+			b2.mu.NestedLock(futexBucketLockB)
+			return b1, b2, b1, b2
 		case i2 < i1:
 			b2.mu.Lock()
-			b1.mu.Lock()
+			b1.mu.NestedLock(futexBucketLockB)
+			return b1, b2, b2, b1
 		default:
 			b1.mu.Lock()
+			return b1, b2, b1, nil // +checklocksforce
 		}
-		return b1, b2
 	}
 
 	// At least one of b1 or b2 should be m.sharedBucket.
-	b1 := m.sharedBucket
-	b2 := m.sharedBucket
+	b1 = m.sharedBucket
+	b2 = m.sharedBucket
 	if k1.Kind != KindSharedMappable {
 		b1 = m.lockBucket(k1)
-	} else if k2.Kind != KindSharedMappable {
-		b2 = m.lockBucket(k2)
+		b2.mu.NestedLock(futexBucketLockB)
+		return b1, b2, b1, b2
 	}
-	m.sharedBucket.mu.Lock()
-	return b1, b2
+	if k2.Kind != KindSharedMappable {
+		b2 = m.lockBucket(k2)
+		b1.mu.NestedLock(futexBucketLockB)
+		return b1, b2, b2, b1
+	}
+	b1.mu.Lock()
+	return b1, b2, b1, nil // +checklocksforce
+}
+
+// unlockBuckets unlocks two buckets.
+// +checklocksrelease:lockedFirst.mu
+// +checklocksrelease:lockedSecond.mu
+func (m *Manager) unlockBuckets(lockedFirst, lockedSecond *bucket) {
+	if lockedSecond != nil {
+		lockedSecond.mu.NestedUnlock(futexBucketLockB)
+	}
+	lockedFirst.mu.Unlock()
 }
 
 // Wake wakes up to n waiters matching the bitmask on the given addr.
 // The number of waiters woken is returned.
-func (m *Manager) Wake(t Target, addr usermem.Addr, private bool, bitmask uint32, n int) (int, error) {
+func (m *Manager) Wake(t Target, addr hostarch.Addr, private bool, bitmask uint32, n int) (int, error) {
 	// This function is very hot; avoid defer.
 	k, err := getKey(t, addr, private)
 	if err != nil {
@@ -456,27 +480,24 @@ func (m *Manager) Wake(t Target, addr usermem.Addr, private bool, bitmask uint32
 	r := b.wakeLocked(&k, bitmask, n)
 
 	b.mu.Unlock()
-	k.release()
+	k.release(t)
 	return r, nil
 }
 
-func (m *Manager) doRequeue(t Target, addr, naddr usermem.Addr, private bool, checkval bool, val uint32, nwake int, nreq int) (int, error) {
+func (m *Manager) doRequeue(t Target, addr, naddr hostarch.Addr, private bool, checkval bool, val uint32, nwake int, nreq int) (int, error) {
 	k1, err := getKey(t, addr, private)
 	if err != nil {
 		return 0, err
 	}
-	defer k1.release()
+	defer k1.release(t)
 	k2, err := getKey(t, naddr, private)
 	if err != nil {
 		return 0, err
 	}
-	defer k2.release()
+	defer k2.release(t)
 
-	b1, b2 := m.lockBuckets(&k1, &k2)
-	defer b1.mu.Unlock()
-	if b2 != b1 {
-		defer b2.mu.Unlock()
-	}
+	b1, b2, lockedFirst, lockedSecond := m.lockBuckets(&k1, &k2)
+	defer m.unlockBuckets(lockedFirst, lockedSecond)
 
 	if checkval {
 		if err := check(t, addr, val); err != nil {
@@ -488,21 +509,21 @@ func (m *Manager) doRequeue(t Target, addr, naddr usermem.Addr, private bool, ch
 	done := b1.wakeLocked(&k1, ^uint32(0), nwake)
 
 	// Requeue the number required.
-	b1.requeueLocked(b2, &k1, &k2, nreq)
+	b1.requeueLocked(t, b2, &k1, &k2, nreq)
 
 	return done, nil
 }
 
 // Requeue wakes up to nwake waiters on the given addr, and unconditionally
 // requeues up to nreq waiters on naddr.
-func (m *Manager) Requeue(t Target, addr, naddr usermem.Addr, private bool, nwake int, nreq int) (int, error) {
+func (m *Manager) Requeue(t Target, addr, naddr hostarch.Addr, private bool, nwake int, nreq int) (int, error) {
 	return m.doRequeue(t, addr, naddr, private, false, 0, nwake, nreq)
 }
 
 // RequeueCmp atomically checks that the addr contains val (via the Target),
 // wakes up to nwake waiters on addr and then unconditionally requeues nreq
 // waiters on naddr.
-func (m *Manager) RequeueCmp(t Target, addr, naddr usermem.Addr, private bool, val uint32, nwake int, nreq int) (int, error) {
+func (m *Manager) RequeueCmp(t Target, addr, naddr hostarch.Addr, private bool, val uint32, nwake int, nreq int) (int, error) {
 	return m.doRequeue(t, addr, naddr, private, true, val, nwake, nreq)
 }
 
@@ -510,23 +531,20 @@ func (m *Manager) RequeueCmp(t Target, addr, naddr usermem.Addr, private bool, v
 // waiters unconditionally from addr1, and, based on the original value at addr2
 // and a comparison encoded in op, wakes up to nwake2 waiters from addr2.
 // It returns the total number of waiters woken.
-func (m *Manager) WakeOp(t Target, addr1, addr2 usermem.Addr, private bool, nwake1 int, nwake2 int, op uint32) (int, error) {
+func (m *Manager) WakeOp(t Target, addr1, addr2 hostarch.Addr, private bool, nwake1 int, nwake2 int, op uint32) (int, error) {
 	k1, err := getKey(t, addr1, private)
 	if err != nil {
 		return 0, err
 	}
-	defer k1.release()
+	defer k1.release(t)
 	k2, err := getKey(t, addr2, private)
 	if err != nil {
 		return 0, err
 	}
-	defer k2.release()
+	defer k2.release(t)
 
-	b1, b2 := m.lockBuckets(&k1, &k2)
-	defer b1.mu.Unlock()
-	if b2 != b1 {
-		defer b2.mu.Unlock()
-	}
+	b1, b2, lockedFirst, lockedSecond := m.lockBuckets(&k1, &k2)
+	defer m.unlockBuckets(lockedFirst, lockedSecond)
 
 	done := 0
 	cond, err := atomicOp(t, addr2, op)
@@ -550,7 +568,7 @@ func (m *Manager) WakeOp(t Target, addr1, addr2 usermem.Addr, private bool, nwak
 // enqueues w to be woken by a send to w.C. If WaitPrepare returns nil, the
 // Waiter must be subsequently removed by calling WaitComplete, whether or not
 // a wakeup is received on w.C.
-func (m *Manager) WaitPrepare(w *Waiter, t Target, addr usermem.Addr, private bool, val uint32, bitmask uint32) error {
+func (m *Manager) WaitPrepare(w *Waiter, t Target, addr hostarch.Addr, private bool, val uint32, bitmask uint32) error {
 	k, err := getKey(t, addr, private)
 	if err != nil {
 		return err
@@ -571,7 +589,7 @@ func (m *Manager) WaitPrepare(w *Waiter, t Target, addr usermem.Addr, private bo
 	// Perform our atomic check.
 	if err := check(t, addr, val); err != nil {
 		b.mu.Unlock()
-		w.key.release()
+		w.key.release(t)
 		return err
 	}
 
@@ -585,7 +603,7 @@ func (m *Manager) WaitPrepare(w *Waiter, t Target, addr usermem.Addr, private bo
 
 // WaitComplete must be called when a Waiter previously added by WaitPrepare is
 // no longer eligible to be woken.
-func (m *Manager) WaitComplete(w *Waiter) {
+func (m *Manager) WaitComplete(w *Waiter, t Target) {
 	// Remove w from the bucket it's in.
 	for {
 		b := w.bucket.Load()
@@ -617,7 +635,7 @@ func (m *Manager) WaitComplete(w *Waiter) {
 	}
 
 	// Release references held by the waiter.
-	w.key.release()
+	w.key.release(t)
 }
 
 // LockPI attempts to lock the futex following the Priority-inheritance futex
@@ -628,7 +646,7 @@ func (m *Manager) WaitComplete(w *Waiter) {
 // FUTEX_OWNER_DIED is only set by the Linux when robust lists are in use (see
 // exit_robust_list()). Given we don't support robust lists, although handled
 // below, it's never set.
-func (m *Manager) LockPI(w *Waiter, t Target, addr usermem.Addr, tid uint32, private, try bool) (bool, error) {
+func (m *Manager) LockPI(w *Waiter, t Target, addr hostarch.Addr, tid uint32, private, try bool) (bool, error) {
 	k, err := getKey(t, addr, private)
 	if err != nil {
 		return false, err
@@ -648,26 +666,26 @@ func (m *Manager) LockPI(w *Waiter, t Target, addr usermem.Addr, tid uint32, pri
 
 	success, err := m.lockPILocked(w, t, addr, tid, b, try)
 	if err != nil {
-		w.key.release()
+		w.key.release(t)
 		b.mu.Unlock()
 		return false, err
 	}
 	if success || try {
 		// Release waiter if it's not going to be a wait.
-		w.key.release()
+		w.key.release(t)
 	}
 	b.mu.Unlock()
 	return success, nil
 }
 
-func (m *Manager) lockPILocked(w *Waiter, t Target, addr usermem.Addr, tid uint32, b *bucket, try bool) (bool, error) {
+func (m *Manager) lockPILocked(w *Waiter, t Target, addr hostarch.Addr, tid uint32, b *bucket, try bool) (bool, error) {
 	for {
 		cur, err := t.LoadUint32(addr)
 		if err != nil {
 			return false, err
 		}
 		if (cur & linux.FUTEX_TID_MASK) == tid {
-			return false, syserror.EDEADLK
+			return false, linuxerr.EDEADLK
 		}
 
 		if (cur & linux.FUTEX_TID_MASK) == 0 {
@@ -717,11 +735,11 @@ func (m *Manager) lockPILocked(w *Waiter, t Target, addr usermem.Addr, tid uint3
 	}
 }
 
-// UnlockPI unlock the futex following the Priority-inheritance futex
-// rules. The address provided must contain the caller's TID. If there are
-// waiters, TID of the next waiter (FIFO) is set to the given address, and the
-// waiter woken up. If there are no waiters, 0 is set to the address.
-func (m *Manager) UnlockPI(t Target, addr usermem.Addr, tid uint32, private bool) error {
+// UnlockPI unlocks the futex following the Priority-inheritance futex rules.
+// The address provided must contain the caller's TID. If there are waiters,
+// TID of the next waiter (FIFO) is set to the given address, and the waiter
+// woken up. If there are no waiters, 0 is set to the address.
+func (m *Manager) UnlockPI(t Target, addr hostarch.Addr, tid uint32, private bool) error {
 	k, err := getKey(t, addr, private)
 	if err != nil {
 		return err
@@ -730,19 +748,19 @@ func (m *Manager) UnlockPI(t Target, addr usermem.Addr, tid uint32, private bool
 
 	err = m.unlockPILocked(t, addr, tid, b, &k)
 
-	k.release()
+	k.release(t)
 	b.mu.Unlock()
 	return err
 }
 
-func (m *Manager) unlockPILocked(t Target, addr usermem.Addr, tid uint32, b *bucket, key *Key) error {
+func (m *Manager) unlockPILocked(t Target, addr hostarch.Addr, tid uint32, b *bucket, key *Key) error {
 	cur, err := t.LoadUint32(addr)
 	if err != nil {
 		return err
 	}
 
 	if (cur & linux.FUTEX_TID_MASK) != tid {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	var next *Waiter  // Who's the next owner?
@@ -770,7 +788,7 @@ func (m *Manager) unlockPILocked(t Target, addr usermem.Addr, tid uint32, b *buc
 		if prev != cur {
 			// Let user mode handle CAS races. This is different than lock, which
 			// retries when CAS fails.
-			return syserror.EAGAIN
+			return linuxerr.EAGAIN
 		}
 		return nil
 	}
@@ -787,7 +805,7 @@ func (m *Manager) unlockPILocked(t Target, addr usermem.Addr, tid uint32, b *buc
 		return err
 	}
 	if prev != cur {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	b.wakeWaiterLocked(next)

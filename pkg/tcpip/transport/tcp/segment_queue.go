@@ -22,27 +22,23 @@ import (
 //
 // +stateify savable
 type segmentQueue struct {
-	mu    sync.Mutex  `state:"nosave"`
-	list  segmentList `state:"wait"`
-	limit int
-	used  int
+	mu     sync.Mutex  `state:"nosave"`
+	list   segmentList `state:"wait"`
+	ep     *Endpoint
+	frozen bool
+}
+
+// emptyLocked determines if the queue is empty.
+// Preconditions: q.mu must be held.
+func (q *segmentQueue) emptyLocked() bool {
+	return q.list.Empty()
 }
 
 // empty determines if the queue is empty.
 func (q *segmentQueue) empty() bool {
 	q.mu.Lock()
-	r := q.used == 0
-	q.mu.Unlock()
-
-	return r
-}
-
-// setLimit updates the limit. No segments are immediately dropped in case the
-// queue becomes full due to the new limit.
-func (q *segmentQueue) setLimit(limit int) {
-	q.mu.Lock()
-	q.limit = limit
-	q.mu.Unlock()
+	defer q.mu.Unlock()
+	return q.emptyLocked()
 }
 
 // enqueue adds the given segment to the queue.
@@ -52,15 +48,26 @@ func (q *segmentQueue) setLimit(limit int) {
 // false if the queue is full, in which case ownership is retained by the
 // caller.
 func (q *segmentQueue) enqueue(s *segment) bool {
-	q.mu.Lock()
-	r := q.used < q.limit
-	if r {
-		q.list.PushBack(s)
-		q.used++
-	}
-	q.mu.Unlock()
+	// q.ep.receiveBufferParams() must be called without holding q.mu to
+	// avoid lock order inversion.
+	bufSz := q.ep.ops.GetReceiveBufferSize()
+	used := q.ep.receiveMemUsed()
 
-	return r
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Allow zero sized segments (ACK/FIN/RSTs etc even if the segment queue
+	// is currently full).
+	allow := (used <= int(bufSz) || s.payloadSize() == 0) && !q.frozen
+
+	if allow {
+		s.IncRef()
+		q.list.PushBack(s)
+		// Set the owner now that the endpoint owns the segment.
+		s.setOwner(q.ep, recvQ)
+	}
+
+	return allow
 }
 
 // dequeue removes and returns the next segment from queue, if one exists.
@@ -68,12 +75,29 @@ func (q *segmentQueue) enqueue(s *segment) bool {
 // the ref count when done.
 func (q *segmentQueue) dequeue() *segment {
 	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	s := q.list.Front()
 	if s != nil {
 		q.list.Remove(s)
-		q.used--
 	}
-	q.mu.Unlock()
 
 	return s
+}
+
+// freeze prevents any more segments from being added to the queue. i.e all
+// future segmentQueue.enqueue will return false and not add the segment to the
+// queue till the queue is unfroze with a corresponding segmentQueue.thaw call.
+func (q *segmentQueue) freeze() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.frozen = true
+}
+
+// thaw unfreezes a previously frozen queue using segmentQueue.freeze() and
+// allows new segments to be queued again.
+func (q *segmentQueue) thaw() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.frozen = false
 }

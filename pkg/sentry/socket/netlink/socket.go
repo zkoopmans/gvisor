@@ -16,26 +16,30 @@
 package netlink
 
 import (
+	"io"
 	"math"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/device"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -53,10 +57,7 @@ const (
 	maxSendBufferSize = 4 << 20 // 4MB
 )
 
-var errNoFilter = syserr.New("no filter attached", linux.ENOENT)
-
-// netlinkSocketDevice is the netlink socket virtual device.
-var netlinkSocketDevice = device.NewAnonDevice()
+var errNoFilter = syserr.New("no filter attached", errno.ENOENT)
 
 // Socket is the base socket type for netlink sockets.
 //
@@ -67,13 +68,10 @@ var netlinkSocketDevice = device.NewAnonDevice()
 //
 // +stateify savable
 type Socket struct {
-	fsutil.FilePipeSeek             `state:"nosave"`
-	fsutil.FileNotDirReaddir        `state:"nosave"`
-	fsutil.FileNoFsync              `state:"nosave"`
-	fsutil.FileNoMMap               `state:"nosave"`
-	fsutil.FileNoSplice             `state:"nosave"`
-	fsutil.FileNoopFlush            `state:"nosave"`
-	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.LockFD
 	socket.SendReceiveTimeout
 
 	// ports provides netlink port allocation.
@@ -107,56 +105,121 @@ type Socket struct {
 	// fixed buffer but only consume this many bytes.
 	sendBufferSize uint32
 
-	// passcred indicates if this socket wants SCM credentials.
-	passcred bool
-
 	// filter indicates that this socket has a BPF filter "installed".
 	//
 	// TODO(gvisor.dev/issue/1119): We don't actually support filtering,
 	// this is just bookkeeping for tracking add/remove.
 	filter bool
+
+	// netns is the network namespace associated with the socket.
+	netns *inet.Namespace
 }
 
 var _ socket.Socket = (*Socket)(nil)
 var _ transport.Credentialer = (*Socket)(nil)
 
-// NewSocket creates a new Socket.
-func NewSocket(t *kernel.Task, skType linux.SockType, protocol Protocol) (*Socket, *syserr.Error) {
+// New creates a new Socket.
+func New(t *kernel.Task, skType linux.SockType, protocol Protocol) (*Socket, *syserr.Error) {
 	// Datagram endpoint used to buffer kernel -> user messages.
 	ep := transport.NewConnectionless(t)
 
 	// Bind the endpoint for good measure so we can connect to it. The
 	// bound address will never be exposed.
-	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); err != nil {
-		ep.Close()
+	if err := ep.Bind(transport.Address{Addr: "dummy"}); err != nil {
+		ep.Close(t)
 		return nil, err
 	}
 
 	// Create a connection from which the kernel can write messages.
 	connection, err := ep.(transport.BoundEndpoint).UnidirectionalConnect(t)
 	if err != nil {
-		ep.Close()
+		ep.Close(t)
 		return nil, err
 	}
 
-	return &Socket{
+	fd := &Socket{
 		ports:          t.Kernel().NetlinkPorts(),
 		protocol:       protocol,
 		skType:         skType,
 		ep:             ep,
 		connection:     connection,
 		sendBufferSize: defaultSendBufferSize,
-	}, nil
+		netns:          t.GetNetworkNamespace(),
+	}
+	fd.LockFD.Init(&vfs.FileLocks{})
+	return fd, nil
 }
 
-// Release implements fs.FileOperations.Release.
-func (s *Socket) Release() {
-	s.connection.Release()
-	s.ep.Close()
+// Stack returns the network stack associated with the socket.
+func (s *Socket) Stack() inet.Stack {
+	return s.netns.Stack()
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *Socket) Release(ctx context.Context) {
+	t := kernel.TaskFromContext(ctx)
+	t.Kernel().DeleteSocket(&s.vfsfd)
+	s.connection.Release(ctx)
+	s.ep.Close(ctx)
 
 	if s.bound {
 		s.ports.Release(s.protocol.Protocol(), s.portID)
 	}
+	s.netns.DecRef(ctx)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (s *Socket) Epollable() bool {
+	return true
+}
+
+// Ioctl implements vfs.FileDescriptionImpl.
+func (*Socket) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	// TODO(b/68878065): no ioctls supported.
+	return 0, linuxerr.ENOTTY
+}
+
+// PRead implements vfs.FileDescriptionImpl.
+func (s *Socket) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	return 0, linuxerr.ESPIPE
+}
+
+// Read implements vfs.FileDescriptionImpl.
+func (s *Socket) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// All flags other than RWF_NOWAIT should be ignored.
+	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
+	if opts.Flags != 0 {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	r := unix.EndpointReader{
+		Endpoint: s.ep,
+	}
+	n, err := dst.CopyOutFrom(ctx, &r)
+	if r.Notify != nil {
+		r.Notify()
+	}
+	return n, err
+}
+
+// PWrite implements vfs.FileDescriptionImpl.
+func (s *Socket) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
+	return 0, linuxerr.ESPIPE
+}
+
+// Write implements vfs.FileDescriptionImpl.
+func (s *Socket) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	// All flags other than RWF_NOWAIT should be ignored.
+	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
+	if opts.Flags != 0 {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+
+	n, err := s.sendMsg(ctx, src, nil, 0, socket.ControlMessages{})
+	return int64(n), err.ToError()
 }
 
 // Readiness implements waiter.Waitable.Readiness.
@@ -164,18 +227,18 @@ func (s *Socket) Readiness(mask waiter.EventMask) waiter.EventMask {
 	// ep holds messages to be read and thus handles EventIn readiness.
 	ready := s.ep.Readiness(mask)
 
-	if mask&waiter.EventOut == waiter.EventOut {
+	if mask&waiter.WritableEvents != 0 {
 		// sendMsg handles messages synchronously and is thus always
 		// ready for writing.
-		ready |= waiter.EventOut
+		ready |= waiter.WritableEvents
 	}
 
 	return ready
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *Socket) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	s.ep.EventRegister(e, mask)
+func (s *Socket) EventRegister(e *waiter.Entry) error {
+	return s.ep.EventRegister(e)
 	// Writable readiness never changes, so no registration is needed.
 }
 
@@ -186,10 +249,7 @@ func (s *Socket) EventUnregister(e *waiter.Entry) {
 
 // Passcred implements transport.Credentialer.Passcred.
 func (s *Socket) Passcred() bool {
-	s.mu.Lock()
-	passcred := s.passcred
-	s.mu.Unlock()
-	return passcred
+	return s.ep.SocketOptions().GetPassCred()
 }
 
 // ConnectedPasscred implements transport.Credentialer.ConnectedPasscred.
@@ -200,12 +260,6 @@ func (s *Socket) ConnectedPasscred() bool {
 	return false
 }
 
-// Ioctl implements fs.FileOperations.Ioctl.
-func (*Socket) Ioctl(context.Context, *fs.File, usermem.IO, arch.SyscallArguments) (uintptr, error) {
-	// TODO(b/68878065): no ioctls supported.
-	return 0, syserror.ENOTTY
-}
-
 // ExtractSockAddr extracts the SockAddrNetlink from b.
 func ExtractSockAddr(b []byte) (*linux.SockAddrNetlink, *syserr.Error) {
 	if len(b) < linux.SockAddrNetlinkSize {
@@ -213,7 +267,7 @@ func ExtractSockAddr(b []byte) (*linux.SockAddrNetlink, *syserr.Error) {
 	}
 
 	var sa linux.SockAddrNetlink
-	binary.Unmarshal(b[:linux.SockAddrNetlinkSize], usermem.ByteOrder, &sa)
+	sa.UnmarshalUnsafe(b)
 
 	if sa.Family != linux.AF_NETLINK {
 		return nil, syserr.ErrInvalidArgument
@@ -318,7 +372,7 @@ func (s *Socket) Shutdown(t *kernel.Task, how int) *syserr.Error {
 }
 
 // GetSockOpt implements socket.Socket.GetSockOpt.
-func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr usermem.Addr, outLen int) (interface{}, *syserr.Error) {
+func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
 	switch level {
 	case linux.SOL_SOCKET:
 		switch name {
@@ -328,29 +382,39 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr usermem.
 			}
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			return int32(s.sendBufferSize), nil
+			return primitive.AllocateInt32(int32(s.sendBufferSize)), nil
 
 		case linux.SO_RCVBUF:
 			if outLen < sizeOfInt32 {
 				return nil, syserr.ErrInvalidArgument
 			}
 			// We don't have limit on receiving size.
-			return int32(math.MaxInt32), nil
+			return primitive.AllocateInt32(math.MaxInt32), nil
 
 		case linux.SO_PASSCRED:
 			if outLen < sizeOfInt32 {
 				return nil, syserr.ErrInvalidArgument
 			}
-			var passcred int32
+			var passcred primitive.Int32
 			if s.Passcred() {
 				passcred = 1
 			}
-			return passcred, nil
+			return &passcred, nil
 
-		default:
-			socket.GetSockOptEmitUnimplementedEvent(t, name)
+		case linux.SO_SNDTIMEO:
+			if outLen < linux.SizeOfTimeval {
+				return nil, syserr.ErrInvalidArgument
+			}
+			sendTimeout := linux.NsecToTimeval(s.SendTimeout())
+			return &sendTimeout, nil
+
+		case linux.SO_RCVTIMEO:
+			if outLen < linux.SizeOfTimeval {
+				return nil, syserr.ErrInvalidArgument
+			}
+			recvTimeout := linux.NsecToTimeval(s.RecvTimeout())
+			return &recvTimeout, nil
 		}
-
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_BROADCAST_ERROR,
@@ -360,8 +424,7 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr usermem.
 			linux.NETLINK_LIST_MEMBERSHIPS,
 			linux.NETLINK_NO_ENOBUFS,
 			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
+			// Not supported.
 		}
 	}
 	// TODO(b/68878065): other sockopts are not supported.
@@ -377,7 +440,7 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			if len(opt) < sizeOfInt32 {
 				return syserr.ErrInvalidArgument
 			}
-			size := usermem.ByteOrder.Uint32(opt)
+			size := hostarch.ByteOrder.Uint32(opt)
 			if size < minSendBufferSize {
 				size = minSendBufferSize
 			} else if size > maxSendBufferSize {
@@ -400,11 +463,9 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			if len(opt) < sizeOfInt32 {
 				return syserr.ErrInvalidArgument
 			}
-			passcred := usermem.ByteOrder.Uint32(opt)
+			passcred := hostarch.ByteOrder.Uint32(opt)
 
-			s.mu.Lock()
-			s.passcred = passcred != 0
-			s.mu.Unlock()
+			s.ep.SocketOptions().SetPassCred(passcred != 0)
 			return nil
 
 		case linux.SO_ATTACH_FILTER:
@@ -414,7 +475,6 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			// advertise support. Otherwise, be conservative and
 			// return an error.
 			if s.protocol.CanSend() {
-				socket.SetSockOptEmitUnimplementedEvent(t, name)
 				return syserr.ErrProtocolNotAvailable
 			}
 
@@ -426,7 +486,6 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 		case linux.SO_DETACH_FILTER:
 			// TODO(gvisor.dev/issue/1119): See above.
 			if s.protocol.CanSend() {
-				socket.SetSockOptEmitUnimplementedEvent(t, name)
 				return syserr.ErrProtocolNotAvailable
 			}
 
@@ -441,10 +500,32 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 
 			return nil
 
-		default:
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
-		}
+		case linux.SO_SNDTIMEO:
+			if len(opt) < linux.SizeOfTimeval {
+				return syserr.ErrInvalidArgument
+			}
 
+			var v linux.Timeval
+			v.UnmarshalBytes(opt)
+			if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
+				return syserr.ErrDomain
+			}
+			s.SetSendTimeout(v.ToNsecCapped())
+			return nil
+
+		case linux.SO_RCVTIMEO:
+			if len(opt) < linux.SizeOfTimeval {
+				return syserr.ErrInvalidArgument
+			}
+
+			var v linux.Timeval
+			v.UnmarshalBytes(opt)
+			if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
+				return syserr.ErrDomain
+			}
+			s.SetRecvTimeout(v.ToNsecCapped())
+			return nil
+		}
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_ADD_MEMBERSHIP,
@@ -456,11 +537,10 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			linux.NETLINK_LISTEN_ALL_NSID,
 			linux.NETLINK_NO_ENOBUFS,
 			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
+			// Not supported.
 		}
-
 	}
+
 	// TODO(b/68878065): other sockopts are not supported.
 	return syserr.ErrProtocolNotAvailable
 }
@@ -474,7 +554,7 @@ func (s *Socket) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Er
 		Family: linux.AF_NETLINK,
 		PortID: uint32(s.portID),
 	}
-	return sa, uint32(binary.Size(sa)), nil
+	return sa, uint32(sa.SizeBytes()), nil
 }
 
 // GetPeerName implements socket.Socket.GetPeerName.
@@ -485,7 +565,7 @@ func (s *Socket) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Er
 		// must be the kernel.
 		PortID: 0,
 	}
-	return sa, uint32(binary.Size(sa)), nil
+	return sa, uint32(sa.SizeBytes()), nil
 }
 
 // RecvMsg implements socket.Socket.RecvMsg.
@@ -494,7 +574,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 		Family: linux.AF_NETLINK,
 		PortID: 0,
 	}
-	fromLen := uint32(binary.Size(from))
+	fromLen := uint32(from.SizeBytes())
 
 	trunc := flags&linux.MSG_TRUNC != 0
 
@@ -521,7 +601,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 		}
 	}
 
-	if n, err := doRead(); err != syserror.ErrWouldBlock || flags&linux.MSG_DONTWAIT != 0 {
+	if n, err := doRead(); err != linuxerr.ErrWouldBlock || flags&linux.MSG_DONTWAIT != 0 {
 		var mflags int
 		if n < int64(r.MsgSize) {
 			mflags |= linux.MSG_TRUNC
@@ -534,12 +614,14 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 
 	// We'll have to block. Register for notification and keep trying to
 	// receive all the data.
-	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	if err := s.EventRegister(&e); err != nil {
+		return 0, 0, from, fromLen, socket.ControlMessages{}, syserr.FromError(err)
+	}
 	defer s.EventUnregister(&e)
 
 	for {
-		if n, err := doRead(); err != syserror.ErrWouldBlock {
+		if n, err := doRead(); err != linuxerr.ErrWouldBlock {
 			var mflags int
 			if n < int64(r.MsgSize) {
 				mflags |= linux.MSG_TRUNC
@@ -551,22 +633,12 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 		}
 
 		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
-			if err == syserror.ETIMEDOUT {
+			if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
 				return 0, 0, nil, 0, socket.ControlMessages{}, syserr.ErrTryAgain
 			}
 			return 0, 0, nil, 0, socket.ControlMessages{}, syserr.FromError(err)
 		}
 	}
-}
-
-// Read implements fs.FileOperations.Read.
-func (s *Socket) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _ int64) (int64, error) {
-	if dst.NumBytes() == 0 {
-		return 0, nil
-	}
-	return dst.CopyOutFrom(ctx, &unix.EndpointReader{
-		Endpoint: s.ep,
-	})
 }
 
 // kernelSCM implements control.SCMCredentials with credentials that represent
@@ -590,7 +662,7 @@ func (kernelSCM) Credentials(*kernel.Task) (kernel.ThreadID, auth.UID, auth.GID)
 var kernelCreds = &kernelSCM{}
 
 // sendResponse sends the response messages in ms back to userspace.
-func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error {
+func (s *Socket) sendResponse(ctx context.Context, ms *nlmsg.MessageSet) *syserr.Error {
 	// Linux combines multiple netlink messages into a single datagram.
 	bufs := make([][]byte, 0, len(ms.Messages))
 	for _, m := range ms.Messages {
@@ -605,7 +677,7 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 	if len(bufs) > 0 {
 		// RecvMsg never receives the address, so we don't need to send
 		// one.
-		_, notify, err := s.connection.Send(bufs, cms, tcpip.FullAddress{})
+		_, notify, err := s.connection.Send(ctx, bufs, cms, transport.Address{})
 		// If the buffer is full, we simply drop messages, just like
 		// Linux.
 		if err != nil && err != syserr.ErrWouldBlock {
@@ -617,12 +689,12 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 	}
 
 	// N.B. multi-part messages should still send NLMSG_DONE even if
-	// MessageSet contains no messages.
+	// nlmsg.MessageSet contains no messages.
 	//
 	// N.B. NLMSG_DONE is always sent in a different datagram. See
 	// net/netlink/af_netlink.c:netlink_dump.
 	if ms.Multi {
-		m := NewMessage(linux.NetlinkMessageHeader{
+		m := nlmsg.NewMessage(linux.NetlinkMessageHeader{
 			Type:   linux.NLMSG_DONE,
 			Flags:  linux.NLM_F_MULTI,
 			Seq:    ms.Seq,
@@ -630,9 +702,9 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 		})
 
 		// Add the dump_done_errno payload.
-		m.Put(int64(0))
+		m.Put(primitive.AllocateInt64(0))
 
-		_, notify, err := s.connection.Send([][]byte{m.Finalize()}, cms, tcpip.FullAddress{})
+		_, notify, err := s.connection.Send(ctx, [][]byte{m.Finalize()}, cms, transport.Address{})
 		if err != nil && err != syserr.ErrWouldBlock {
 			return err
 		}
@@ -644,21 +716,21 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 	return nil
 }
 
-func dumpErrorMesage(hdr linux.NetlinkMessageHeader, ms *MessageSet, err *syserr.Error) {
+func dumpErrorMessage(hdr linux.NetlinkMessageHeader, ms *nlmsg.MessageSet, err *syserr.Error) {
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.NLMSG_ERROR,
 	})
-	m.Put(linux.NetlinkErrorMessage{
-		Error:  int32(-err.ToLinux().Number()),
+	m.Put(&linux.NetlinkErrorMessage{
+		Error:  int32(-err.ToLinux()),
 		Header: hdr,
 	})
 }
 
-func dumpAckMesage(hdr linux.NetlinkMessageHeader, ms *MessageSet) {
+func dumpAckMessage(hdr linux.NetlinkMessageHeader, ms *nlmsg.MessageSet) {
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.NLMSG_ERROR,
 	})
-	m.Put(linux.NetlinkErrorMessage{
+	m.Put(&linux.NetlinkErrorMessage{
 		Error:  0,
 		Header: hdr,
 	})
@@ -668,7 +740,7 @@ func dumpAckMesage(hdr linux.NetlinkMessageHeader, ms *MessageSet) {
 // handler for final handling.
 func (s *Socket) processMessages(ctx context.Context, buf []byte) *syserr.Error {
 	for len(buf) > 0 {
-		msg, rest, ok := ParseMessage(buf)
+		msg, rest, ok := nlmsg.ParseMessage(buf)
 		if !ok {
 			// Linux ignores messages that are too short. See
 			// net/netlink/af_netlink.c:netlink_rcv_skb.
@@ -682,11 +754,11 @@ func (s *Socket) processMessages(ctx context.Context, buf []byte) *syserr.Error 
 			continue
 		}
 
-		ms := NewMessageSet(s.portID, hdr.Seq)
-		if err := s.protocol.ProcessMessage(ctx, msg, ms); err != nil {
-			dumpErrorMesage(hdr, ms, err)
+		ms := nlmsg.NewMessageSet(s.portID, hdr.Seq)
+		if err := s.protocol.ProcessMessage(ctx, s, msg, ms); err != nil {
+			dumpErrorMessage(hdr, ms, err)
 		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK {
-			dumpAckMesage(hdr, ms)
+			dumpAckMessage(hdr, ms)
 		}
 
 		if err := s.sendResponse(ctx, ms); err != nil {
@@ -732,6 +804,12 @@ func (s *Socket) sendMsg(ctx context.Context, src usermem.IOSequence, to []byte,
 
 	buf := make([]byte, src.NumBytes())
 	n, err := src.CopyIn(ctx, buf)
+	// io.EOF can be only returned if src is a file, this means that
+	// sendMsg is called from splice and the error has to be ignored in
+	// this case.
+	if err == io.EOF {
+		err = nil
+	}
 	if err != nil {
 		// Don't partially consume messages.
 		return 0, syserr.FromError(err)
@@ -747,12 +825,6 @@ func (s *Socket) sendMsg(ctx context.Context, src usermem.IOSequence, to []byte,
 // SendMsg implements socket.Socket.SendMsg.
 func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	return s.sendMsg(t, src, to, flags, controlMessages)
-}
-
-// Write implements fs.FileOperations.Write.
-func (s *Socket) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
-	n, err := s.sendMsg(ctx, src, nil, 0, socket.ControlMessages{})
-	return int64(n), err.ToError()
 }
 
 // State implements socket.Socket.State.

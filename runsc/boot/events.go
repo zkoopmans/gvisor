@@ -15,23 +15,51 @@
 package boot
 
 import (
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"fmt"
+	"strconv"
+
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
+
+// NetworkInterface is the network statistics of the particular network interface
+type NetworkInterface struct {
+	// Name is the name of the network interface.
+	Name      string
+	RxBytes   uint64
+	RxPackets uint64
+	RxErrors  uint64
+	RxDropped uint64
+	TxBytes   uint64
+	TxPackets uint64
+	TxErrors  uint64
+	TxDropped uint64
+}
+
+// EventOut is the return type of the Event command.
+type EventOut struct {
+	Event Event `json:"event"`
+
+	// ContainerUsage maps each container ID to its total CPU usage.
+	ContainerUsage map[string]uint64 `json:"containerUsage"`
+}
 
 // Event struct for encoding the event data to JSON. Corresponds to runc's
 // main.event struct.
 type Event struct {
-	Type string      `json:"type"`
-	ID   string      `json:"id"`
-	Data interface{} `json:"data,omitempty"`
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Data Stats  `json:"data"`
 }
 
 // Stats is the runc specific stats structure for stability when encoding and
 // decoding stats.
 type Stats struct {
-	Memory Memory `json:"memory"`
-	Pids   Pids   `json:"pids"`
+	CPU               CPU                 `json:"cpu"`
+	Memory            Memory              `json:"memory"`
+	Pids              Pids                `json:"pids"`
+	NetworkInterfaces []*NetworkInterface `json:"network_interfaces"`
 }
 
 // Pids contains stats on processes.
@@ -58,24 +86,113 @@ type Memory struct {
 	Raw       map[string]uint64 `json:"raw,omitempty"`
 }
 
-// Event gets the events from the container.
-func (cm *containerManager) Event(_ *struct{}, out *Event) error {
-	stats := &Stats{}
-	stats.populateMemory(cm.l.k)
-	stats.populatePIDs(cm.l.k)
-	*out = Event{Type: "stats", Data: stats}
-	return nil
+// CPU contains stats on the CPU.
+type CPU struct {
+	Usage CPUUsage `json:"usage"`
 }
 
-func (s *Stats) populateMemory(k *kernel.Kernel) {
-	mem := k.MemoryFile()
-	mem.UpdateUsage()
-	_, totalUsage := usage.MemoryAccounting.Copy()
-	s.Memory.Usage = MemoryEntry{
-		Usage: totalUsage,
+// CPUUsage contains stats on CPU usage.
+type CPUUsage struct {
+	Kernel uint64   `json:"kernel,omitempty"`
+	User   uint64   `json:"user,omitempty"`
+	Total  uint64   `json:"total,omitempty"`
+	PerCPU []uint64 `json:"percpu,omitempty"`
+}
+
+func (cm *containerManager) getUsageFromCgroups(file control.CgroupControlFile) (uint64, error) {
+	var out control.CgroupsResults
+	args := control.CgroupsReadArgs{
+		Args: []control.CgroupsReadArg{
+			{
+				File: file,
+			},
+		},
 	}
+	cgroups := control.Cgroups{Kernel: cm.l.k}
+	if err := cgroups.ReadControlFiles(&args, &out); err != nil {
+		return 0, err
+	}
+	if len(out.Results) != 1 {
+		return 0, fmt.Errorf("expected 1 result, got %d, raw: %+v", len(out.Results), out)
+	}
+	val, err := out.Results[0].Unpack()
+	if err != nil {
+		return 0, err
+	}
+	usage, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return usage, nil
 }
 
-func (s *Stats) populatePIDs(k *kernel.Kernel) {
-	s.Pids.Current = uint64(len(k.TaskSet().Root.ThreadGroups()))
+// Event gets the events from the container.
+func (cm *containerManager) Event(cid *string, out *EventOut) error {
+	*out = EventOut{
+		Event: Event{
+			ID:   *cid,
+			Type: "stats",
+		},
+	}
+
+	// PIDs and check that container exists before going further.
+	pids, err := cm.l.pidsCount(*cid)
+	if err != nil {
+		return err
+	}
+	out.Event.Data.Pids.Current = uint64(pids)
+
+	networkStats, err := cm.l.networkStats()
+	if err != nil {
+		return err
+	}
+	out.Event.Data.NetworkInterfaces = networkStats
+
+	numContainers := cm.l.containerCount()
+	if numContainers == 0 {
+		return fmt.Errorf("no container was found")
+	}
+
+	// Memory usage.
+	memFile := control.CgroupControlFile{"memory", "/" + *cid, "memory.usage_in_bytes"}
+	memUsage, err := cm.getUsageFromCgroups(memFile)
+	if err != nil {
+		// Cgroups is not installed or there was an error to get usage
+		// from the cgroups. Fall back to the old method of getting the
+		// usage from the sentry.
+		log.Warningf("could not get container memory usage from cgroups, error:  %v", err)
+
+		mem := cm.l.k.MemoryFile()
+		_ = mem.UpdateUsage(nil) // best effort to update.
+		_, totalUsage := usage.MemoryAccounting.Copy()
+		if numContainers == 1 {
+			memUsage = totalUsage
+		} else {
+			// In the multi-container case, reports 0 for the root (pause)
+			// container, since it's small and idle. Then equally split the
+			// usage to the other containers. At least the sum of all
+			// containers will correctly account for the memory used by the
+			// sandbox.
+			if *cid == cm.l.sandboxID {
+				memUsage = 0
+			} else {
+				memUsage = totalUsage / uint64(numContainers-1)
+			}
+		}
+	}
+	out.Event.Data.Memory.Usage.Usage = memUsage
+
+	// CPU usage by container.
+	cpuacctFile := control.CgroupControlFile{"cpuacct", "/" + *cid, "cpuacct.usage"}
+	if cpuUsage, err := cm.getUsageFromCgroups(cpuacctFile); err != nil {
+		// Cgroups is not installed or there was an error to get usage
+		// from the cgroups. Fall back to the old method of getting the
+		// usage from the sentry and host cgroups.
+		log.Warningf("could not get container cpu usage from cgroups, error:  %v", err)
+
+		out.ContainerUsage = control.ContainerUsage(cm.l.k)
+	} else {
+		out.Event.Data.CPU.Usage.Total = cpuUsage
+	}
+	return nil
 }

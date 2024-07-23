@@ -12,21 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build go1.12
-// +build !go1.15
+//go:build go1.18
+// +build go1.18
 
-// Check go:linkname function signatures when updating Go version.
+// //go:linkname directives type-checked by checklinkname. Any other
+// non-linkname assumptions outside the Go 1 compatibility guarantee should
+// have an accompanied vet check or version guard build tag.
 
 package kvm
 
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 )
 
 //go:linkname entersyscall runtime.entersyscall
@@ -41,7 +46,7 @@ func exitsyscall()
 // directly (instead of wrapping in an error) to avoid allocations.
 //
 //go:nosplit
-func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, flags uint32) syscall.Errno {
+func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, flags uint32) unix.Errno {
 	userRegion := userMemoryRegion{
 		slot:          uint32(slot),
 		flags:         uint32(flags),
@@ -51,22 +56,23 @@ func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, f
 	}
 
 	// Set the region.
+	// Note: syscall.RawSyscall is used to fit the nosplit stack limit.
 	_, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+		unix.SYS_IOCTL,
 		uintptr(m.fd),
-		_KVM_SET_USER_MEMORY_REGION,
+		KVM_SET_USER_MEMORY_REGION,
 		uintptr(unsafe.Pointer(&userRegion)))
 	return errno
 }
 
 // mapRunData maps the vCPU run data.
 func mapRunData(fd int) (*runData, error) {
-	r, _, errno := syscall.RawSyscall6(
-		syscall.SYS_MMAP,
+	r, _, errno := unix.RawSyscall6(
+		unix.SYS_MMAP,
 		0,
 		uintptr(runDataSize),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
 		uintptr(fd),
 		0)
 	if errno != 0 {
@@ -77,8 +83,8 @@ func mapRunData(fd int) (*runData, error) {
 
 // unmapRunData unmaps the vCPU run data.
 func unmapRunData(r *runData) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_MUNMAP,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_MUNMAP,
 		uintptr(unsafe.Pointer(r)),
 		uintptr(runDataSize),
 		0); errno != 0 {
@@ -115,8 +121,8 @@ func (a *atomicAddressSpace) get() *addressSpace {
 //
 //go:nosplit
 func (c *vCPU) notify() {
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_FUTEX,
+	_, _, errno := unix.RawSyscall6( // escapes: no.
+		unix.SYS_FUTEX,
 		uintptr(unsafe.Pointer(&c.state)),
 		linux.FUTEX_WAKE|linux.FUTEX_PRIVATE_FLAG,
 		math.MaxInt32, // Number of waiters.
@@ -133,13 +139,126 @@ func (c *vCPU) notify() {
 //
 // This panics on error.
 func (c *vCPU) waitUntilNot(state uint32) {
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_FUTEX,
+	_, _, errno := unix.Syscall6(
+		unix.SYS_FUTEX,
 		uintptr(unsafe.Pointer(&c.state)),
 		linux.FUTEX_WAIT|linux.FUTEX_PRIVATE_FLAG,
 		uintptr(state),
 		0, 0, 0)
-	if errno != 0 && errno != syscall.EINTR && errno != syscall.EAGAIN {
+	if errno != 0 && errno != unix.EINTR && errno != unix.EAGAIN {
 		panic("futex wait error")
+	}
+}
+
+// setSignalMask sets the vCPU signal mask.
+//
+// This must be called prior to running the vCPU.
+func (c *vCPU) setSignalMask() error {
+	// The layout of this structure implies that it will not necessarily be
+	// the same layout chosen by the Go compiler. It gets fudged here.
+	var data struct {
+		length uint32
+		mask1  uint32
+		mask2  uint32
+		_      uint32
+	}
+	data.length = 8 // Fixed sigset size.
+	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
+	data.mask2 = ^uint32(bounceSignalMask >> 32)
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_SET_SIGNAL_MASK,
+		uintptr(unsafe.Pointer(&data))); errno != 0 {
+		return fmt.Errorf("error setting signal mask: %v", errno)
+	}
+
+	return nil
+}
+
+// seccompMmapHandlerCnt is a number of currently running seccompMmapHandler
+// instances.
+var seccompMmapHandlerCnt atomicbitops.Int64
+
+// seccompMmapSync waits for all currently runnuing seccompMmapHandler
+// instances.
+//
+// The standard locking primitives can't be used in this case since
+// seccompMmapHandler is executed in a signal handler context.
+//
+// It can be implemented by using FUTEX calls, but it will require to call
+// FUTEX_WAKE from seccompMmapHandler. Consider machine.Destroy is called only
+// once, and the probability is racing with seccompMmapHandler is very low the
+// spinlock-like way looks more reasonable.
+func seccompMmapSync() {
+	for seccompMmapHandlerCnt.Load() != 0 {
+		runtime.Gosched()
+	}
+}
+
+// seccompMmapHandler is a signal handler for runtime mmap system calls
+// that are trapped by seccomp.
+//
+// It executes the mmap syscall with specified arguments and maps a new region
+// to the guest.
+//
+//go:nosplit
+func seccompMmapHandler(context unsafe.Pointer) {
+	mmapCallCounter.Increment()
+
+	addr, length, errno := seccompMmapSyscall(context)
+	if errno != 0 {
+		return
+	}
+
+	seccompMmapHandlerCnt.Add(1)
+	for i := uint32(0); i < machinePoolLen.Load(); i++ {
+		m := machinePool[i].Load()
+		if m == nil {
+			continue
+		}
+
+		// Map the new region to the guest.
+		vr := region{
+			virtual: addr,
+			length:  length,
+		}
+		for virtual := vr.virtual; virtual < vr.virtual+vr.length; {
+			physical, length, ok := translateToPhysical(virtual)
+			if !ok {
+				// This must be an invalid region that was
+				// knocked out by creation of the physical map.
+				return
+			}
+			if virtual+length > vr.virtual+vr.length {
+				// Cap the length to the end of the area.
+				length = vr.virtual + vr.length - virtual
+			}
+
+			// Ensure the physical range is mapped.
+			m.mapPhysical(physical, length, physicalRegions)
+			virtual += length
+		}
+	}
+	seccompMmapHandlerCnt.Add(-1)
+}
+
+// disableAsyncPreemption disables asynchronous preemption of go-routines.
+func disableAsyncPreemption() {
+	set := linux.MakeSignalSet(linux.SIGURG)
+	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, linux.SIG_BLOCK,
+		uintptr(unsafe.Pointer(&set)), 0, linux.SignalSetSize, 0, 0)
+	if errno != 0 {
+		panic(fmt.Sprintf("sigprocmask failed: %d", errno))
+	}
+}
+
+// enableAsyncPreemption enables asynchronous preemption of go-routines.
+func enableAsyncPreemption() {
+	set := linux.MakeSignalSet(linux.SIGURG)
+	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, linux.SIG_UNBLOCK,
+		uintptr(unsafe.Pointer(&set)), 0, linux.SignalSetSize, 0, 0)
+	if errno != 0 {
+		panic(fmt.Sprintf("sigprocmask failed: %d", errno))
 	}
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !msan && !race
 // +build !msan,!race
 
 package filter
@@ -24,5 +25,5 @@ import (
 // Go instrumentation tools, e.g. -race, -msan.
 // Returns empty when disabled.
 func instrumentationFilters() seccomp.SyscallRules {
-	return nil
+	return seccomp.NewSyscallRules()
 }

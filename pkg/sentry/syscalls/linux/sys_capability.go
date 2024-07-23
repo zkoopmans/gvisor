@@ -16,22 +16,22 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 func lookupCaps(t *kernel.Task, tid kernel.ThreadID) (permitted, inheritable, effective auth.CapabilitySet, err error) {
 	if tid < 0 {
-		err = syserror.EINVAL
+		err = linuxerr.EINVAL
 		return
 	}
 	if tid > 0 {
 		t = t.PIDNamespace().TaskWithID(tid)
 	}
 	if t == nil {
-		err = syserror.ESRCH
+		err = linuxerr.ESRCH
 		return
 	}
 	creds := t.Credentials()
@@ -40,12 +40,12 @@ func lookupCaps(t *kernel.Task, tid kernel.ThreadID) (permitted, inheritable, ef
 }
 
 // Capget implements Linux syscall capget.
-func Capget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Capget(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	hdrAddr := args[0].Pointer()
 	dataAddr := args[1].Pointer()
 
 	var hdr linux.CapUserHeader
-	if _, err := t.CopyIn(hdrAddr, &hdr); err != nil {
+	if _, err := hdr.CopyIn(t, hdrAddr); err != nil {
 		return 0, nil, err
 	}
 	// hdr.Pid doesn't need to be valid if this capget() is a "version probe"
@@ -65,7 +65,7 @@ func Capget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 			Permitted:   uint32(p),
 			Inheritable: uint32(i),
 		}
-		_, err = t.CopyOut(dataAddr, &data)
+		_, err = data.CopyOut(t, dataAddr)
 		return 0, nil, err
 
 	case linux.LINUX_CAPABILITY_VERSION_2, linux.LINUX_CAPABILITY_VERSION_3:
@@ -88,37 +88,37 @@ func Capget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 				Inheritable: uint32(i >> 32),
 			},
 		}
-		_, err = t.CopyOut(dataAddr, &data)
+		_, err = linux.CopyCapUserDataSliceOut(t, dataAddr, data[:])
 		return 0, nil, err
 
 	default:
 		hdr.Version = linux.HighestCapabilityVersion
-		if _, err := t.CopyOut(hdrAddr, &hdr); err != nil {
+		if _, err := hdr.CopyOut(t, hdrAddr); err != nil {
 			return 0, nil, err
 		}
 		if dataAddr != 0 {
-			return 0, nil, syserror.EINVAL
+			return 0, nil, linuxerr.EINVAL
 		}
 		return 0, nil, nil
 	}
 }
 
 // Capset implements Linux syscall capset.
-func Capset(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Capset(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	hdrAddr := args[0].Pointer()
 	dataAddr := args[1].Pointer()
 
 	var hdr linux.CapUserHeader
-	if _, err := t.CopyIn(hdrAddr, &hdr); err != nil {
+	if _, err := hdr.CopyIn(t, hdrAddr); err != nil {
 		return 0, nil, err
 	}
 	switch hdr.Version {
 	case linux.LINUX_CAPABILITY_VERSION_1:
 		if tid := kernel.ThreadID(hdr.Pid); tid != 0 && tid != t.ThreadID() {
-			return 0, nil, syserror.EPERM
+			return 0, nil, linuxerr.EPERM
 		}
 		var data linux.CapUserData
-		if _, err := t.CopyIn(dataAddr, &data); err != nil {
+		if _, err := data.CopyIn(t, dataAddr); err != nil {
 			return 0, nil, err
 		}
 		p := auth.CapabilitySet(data.Permitted) & auth.AllCapabilities
@@ -128,10 +128,10 @@ func Capset(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 
 	case linux.LINUX_CAPABILITY_VERSION_2, linux.LINUX_CAPABILITY_VERSION_3:
 		if tid := kernel.ThreadID(hdr.Pid); tid != 0 && tid != t.ThreadID() {
-			return 0, nil, syserror.EPERM
+			return 0, nil, linuxerr.EPERM
 		}
 		var data [2]linux.CapUserData
-		if _, err := t.CopyIn(dataAddr, &data); err != nil {
+		if _, err := linux.CopyCapUserDataSliceIn(t, dataAddr, data[:]); err != nil {
 			return 0, nil, err
 		}
 		p := (auth.CapabilitySet(data[0].Permitted) | (auth.CapabilitySet(data[1].Permitted) << 32)) & auth.AllCapabilities
@@ -141,9 +141,9 @@ func Capset(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 
 	default:
 		hdr.Version = linux.HighestCapabilityVersion
-		if _, err := t.CopyOut(hdrAddr, &hdr); err != nil {
+		if _, err := hdr.CopyOut(t, hdrAddr); err != nil {
 			return 0, nil, err
 		}
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 }

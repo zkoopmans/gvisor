@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build (linux && amd64) || (linux && arm64)
 // +build linux,amd64 linux,arm64
 
 package fdbased
 
 import (
 	"fmt"
-	"sync/atomic"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 )
 
 // tPacketHdrlen is the TPACKET_HDRLEN variable defined in <linux/if_packet.h>.
-var tPacketHdrlen = tPacketAlign(unsafe.Sizeof(tPacketHdr{}) + unsafe.Sizeof(syscall.RawSockaddrLinklayer{}))
+var tPacketHdrlen = tPacketAlign(unsafe.Sizeof(tPacketHdr{}) + unsafe.Sizeof(unix.RawSockaddrLinklayer{}))
 
 // tpStatus returns the frame status field.
 // The status is concurrently updated by the kernel as a result we must
@@ -34,7 +35,7 @@ var tPacketHdrlen = tPacketAlign(unsafe.Sizeof(tPacketHdr{}) + unsafe.Sizeof(sys
 func (t tPacketHdr) tpStatus() uint32 {
 	hdr := unsafe.Pointer(&t[0])
 	statusPtr := unsafe.Pointer(uintptr(hdr) + uintptr(tpStatusOffset))
-	return atomic.LoadUint32((*uint32)(statusPtr))
+	return (*atomicbitops.Uint32)(statusPtr).Load()
 }
 
 // setTPStatus set's the frame status to the provided status.
@@ -43,13 +44,18 @@ func (t tPacketHdr) tpStatus() uint32 {
 func (t tPacketHdr) setTPStatus(status uint32) {
 	hdr := unsafe.Pointer(&t[0])
 	statusPtr := unsafe.Pointer(uintptr(hdr) + uintptr(tpStatusOffset))
-	atomic.StoreUint32((*uint32)(statusPtr), status)
+	(*atomicbitops.Uint32)(statusPtr).Store(status)
 }
 
-func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
+func newPacketMMapDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
+	stopFD, err := stopfd.New()
+	if err != nil {
+		return nil, err
+	}
 	d := &packetMMapDispatcher{
-		fd: fd,
-		e:  e,
+		StopFD: stopFD,
+		fd:     fd,
+		e:      e,
 	}
 	pageSize := unix.Getpagesize()
 	if tpBlockSize%pageSize != 0 {
@@ -62,21 +68,23 @@ func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
 		tpFrameNR:   uint32(tpFrameNR),
 	}
 	// Setup PACKET_RX_RING.
-	if err := setsockopt(d.fd, syscall.SOL_PACKET, syscall.PACKET_RX_RING, unsafe.Pointer(&tReq), unsafe.Sizeof(tReq)); err != nil {
+	if err := setsockopt(d.fd, unix.SOL_PACKET, unix.PACKET_RX_RING, unsafe.Pointer(&tReq), unsafe.Sizeof(tReq)); err != nil {
 		return nil, fmt.Errorf("failed to enable PACKET_RX_RING: %v", err)
 	}
 	// Let's mmap the blocks.
 	sz := tpBlockSize * tpBlockNR
-	buf, err := syscall.Mmap(d.fd, 0, sz, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	buf, err := unix.Mmap(d.fd, 0, sz, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return nil, fmt.Errorf("syscall.Mmap(...,0, %v, ...) failed = %v", sz, err)
+		return nil, fmt.Errorf("unix.Mmap(...,0, %v, ...) failed = %v", sz, err)
 	}
+	d.mgr = newProcessorManager(opts, e)
+	d.mgr.start()
 	d.ringBuffer = buf
 	return d, nil
 }
 
 func setsockopt(fd, level, name int, val unsafe.Pointer, vallen uintptr) error {
-	if _, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), uintptr(val), vallen, 0); errno != 0 {
+	if _, _, errno := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), uintptr(val), vallen, 0); errno != 0 {
 		return error(errno)
 	}
 

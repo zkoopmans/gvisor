@@ -14,6 +14,12 @@
 
 package linux
 
+import (
+	"fmt"
+
+	"golang.org/x/sys/unix"
+)
+
 // Protections for mmap(2).
 const (
 	PROT_NONE      = 0
@@ -90,14 +96,19 @@ const (
 	MS_SYNC       = 1 << 2
 )
 
+// NumaPolicy is the NUMA memory policy for a memory range. See numa(7).
+//
+// +marshal
+type NumaPolicy int32
+
 // Policies for get_mempolicy(2)/set_mempolicy(2).
 const (
-	MPOL_DEFAULT    = 0
-	MPOL_PREFERRED  = 1
-	MPOL_BIND       = 2
-	MPOL_INTERLEAVE = 3
-	MPOL_LOCAL      = 4
-	MPOL_MAX        = 5
+	MPOL_DEFAULT    NumaPolicy = 0
+	MPOL_PREFERRED  NumaPolicy = 1
+	MPOL_BIND       NumaPolicy = 2
+	MPOL_INTERLEAVE NumaPolicy = 3
+	MPOL_LOCAL      NumaPolicy = 4
+	MPOL_MAX        NumaPolicy = 5
 )
 
 // Flags for get_mempolicy(2).
@@ -123,3 +134,26 @@ const (
 
 	MPOL_MF_VALID = MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL
 )
+
+// TaskSize is the address space size.
+var TaskSize = func() uintptr {
+	pageSize := uintptr(unix.Getpagesize())
+	for _, s := range feasibleTaskSizes {
+		// mmap returns ENOMEM if addr is greater than TASK_SIZE,
+		// otherwise it returns EINVAL, because addr isn't aligned to
+		// the page size.
+		_, _, errno := unix.RawSyscall6(
+			unix.SYS_MMAP,
+			s-pageSize-1,
+			512,
+			uintptr(unix.PROT_NONE),
+			uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
+		if errno == unix.EINVAL {
+			return s
+		}
+		if errno != unix.ENOMEM {
+			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
+		}
+	}
+	panic("None of the address space sizes could be successfully mmaped")
+}()

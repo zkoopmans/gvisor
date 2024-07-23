@@ -18,11 +18,9 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
-	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const matcherNameTCP = "tcp"
@@ -39,21 +37,27 @@ func (tcpMarshaler) name() string {
 	return matcherNameTCP
 }
 
+func (tcpMarshaler) revision() uint8 {
+	return 0
+}
+
 // marshal implements matchMaker.marshal.
-func (tcpMarshaler) marshal(mr iptables.Matcher) []byte {
+func (tcpMarshaler) marshal(mr matcher) []byte {
 	matcher := mr.(*TCPMatcher)
 	xttcp := linux.XTTCP{
 		SourcePortStart:      matcher.sourcePortStart,
 		SourcePortEnd:        matcher.sourcePortEnd,
 		DestinationPortStart: matcher.destinationPortStart,
 		DestinationPortEnd:   matcher.destinationPortEnd,
+		FlagMask:             matcher.flagMask,
+		FlagCompare:          matcher.flagCompare,
+		InverseFlags:         matcher.inverseFlags,
 	}
-	buf := make([]byte, 0, linux.SizeOfXTTCP)
-	return marshalEntryMatch(matcherNameTCP, binary.Marshal(buf, usermem.ByteOrder, xttcp))
+	return marshalEntryMatch(matcherNameTCP, marshal.Marshal(&xttcp))
 }
 
 // unmarshal implements matchMaker.unmarshal.
-func (tcpMarshaler) unmarshal(buf []byte, filter iptables.IPHeaderFilter) (iptables.Matcher, error) {
+func (tcpMarshaler) unmarshal(_ IDMapper, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
 	if len(buf) < linux.SizeOfXTTCP {
 		return nil, fmt.Errorf("buf has insufficient size for TCP match: %d", len(buf))
 	}
@@ -61,18 +65,16 @@ func (tcpMarshaler) unmarshal(buf []byte, filter iptables.IPHeaderFilter) (iptab
 	// For alignment reasons, the match's total size may
 	// exceed what's strictly necessary to hold matchData.
 	var matchData linux.XTTCP
-	binary.Unmarshal(buf[:linux.SizeOfXTTCP], usermem.ByteOrder, &matchData)
+	matchData.UnmarshalUnsafe(buf)
 	nflog("parseMatchers: parsed XTTCP: %+v", matchData)
 
-	if matchData.Option != 0 ||
-		matchData.FlagMask != 0 ||
-		matchData.FlagCompare != 0 ||
-		matchData.InverseFlags != 0 {
+	// Only support inverse dport/sport
+	if matchData.Option != 0 || matchData.InverseFlags > 2 {
 		return nil, fmt.Errorf("unsupported TCP matcher flags set")
 	}
 
 	if filter.Protocol != header.TCPProtocolNumber {
-		return nil, fmt.Errorf("TCP matching is only valid for protocol %d.", header.TCPProtocolNumber)
+		return nil, fmt.Errorf("TCP matching is only valid for protocol %d", header.TCPProtocolNumber)
 	}
 
 	return &TCPMatcher{
@@ -80,6 +82,9 @@ func (tcpMarshaler) unmarshal(buf []byte, filter iptables.IPHeaderFilter) (iptab
 		sourcePortEnd:        matchData.SourcePortEnd,
 		destinationPortStart: matchData.DestinationPortStart,
 		destinationPortEnd:   matchData.DestinationPortEnd,
+		flagMask:             matchData.FlagMask,
+		flagCompare:          matchData.FlagCompare,
+		inverseFlags:         matchData.InverseFlags,
 	}, nil
 }
 
@@ -89,53 +94,75 @@ type TCPMatcher struct {
 	sourcePortEnd        uint16
 	destinationPortStart uint16
 	destinationPortEnd   uint16
+	flagMask             uint8
+	flagCompare          uint8
+	inverseFlags         uint8
 }
 
-// Name implements Matcher.Name.
-func (*TCPMatcher) Name() string {
+// name implements matcher.name.
+func (*TCPMatcher) name() string {
 	return matcherNameTCP
 }
 
+func (*TCPMatcher) revision() uint8 {
+	return 0
+}
+
 // Match implements Matcher.Match.
-func (tm *TCPMatcher) Match(hook iptables.Hook, pkt tcpip.PacketBuffer, interfaceName string) (bool, bool) {
-	netHeader := header.IPv4(pkt.NetworkHeader)
+func (tm *TCPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
+	switch pkt.NetworkProtocolNumber {
+	case header.IPv4ProtocolNumber:
+		netHeader := header.IPv4(pkt.NetworkHeader().Slice())
+		if netHeader.TransportProtocol() != header.TCPProtocolNumber {
+			return false, false
+		}
 
-	if netHeader.TransportProtocol() != header.TCPProtocolNumber {
+		// We don't match fragments.
+		if frag := netHeader.FragmentOffset(); frag != 0 {
+			if frag == 1 {
+				return false, true
+			}
+			return false, false
+		}
+
+	case header.IPv6ProtocolNumber:
+		// As in Linux, we do not perform an IPv6 fragment check. See
+		// xt_action_param.fragoff in
+		// include/linux/netfilter/x_tables.h.
+		if header.IPv6(pkt.NetworkHeader().Slice()).TransportProtocol() != header.TCPProtocolNumber {
+			return false, false
+		}
+
+	default:
+		// We don't know the network protocol.
 		return false, false
 	}
 
-	// We dont't match fragments.
-	if frag := netHeader.FragmentOffset(); frag != 0 {
-		if frag == 1 {
-			return false, true
-		}
-		return false, false
-	}
-
-	// Now we need the transport header. However, this may not have been set
-	// yet.
-	// TODO(gvisor.dev/issue/170): Parsing the transport header should
-	// ultimately be moved into the iptables.Check codepath as matchers are
-	// added.
-	var tcpHeader header.TCP
-	if pkt.TransportHeader != nil {
-		tcpHeader = header.TCP(pkt.TransportHeader)
-	} else {
-		// The TCP header hasn't been parsed yet. We have to do it here.
-		if len(pkt.Data.First()) < header.TCPMinimumSize {
-			// There's no valid TCP header here, so we hotdrop the
-			// packet.
-			return false, true
-		}
-		tcpHeader = header.TCP(pkt.Data.First())
+	tcpHeader := header.TCP(pkt.TransportHeader().Slice())
+	if len(tcpHeader) < header.TCPMinimumSize {
+		// There's no valid TCP header here, so we drop the packet immediately.
+		return false, true
 	}
 
 	// Check whether the source and destination ports are within the
 	// matching range.
-	if sourcePort := tcpHeader.SourcePort(); sourcePort < tm.sourcePortStart || tm.sourcePortEnd < sourcePort {
+	// Take into account inverseFlags for DSTPT & SRCPT only
+	sPort := tcpHeader.SourcePort()
+	sPortMatch := sPort < tm.sourcePortStart || tm.sourcePortEnd < sPort
+	sPortMatch = sPortMatch != (tm.inverseFlags&linux.XT_TCP_INV_SRCPT == linux.XT_TCP_INV_SRCPT)
+	if sPortMatch {
 		return false, false
 	}
-	if destinationPort := tcpHeader.DestinationPort(); destinationPort < tm.destinationPortStart || tm.destinationPortEnd < destinationPort {
+
+	dPort := tcpHeader.DestinationPort()
+	dPortMatch := dPort < tm.destinationPortStart || tm.destinationPortEnd < dPort
+	dPortMatch = dPortMatch != (tm.inverseFlags&linux.XT_TCP_INV_DSTPT == linux.XT_TCP_INV_DSTPT)
+	if dPortMatch {
+		return false, false
+	}
+
+	// Check the flags.
+	if uint8(tcpHeader.Flags())&tm.flagMask != tm.flagCompare {
 		return false, false
 	}
 

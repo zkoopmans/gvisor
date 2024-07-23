@@ -21,16 +21,14 @@ import (
 	"io"
 	"strconv"
 
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/gohacks"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // IO provides access to the contents of a virtual memory space.
-//
-// FIXME(b/38173783): Implementations of IO cannot expect ctx to contain any
-// meaningful data.
 type IO interface {
 	// CopyOut copies len(src) bytes from src to the memory mapped at addr. It
 	// returns the number of bytes copied. If the number of bytes copied is <
@@ -40,7 +38,7 @@ type IO interface {
 	// any following locks in the lock order.
 	//
 	// Postconditions: CopyOut does not retain src.
-	CopyOut(ctx context.Context, addr Addr, src []byte, opts IOOpts) (int, error)
+	CopyOut(ctx context.Context, addr hostarch.Addr, src []byte, opts IOOpts) (int, error)
 
 	// CopyIn copies len(dst) bytes from the memory mapped at addr to dst.
 	// It returns the number of bytes copied. If the number of bytes copied is
@@ -50,15 +48,17 @@ type IO interface {
 	// any following locks in the lock order.
 	//
 	// Postconditions: CopyIn does not retain dst.
-	CopyIn(ctx context.Context, addr Addr, dst []byte, opts IOOpts) (int, error)
+	CopyIn(ctx context.Context, addr hostarch.Addr, dst []byte, opts IOOpts) (int, error)
 
 	// ZeroOut sets toZero bytes to 0, starting at addr. It returns the number
 	// of bytes zeroed. If the number of bytes zeroed is < toZero, it returns a
 	// non-nil error explaining why.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. toZero >= 0.
-	ZeroOut(ctx context.Context, addr Addr, toZero int64, opts IOOpts) (int64, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* toZero >= 0.
+	ZeroOut(ctx context.Context, addr hostarch.Addr, toZero int64, opts IOOpts) (int64, error)
 
 	// CopyOutFrom copies ars.NumBytes() bytes from src to the memory mapped at
 	// ars. It returns the number of bytes copied, which may be less than the
@@ -68,10 +68,12 @@ type IO interface {
 	//
 	// CopyOutFrom calls src.ReadToBlocks at most once.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. src.ReadToBlocks must not block
-	// on mm.MemoryManager.activeMu or any preceding locks in the lock order.
-	CopyOutFrom(ctx context.Context, ars AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* src.ReadToBlocks must not block on mm.MemoryManager.activeMu or
+	//		any preceding locks in the lock order.
+	CopyOutFrom(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error)
 
 	// CopyInTo copies ars.NumBytes() bytes from the memory mapped at ars to
 	// dst. It returns the number of bytes copied. CopyInTo may return a
@@ -80,11 +82,12 @@ type IO interface {
 	//
 	// CopyInTo calls dst.WriteFromBlocks at most once.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. dst.WriteFromBlocks must not
-	// block on mm.MemoryManager.activeMu or any preceding locks in the lock
-	// order.
-	CopyInTo(ctx context.Context, ars AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* dst.WriteFromBlocks must not block on mm.MemoryManager.activeMu or
+	//		any preceding locks in the lock order.
+	CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error)
 
 	// TODO(jamieliu): The requirement that CopyOutFrom/CopyInTo call src/dst
 	// at most once, which is unnecessary in most cases, forces implementations
@@ -95,26 +98,29 @@ type IO interface {
 	// SwapUint32 atomically sets the uint32 value at addr to new and
 	// returns the previous value.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. addr must be aligned to a 4-byte
-	// boundary.
-	SwapUint32(ctx context.Context, addr Addr, new uint32, opts IOOpts) (uint32, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* addr must be aligned to a 4-byte boundary.
+	SwapUint32(ctx context.Context, addr hostarch.Addr, new uint32, opts IOOpts) (uint32, error)
 
 	// CompareAndSwapUint32 atomically compares the uint32 value at addr to
 	// old; if they are equal, the value in memory is replaced by new. In
 	// either case, the previous value stored in memory is returned.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. addr must be aligned to a 4-byte
-	// boundary.
-	CompareAndSwapUint32(ctx context.Context, addr Addr, old, new uint32, opts IOOpts) (uint32, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* addr must be aligned to a 4-byte boundary.
+	CompareAndSwapUint32(ctx context.Context, addr hostarch.Addr, old, new uint32, opts IOOpts) (uint32, error)
 
 	// LoadUint32 atomically loads the uint32 value at addr and returns it.
 	//
-	// Preconditions: The caller must not hold mm.MemoryManager.mappingMu or
-	// any following locks in the lock order. addr must be aligned to a 4-byte
-	// boundary.
-	LoadUint32(ctx context.Context, addr Addr, opts IOOpts) (uint32, error)
+	// Preconditions:
+	//	* The caller must not hold mm.MemoryManager.mappingMu or any
+	//		following locks in the lock order.
+	//	* addr must be aligned to a 4-byte boundary.
+	LoadUint32(ctx context.Context, addr hostarch.Addr, opts IOOpts) (uint32, error)
 }
 
 // IOOpts contains options applicable to all IO methods.
@@ -137,7 +143,7 @@ type IOOpts struct {
 type IOReadWriter struct {
 	Ctx  context.Context
 	IO   IO
-	Addr Addr
+	Addr hostarch.Addr
 	Opts IOOpts
 }
 
@@ -154,15 +160,15 @@ func (rw *IOReadWriter) Read(dst []byte) (int, error) {
 		rw.Addr = end
 	} else {
 		// Disallow wraparound.
-		rw.Addr = ^Addr(0)
+		rw.Addr = ^hostarch.Addr(0)
 		if err != nil {
-			err = syserror.EFAULT
+			err = linuxerr.EFAULT
 		}
 	}
 	return n, err
 }
 
-// Writer implements io.Writer.Write.
+// Write implements io.Writer.Write.
 func (rw *IOReadWriter) Write(src []byte) (int, error) {
 	n, err := rw.IO.CopyOut(rw.Ctx, rw.Addr, src, rw.Opts)
 	end, ok := rw.Addr.AddLength(uint64(n))
@@ -170,57 +176,12 @@ func (rw *IOReadWriter) Write(src []byte) (int, error) {
 		rw.Addr = end
 	} else {
 		// Disallow wraparound.
-		rw.Addr = ^Addr(0)
+		rw.Addr = ^hostarch.Addr(0)
 		if err != nil {
-			err = syserror.EFAULT
+			err = linuxerr.EFAULT
 		}
 	}
 	return n, err
-}
-
-// CopyObjectOut copies a fixed-size value or slice of fixed-size values from
-// src to the memory mapped at addr in uio. It returns the number of bytes
-// copied.
-//
-// CopyObjectOut must use reflection to encode src; performance-sensitive
-// clients should do encoding manually and use uio.CopyOut directly.
-//
-// Preconditions: As for IO.CopyOut.
-func CopyObjectOut(ctx context.Context, uio IO, addr Addr, src interface{}, opts IOOpts) (int, error) {
-	w := &IOReadWriter{
-		Ctx:  ctx,
-		IO:   uio,
-		Addr: addr,
-		Opts: opts,
-	}
-	// Allocate a byte slice the size of the object being marshaled. This
-	// adds an extra reflection call, but avoids needing to grow the slice
-	// during encoding, which can result in many heap-allocated slices.
-	b := make([]byte, 0, binary.Size(src))
-	return w.Write(binary.Marshal(b, ByteOrder, src))
-}
-
-// CopyObjectIn copies a fixed-size value or slice of fixed-size values from
-// the memory mapped at addr in uio to dst. It returns the number of bytes
-// copied.
-//
-// CopyObjectIn must use reflection to decode dst; performance-sensitive
-// clients should use uio.CopyIn directly and do decoding manually.
-//
-// Preconditions: As for IO.CopyIn.
-func CopyObjectIn(ctx context.Context, uio IO, addr Addr, dst interface{}, opts IOOpts) (int, error) {
-	r := &IOReadWriter{
-		Ctx:  ctx,
-		IO:   uio,
-		Addr: addr,
-		Opts: opts,
-	}
-	buf := make([]byte, binary.Size(dst))
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return 0, err
-	}
-	binary.Unmarshal(buf, ByteOrder, dst)
-	return int(r.Addr - addr), nil
 }
 
 // CopyStringIn tuning parameters, defined outside that function for tests.
@@ -235,8 +196,9 @@ const (
 // would exceed maxlen, CopyStringIn returns the string truncated to maxlen and
 // ENAMETOOLONG.
 //
-// Preconditions: As for IO.CopyFromUser. maxlen >= 0.
-func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpts) (string, error) {
+// Preconditions: Same as IO.CopyFromUser, plus:
+//   - maxlen >= 0.
+func CopyStringIn(ctx context.Context, uio IO, addr hostarch.Addr, maxlen int, opts IOOpts) (string, error) {
 	initLen := maxlen
 	if initLen > copyStringMaxInitBufLen {
 		initLen = copyStringMaxInitBufLen
@@ -251,7 +213,7 @@ func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpt
 		}
 		end, ok := addr.AddLength(uint64(readlen))
 		if !ok {
-			return stringFromImmutableBytes(buf[:done]), syserror.EFAULT
+			return gohacks.StringFromImmutableBytes(buf[:done]), linuxerr.EFAULT
 		}
 		// Shorten the read to avoid crossing page boundaries, since faulting
 		// in a page unnecessarily is expensive. This also ensures that partial
@@ -272,16 +234,16 @@ func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpt
 		// Look for the terminating zero byte, which may have occurred before
 		// hitting err.
 		if i := bytes.IndexByte(buf[done:done+n], byte(0)); i >= 0 {
-			return stringFromImmutableBytes(buf[:done+i]), nil
+			return gohacks.StringFromImmutableBytes(buf[:done+i]), nil
 		}
 
 		done += n
 		if err != nil {
-			return stringFromImmutableBytes(buf[:done]), err
+			return gohacks.StringFromImmutableBytes(buf[:done]), err
 		}
 		addr = end
 	}
-	return stringFromImmutableBytes(buf), syserror.ENAMETOOLONG
+	return gohacks.StringFromImmutableBytes(buf), linuxerr.ENAMETOOLONG
 }
 
 // CopyOutVec copies bytes from src to the memory mapped at ars in uio. The
@@ -289,13 +251,13 @@ func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpt
 // less. CopyOutVec returns the number of bytes copied; if this is less than
 // the maximum, it returns a non-nil error explaining why.
 //
-// Preconditions: As for IO.CopyOut.
-func CopyOutVec(ctx context.Context, uio IO, ars AddrRangeSeq, src []byte, opts IOOpts) (int, error) {
+// Preconditions: Same as IO.CopyOut.
+func CopyOutVec(ctx context.Context, uio IO, ars hostarch.AddrRangeSeq, src []byte, opts IOOpts) (int, error) {
 	var done int
 	for !ars.IsEmpty() && done < len(src) {
 		ar := ars.Head()
 		cplen := len(src) - done
-		if Addr(cplen) >= ar.Length() {
+		if hostarch.Addr(cplen) >= ar.Length() {
 			cplen = int(ar.Length())
 		}
 		n, err := uio.CopyOut(ctx, ar.Start, src[done:done+cplen], opts)
@@ -313,13 +275,13 @@ func CopyOutVec(ctx context.Context, uio IO, ars AddrRangeSeq, src []byte, opts 
 // less. CopyInVec returns the number of bytes copied; if this is less than the
 // maximum, it returns a non-nil error explaining why.
 //
-// Preconditions: As for IO.CopyIn.
-func CopyInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dst []byte, opts IOOpts) (int, error) {
+// Preconditions: Same as IO.CopyIn.
+func CopyInVec(ctx context.Context, uio IO, ars hostarch.AddrRangeSeq, dst []byte, opts IOOpts) (int, error) {
 	var done int
 	for !ars.IsEmpty() && done < len(dst) {
 		ar := ars.Head()
 		cplen := len(dst) - done
-		if Addr(cplen) >= ar.Length() {
+		if hostarch.Addr(cplen) >= ar.Length() {
 			cplen = int(ar.Length())
 		}
 		n, err := uio.CopyIn(ctx, ar.Start, dst[done:done+cplen], opts)
@@ -337,13 +299,13 @@ func CopyInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dst []byte, opts I
 // ZeroOutVec returns the number of bytes written; if this is less than the
 // maximum, it returns a non-nil error explaining why.
 //
-// Preconditions: As for IO.ZeroOut.
-func ZeroOutVec(ctx context.Context, uio IO, ars AddrRangeSeq, toZero int64, opts IOOpts) (int64, error) {
+// Preconditions: Same as IO.ZeroOut.
+func ZeroOutVec(ctx context.Context, uio IO, ars hostarch.AddrRangeSeq, toZero int64, opts IOOpts) (int64, error) {
 	var done int64
 	for !ars.IsEmpty() && done < toZero {
 		ar := ars.Head()
 		cplen := toZero - done
-		if Addr(cplen) >= ar.Length() {
+		if hostarch.Addr(cplen) >= ar.Length() {
 			cplen = int64(ar.Length())
 		}
 		n, err := uio.ZeroOut(ctx, ar.Start, cplen, opts)
@@ -373,25 +335,25 @@ func isASCIIWhitespace(b byte) bool {
 // CopyInt32StringsInVec shares the following properties with Linux's
 // kernel/sysctl.c:proc_dointvec(write=1):
 //
-// - If any read value overflows the range of int32, or any invalid characters
-// are encountered during the read, CopyInt32StringsInVec returns EINVAL.
+//   - If any read value overflows the range of int32, or any invalid characters
+//     are encountered during the read, CopyInt32StringsInVec returns EINVAL.
 //
-// - If, upon reaching the end of ars, fewer than len(dsts) values have been
-// read, CopyInt32StringsInVec returns no error if at least 1 value was read
-// and EINVAL otherwise.
+//   - If, upon reaching the end of ars, fewer than len(dsts) values have been
+//     read, CopyInt32StringsInVec returns no error if at least 1 value was read
+//     and EINVAL otherwise.
 //
-// - Trailing whitespace after the last successfully read value is counted in
-// the number of bytes read.
+//   - Trailing whitespace after the last successfully read value is counted in
+//     the number of bytes read.
 //
 // Unlike proc_dointvec():
 //
-// - CopyInt32StringsInVec does not implicitly limit ars.NumBytes() to
-// PageSize-1; callers that require this must do so explicitly.
+//   - CopyInt32StringsInVec does not implicitly limit ars.NumBytes() to
+//     PageSize-1; callers that require this must do so explicitly.
 //
-// - CopyInt32StringsInVec returns EINVAL if ars.NumBytes() == 0.
+//   - CopyInt32StringsInVec returns EINVAL if ars.NumBytes() == 0.
 //
-// Preconditions: As for CopyInVec.
-func CopyInt32StringsInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dsts []int32, opts IOOpts) (int64, error) {
+// Preconditions: Same as CopyInVec.
+func CopyInt32StringsInVec(ctx context.Context, uio IO, ars hostarch.AddrRangeSeq, dsts []int32, opts IOOpts) (int64, error) {
 	if len(dsts) == 0 {
 		return 0, nil
 	}
@@ -419,7 +381,7 @@ func CopyInt32StringsInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dsts [
 		// Parse a single value.
 		val, err := strconv.ParseInt(string(buf[i:nextI]), 10, 32)
 		if err != nil {
-			return int64(i), syserror.EINVAL
+			return int64(i), linuxerr.EINVAL
 		}
 		dsts[j] = int32(val)
 
@@ -435,14 +397,14 @@ func CopyInt32StringsInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dsts [
 		return int64(i), cperr
 	}
 	if j == 0 {
-		return int64(i), syserror.EINVAL
+		return int64(i), linuxerr.EINVAL
 	}
 	return int64(i), nil
 }
 
 // CopyInt32StringInVec is equivalent to CopyInt32StringsInVec, but copies at
 // most one int32.
-func CopyInt32StringInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dst *int32, opts IOOpts) (int64, error) {
+func CopyInt32StringInVec(ctx context.Context, uio IO, ars hostarch.AddrRangeSeq, dst *int32, opts IOOpts) (int64, error) {
 	dsts := [1]int32{*dst}
 	n, err := CopyInt32StringsInVec(ctx, uio, ars, dsts[:], opts)
 	*dst = dsts[0]
@@ -452,7 +414,7 @@ func CopyInt32StringInVec(ctx context.Context, uio IO, ars AddrRangeSeq, dst *in
 // IOSequence holds arguments to IO methods.
 type IOSequence struct {
 	IO    IO
-	Addrs AddrRangeSeq
+	Addrs hostarch.AddrRangeSeq
 	Opts  IOOpts
 }
 
@@ -463,13 +425,13 @@ type IOSequence struct {
 // Many clients of
 // IOSequence currently do something like:
 //
-//     if ioseq.NumBytes() == 0 {
-//       return 0, nil
-//     }
-//     if f.availableBytes == 0 {
-//       return 0, syserror.ErrWouldBlock
-//     }
-//     return ioseq.CopyOutFrom(..., reader)
+//	if ioseq.NumBytes() == 0 {
+//	  return 0, nil
+//	}
+//	if f.availableBytes == 0 {
+//	  return 0, linuxerr.ErrWouldBlock
+//	}
+//	return ioseq.CopyOutFrom(..., reader)
 //
 // In such cases, using s.Addrs.IsEmpty() will cause them to have the wrong
 // behavior for zero-length I/O. However, using s.NumBytes() == 0 instead means
@@ -483,28 +445,28 @@ func (s IOSequence) NumBytes() int64 {
 
 // DropFirst returns a copy of s with s.Addrs.DropFirst(n).
 //
-// Preconditions: As for AddrRangeSeq.DropFirst.
+// Preconditions: Same as hostarch.AddrRangeSeq.DropFirst.
 func (s IOSequence) DropFirst(n int) IOSequence {
 	return IOSequence{s.IO, s.Addrs.DropFirst(n), s.Opts}
 }
 
 // DropFirst64 returns a copy of s with s.Addrs.DropFirst64(n).
 //
-// Preconditions: As for AddrRangeSeq.DropFirst64.
+// Preconditions: Same as hostarch.AddrRangeSeq.DropFirst64.
 func (s IOSequence) DropFirst64(n int64) IOSequence {
 	return IOSequence{s.IO, s.Addrs.DropFirst64(n), s.Opts}
 }
 
 // TakeFirst returns a copy of s with s.Addrs.TakeFirst(n).
 //
-// Preconditions: As for AddrRangeSeq.TakeFirst.
+// Preconditions: Same as hostarch.AddrRangeSeq.TakeFirst.
 func (s IOSequence) TakeFirst(n int) IOSequence {
 	return IOSequence{s.IO, s.Addrs.TakeFirst(n), s.Opts}
 }
 
 // TakeFirst64 returns a copy of s with s.Addrs.TakeFirst64(n).
 //
-// Preconditions: As for AddrRangeSeq.TakeFirst64.
+// Preconditions: Same as hostarch.AddrRangeSeq.TakeFirst64.
 func (s IOSequence) TakeFirst64(n int64) IOSequence {
 	return IOSequence{s.IO, s.Addrs.TakeFirst64(n), s.Opts}
 }
@@ -514,7 +476,7 @@ func (s IOSequence) TakeFirst64(n int64) IOSequence {
 // As with CopyOutVec, if s.NumBytes() < len(src), the copy will be truncated
 // to s.NumBytes(), and a nil error will be returned.
 //
-// Preconditions: As for CopyOutVec.
+// Preconditions: Same as CopyOutVec.
 func (s IOSequence) CopyOut(ctx context.Context, src []byte) (int, error) {
 	return CopyOutVec(ctx, s.IO, s.Addrs, src, s.Opts)
 }
@@ -524,7 +486,7 @@ func (s IOSequence) CopyOut(ctx context.Context, src []byte) (int, error) {
 // As with CopyInVec, if s.NumBytes() < len(dst), the copy will be truncated to
 // s.NumBytes(), and a nil error will be returned.
 //
-// Preconditions: As for CopyInVec.
+// Preconditions: Same as CopyInVec.
 func (s IOSequence) CopyIn(ctx context.Context, dst []byte) (int, error) {
 	return CopyInVec(ctx, s.IO, s.Addrs, dst, s.Opts)
 }
@@ -534,21 +496,21 @@ func (s IOSequence) CopyIn(ctx context.Context, dst []byte) (int, error) {
 // As with ZeroOutVec, if s.NumBytes() < toZero, the write will be truncated
 // to s.NumBytes(), and a nil error will be returned.
 //
-// Preconditions: As for ZeroOutVec.
+// Preconditions: Same as ZeroOutVec.
 func (s IOSequence) ZeroOut(ctx context.Context, toZero int64) (int64, error) {
 	return ZeroOutVec(ctx, s.IO, s.Addrs, toZero, s.Opts)
 }
 
 // CopyOutFrom invokes s.CopyOutFrom over s.Addrs.
 //
-// Preconditions: As for IO.CopyOutFrom.
+// Preconditions: Same as IO.CopyOutFrom.
 func (s IOSequence) CopyOutFrom(ctx context.Context, src safemem.Reader) (int64, error) {
 	return s.IO.CopyOutFrom(ctx, s.Addrs, src, s.Opts)
 }
 
 // CopyInTo invokes s.CopyInTo over s.Addrs.
 //
-// Preconditions: As for IO.CopyInTo.
+// Preconditions: Same as IO.CopyInTo.
 func (s IOSequence) CopyInTo(ctx context.Context, dst safemem.Writer) (int64, error) {
 	return s.IO.CopyInTo(ctx, s.Addrs, dst, s.Opts)
 }
@@ -556,28 +518,35 @@ func (s IOSequence) CopyInTo(ctx context.Context, dst safemem.Writer) (int64, er
 // Reader returns an io.Reader that reads from s. Reads beyond the end of s
 // return io.EOF. The preconditions that apply to s.CopyIn also apply to the
 // returned io.Reader.Read.
-func (s IOSequence) Reader(ctx context.Context) io.Reader {
-	return &ioSequenceReadWriter{ctx, s}
+func (s IOSequence) Reader(ctx context.Context) *IOSequenceReadWriter {
+	return &IOSequenceReadWriter{ctx, s}
 }
 
 // Writer returns an io.Writer that writes to s. Writes beyond the end of s
 // return ErrEndOfIOSequence. The preconditions that apply to s.CopyOut also
 // apply to the returned io.Writer.Write.
-func (s IOSequence) Writer(ctx context.Context) io.Writer {
-	return &ioSequenceReadWriter{ctx, s}
+func (s IOSequence) Writer(ctx context.Context) *IOSequenceReadWriter {
+	return &IOSequenceReadWriter{ctx, s}
 }
 
 // ErrEndOfIOSequence is returned by IOSequence.Writer().Write() when
 // attempting to write beyond the end of the IOSequence.
 var ErrEndOfIOSequence = errors.New("write beyond end of IOSequence")
 
-type ioSequenceReadWriter struct {
+// IOSequenceReadWriter implements io.Reader and io.Writer for an IOSequence.
+type IOSequenceReadWriter struct {
 	ctx context.Context
 	s   IOSequence
 }
 
+// Init initializes the IOSequence.
+func (rw *IOSequenceReadWriter) Init(ctx context.Context, src IOSequence) {
+	rw.ctx = ctx
+	rw.s = src
+}
+
 // Read implements io.Reader.Read.
-func (rw *ioSequenceReadWriter) Read(dst []byte) (int, error) {
+func (rw *IOSequenceReadWriter) Read(dst []byte) (int, error) {
 	n, err := rw.s.CopyIn(rw.ctx, dst)
 	rw.s = rw.s.DropFirst(n)
 	if err == nil && rw.s.NumBytes() == 0 {
@@ -586,8 +555,13 @@ func (rw *ioSequenceReadWriter) Read(dst []byte) (int, error) {
 	return n, err
 }
 
+// Len implements tcpip.Payloader.
+func (rw *IOSequenceReadWriter) Len() int {
+	return int(rw.s.NumBytes())
+}
+
 // Write implements io.Writer.Write.
-func (rw *ioSequenceReadWriter) Write(src []byte) (int, error) {
+func (rw *IOSequenceReadWriter) Write(src []byte) (int, error) {
 	n, err := rw.s.CopyOut(rw.ctx, src)
 	rw.s = rw.s.DropFirst(n)
 	if err == nil && n < len(src) {

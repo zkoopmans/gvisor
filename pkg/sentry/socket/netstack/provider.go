@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 package netstack
 
 import (
-	"syscall"
+	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -39,6 +41,8 @@ type provider struct {
 	netProto tcpip.NetworkProtocolNumber
 }
 
+var rawMissingLogger = log.BasicRateLimitedLogger(time.Minute)
+
 // getTransportProtocol figures out transport protocol. Currently only TCP,
 // UDP, and ICMP are supported. The bool return value is true when this socket
 // is associated with a transport protocol. This is only false for SOCK_RAW,
@@ -46,43 +50,42 @@ type provider struct {
 func getTransportProtocol(ctx context.Context, stype linux.SockType, protocol int) (tcpip.TransportProtocolNumber, bool, *syserr.Error) {
 	switch stype {
 	case linux.SOCK_STREAM:
-		if protocol != 0 && protocol != syscall.IPPROTO_TCP {
+		if protocol != 0 && protocol != unix.IPPROTO_TCP {
 			return 0, true, syserr.ErrInvalidArgument
 		}
 		return tcp.ProtocolNumber, true, nil
 
 	case linux.SOCK_DGRAM:
 		switch protocol {
-		case 0, syscall.IPPROTO_UDP:
+		case 0, unix.IPPROTO_UDP:
 			return udp.ProtocolNumber, true, nil
-		case syscall.IPPROTO_ICMP:
+		case unix.IPPROTO_ICMP:
 			return header.ICMPv4ProtocolNumber, true, nil
-		case syscall.IPPROTO_ICMPV6:
+		case unix.IPPROTO_ICMPV6:
 			return header.ICMPv6ProtocolNumber, true, nil
 		}
 
 	case linux.SOCK_RAW:
-		// TODO(b/142504697): "In order to create a raw socket, a
-		// process must have the CAP_NET_RAW capability in the user
-		// namespace that governs its network namespace." - raw(7)
-
 		// Raw sockets require CAP_NET_RAW.
 		creds := auth.CredentialsFromContext(ctx)
 		if !creds.HasCapability(linux.CAP_NET_RAW) {
+			rawMissingLogger.Infof("A process tried to create a raw socket without CAP_NET_RAW. Should the container config enable CAP_NET_RAW?")
 			return 0, true, syserr.ErrNotPermitted
 		}
 
 		switch protocol {
-		case syscall.IPPROTO_ICMP:
+		case unix.IPPROTO_ICMP:
 			return header.ICMPv4ProtocolNumber, true, nil
-		case syscall.IPPROTO_UDP:
+		case unix.IPPROTO_ICMPV6:
+			return header.ICMPv6ProtocolNumber, true, nil
+		case unix.IPPROTO_UDP:
 			return header.UDPProtocolNumber, true, nil
-		case syscall.IPPROTO_TCP:
+		case unix.IPPROTO_TCP:
 			return header.TCPProtocolNumber, true, nil
 		// IPPROTO_RAW signifies that the raw socket isn't assigned to
 		// a transport protocol. Users will be able to write packets'
 		// IP headers and won't receive anything.
-		case syscall.IPPROTO_RAW:
+		case unix.IPPROTO_RAW:
 			return tcpip.TransportProtocolNumber(0), false, nil
 		}
 	}
@@ -91,7 +94,7 @@ func getTransportProtocol(ctx context.Context, stype linux.SockType, protocol in
 
 // Socket creates a new socket object for the AF_INET, AF_INET6, or AF_PACKET
 // family.
-func (p *provider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (p *provider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
 	// Fail right away if we don't have a stack.
 	stack := t.NetworkContext()
 	if stack == nil {
@@ -118,12 +121,18 @@ func (p *provider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*
 
 	// Create the endpoint.
 	var ep tcpip.Endpoint
-	var e *tcpip.Error
+	var e tcpip.Error
 	wq := &waiter.Queue{}
 	if stype == linux.SOCK_RAW {
 		ep, e = eps.Stack.NewRawEndpoint(transProto, p.netProto, wq, associated)
 	} else {
 		ep, e = eps.Stack.NewEndpoint(transProto, p.netProto, wq)
+
+		// Assign task to PacketOwner interface to get the UID and GID for
+		// iptables owner matching.
+		if e == nil {
+			ep.SetOwner(t)
+		}
 	}
 	if e != nil {
 		return nil, syserr.TranslateNetstackError(e)
@@ -132,14 +141,11 @@ func (p *provider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*
 	return New(t, p.family, stype, int(transProto), wq, ep)
 }
 
-func packetSocket(t *kernel.Task, epStack *Stack, stype linux.SockType, protocol int) (*fs.File, *syserr.Error) {
-	// TODO(b/142504697): "In order to create a packet socket, a process
-	// must have the CAP_NET_RAW capability in the user namespace that
-	// governs its network namespace." - packet(7)
-
+func packetSocket(t *kernel.Task, epStack *Stack, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
 	// Packet sockets require CAP_NET_RAW.
 	creds := auth.CredentialsFromContext(t)
 	if !creds.HasCapability(linux.CAP_NET_RAW) {
+		rawMissingLogger.Infof("A process tried to create a raw socket without CAP_NET_RAW. Should the container config enable CAP_NET_RAW?")
 		return nil, syserr.ErrNotPermitted
 	}
 
@@ -156,11 +162,14 @@ func packetSocket(t *kernel.Task, epStack *Stack, stype linux.SockType, protocol
 
 	// protocol is passed in network byte order, but netstack wants it in
 	// host order.
-	netProto := tcpip.NetworkProtocolNumber(ntohs(uint16(protocol)))
+	netProto := tcpip.NetworkProtocolNumber(socket.Ntohs(uint16(protocol)))
 
 	wq := &waiter.Queue{}
 	ep, err := epStack.Stack.NewPacketEndpoint(cooked, netProto, wq)
 	if err != nil {
+		if _, ok := err.(*tcpip.ErrNotPermitted); ok {
+			rawMissingLogger.Infof("A process tried to create a raw socket, which is disabled by default. Should the runtime config enable --net-raw?")
+		}
 		return nil, syserr.TranslateNetstackError(err)
 	}
 
@@ -168,7 +177,7 @@ func packetSocket(t *kernel.Task, epStack *Stack, stype linux.SockType, protocol
 }
 
 // Pair just returns nil sockets (not supported).
-func (*provider) Pair(*kernel.Task, linux.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
+func (*provider) Pair(*kernel.Task, linux.SockType, int) (*vfs.FileDescription, *vfs.FileDescription, *syserr.Error) {
 	return nil, nil, nil
 }
 

@@ -14,6 +14,10 @@
 
 package linux
 
+import (
+	"strings"
+)
+
 // A Capability represents the ability to perform a privileged operation.
 type Capability int
 
@@ -21,48 +25,51 @@ type Capability int
 // include/uapi/linux/capability.h. See capabilities(7) or that file for more
 // detailed capability descriptions.
 const (
-	CAP_CHOWN            = Capability(0)
-	CAP_DAC_OVERRIDE     = Capability(1)
-	CAP_DAC_READ_SEARCH  = Capability(2)
-	CAP_FOWNER           = Capability(3)
-	CAP_FSETID           = Capability(4)
-	CAP_KILL             = Capability(5)
-	CAP_SETGID           = Capability(6)
-	CAP_SETUID           = Capability(7)
-	CAP_SETPCAP          = Capability(8)
-	CAP_LINUX_IMMUTABLE  = Capability(9)
-	CAP_NET_BIND_SERVICE = Capability(10)
-	CAP_NET_BROADCAST    = Capability(11)
-	CAP_NET_ADMIN        = Capability(12)
-	CAP_NET_RAW          = Capability(13)
-	CAP_IPC_LOCK         = Capability(14)
-	CAP_IPC_OWNER        = Capability(15)
-	CAP_SYS_MODULE       = Capability(16)
-	CAP_SYS_RAWIO        = Capability(17)
-	CAP_SYS_CHROOT       = Capability(18)
-	CAP_SYS_PTRACE       = Capability(19)
-	CAP_SYS_PACCT        = Capability(20)
-	CAP_SYS_ADMIN        = Capability(21)
-	CAP_SYS_BOOT         = Capability(22)
-	CAP_SYS_NICE         = Capability(23)
-	CAP_SYS_RESOURCE     = Capability(24)
-	CAP_SYS_TIME         = Capability(25)
-	CAP_SYS_TTY_CONFIG   = Capability(26)
-	CAP_MKNOD            = Capability(27)
-	CAP_LEASE            = Capability(28)
-	CAP_AUDIT_WRITE      = Capability(29)
-	CAP_AUDIT_CONTROL    = Capability(30)
-	CAP_SETFCAP          = Capability(31)
-	CAP_MAC_OVERRIDE     = Capability(32)
-	CAP_MAC_ADMIN        = Capability(33)
-	CAP_SYSLOG           = Capability(34)
-	CAP_WAKE_ALARM       = Capability(35)
-	CAP_BLOCK_SUSPEND    = Capability(36)
-	CAP_AUDIT_READ       = Capability(37)
+	CAP_CHOWN              = Capability(0)
+	CAP_DAC_OVERRIDE       = Capability(1)
+	CAP_DAC_READ_SEARCH    = Capability(2)
+	CAP_FOWNER             = Capability(3)
+	CAP_FSETID             = Capability(4)
+	CAP_KILL               = Capability(5)
+	CAP_SETGID             = Capability(6)
+	CAP_SETUID             = Capability(7)
+	CAP_SETPCAP            = Capability(8)
+	CAP_LINUX_IMMUTABLE    = Capability(9)
+	CAP_NET_BIND_SERVICE   = Capability(10)
+	CAP_NET_BROADCAST      = Capability(11)
+	CAP_NET_ADMIN          = Capability(12)
+	CAP_NET_RAW            = Capability(13)
+	CAP_IPC_LOCK           = Capability(14)
+	CAP_IPC_OWNER          = Capability(15)
+	CAP_SYS_MODULE         = Capability(16)
+	CAP_SYS_RAWIO          = Capability(17)
+	CAP_SYS_CHROOT         = Capability(18)
+	CAP_SYS_PTRACE         = Capability(19)
+	CAP_SYS_PACCT          = Capability(20)
+	CAP_SYS_ADMIN          = Capability(21)
+	CAP_SYS_BOOT           = Capability(22)
+	CAP_SYS_NICE           = Capability(23)
+	CAP_SYS_RESOURCE       = Capability(24)
+	CAP_SYS_TIME           = Capability(25)
+	CAP_SYS_TTY_CONFIG     = Capability(26)
+	CAP_MKNOD              = Capability(27)
+	CAP_LEASE              = Capability(28)
+	CAP_AUDIT_WRITE        = Capability(29)
+	CAP_AUDIT_CONTROL      = Capability(30)
+	CAP_SETFCAP            = Capability(31)
+	CAP_MAC_OVERRIDE       = Capability(32)
+	CAP_MAC_ADMIN          = Capability(33)
+	CAP_SYSLOG             = Capability(34)
+	CAP_WAKE_ALARM         = Capability(35)
+	CAP_BLOCK_SUSPEND      = Capability(36)
+	CAP_AUDIT_READ         = Capability(37)
+	CAP_PERFMON            = Capability(38)
+	CAP_BPF                = Capability(39)
+	CAP_CHECKPOINT_RESTORE = Capability(40)
 
 	// CAP_LAST_CAP is the highest-numbered capability.
-	// Seach for "CAP_LAST_CAP" to find other places that need to change.
-	CAP_LAST_CAP = CAP_AUDIT_READ
+	// Search for "CAP_LAST_CAP" to find other places that need to change.
+	CAP_LAST_CAP = CAP_CHECKPOINT_RESTORE
 )
 
 // Ok returns true if cp is a supported capability.
@@ -154,6 +161,50 @@ func (cp Capability) String() string {
 	}
 }
 
+// TrimmedString returns the capability name without the "CAP_" prefix.
+func (cp Capability) TrimmedString() string {
+	const capPrefix = "CAP_"
+	s := cp.String()
+	if !strings.HasPrefix(s, capPrefix) {
+		return s
+	}
+	// This could use strings.TrimPrefix, but that function doesn't guarantee
+	// that it won't allocate a new string, whereas string slicing does.
+	// In the case of this function, since Capability.String returns a constant
+	// string, the underlying set of bytes backing that string will never be
+	// garbage-collected. Therefore, we always want to use a string slice that
+	// points to this same constant set of bytes, rather than risking
+	// allocating a new string.
+	return s[len(capPrefix):]
+}
+
+// CapabilityFromString converts a string to a capability.
+// If the capability doesn't exist, its second return value is `false`.
+// The capability name is expected to include the "CAP_" prefix.
+func CapabilityFromString(capability string) (Capability, bool) {
+	for cp := Capability(0); cp <= CAP_LAST_CAP; cp++ {
+		if !cp.Ok() {
+			continue
+		}
+		if cp.String() == capability {
+			return cp, true
+		}
+	}
+	return -1, false
+}
+
+// AllCapabilities returns a list of all defined capabilities.
+func AllCapabilities() []Capability {
+	allCapapabilities := make([]Capability, 0, CAP_LAST_CAP+1)
+	for cp := Capability(0); cp <= CAP_LAST_CAP; cp++ {
+		if !cp.Ok() {
+			continue
+		}
+		allCapapabilities = append(allCapapabilities, cp)
+	}
+	return allCapapabilities
+}
+
 // Version numbers used by the capget/capset syscalls, defined in Linux's
 // include/uapi/linux/capability.h.
 const (
@@ -176,13 +227,44 @@ const (
 	HighestCapabilityVersion = LINUX_CAPABILITY_VERSION_3
 )
 
+// Constants that are used by file capability extended attributes, defined
+// in Linux's include/uapi/linux/capability.h.
+const (
+	// The flag decides the value of effective file capabilit
+	VFS_CAP_FLAGS_EFFECTIVE = 0x000001
+	// VFS_CAP_REVISION_1 was the original file capability implementation,
+	// which supported 32-bit masks for file capabilities.
+	VFS_CAP_REVISION_1 = 0x01000000
+	// VFS_CAP_REVISION_2 allows for file capability masks that are 64
+	// bits in size, and was necessary as the number of supported
+	// capabilities grew beyond 32.
+	VFS_CAP_REVISION_2 = 0x02000000
+	// VFS_CAP_REVISION_3 are provided to support namespaced file capabilities.
+	// As with version 2 file capabilities, version 3 capability
+	// masks are 64 bits in size.  But in addition, the root user
+	// ID of namespace is encoded in the security.capability
+	// extended attribute.
+	VFS_CAP_REVISION_3    = 0x03000000
+	VFS_CAP_REVISION_MASK = 0xFF000000
+	// The encoded VFS_CAP_REVISION_1 data's number of bytes.
+	XATTR_CAPS_SZ_1 = 12
+	// The encoded VFS_CAP_REVISION_2 data's number of bytes.
+	XATTR_CAPS_SZ_2 = 20
+	// The encoded VFS_CAP_REVISION_3 data's number of bytes.
+	XATTR_CAPS_SZ_3 = 24
+)
+
 // CapUserHeader is equivalent to Linux's cap_user_header_t.
+//
+// +marshal
 type CapUserHeader struct {
 	Version uint32
 	Pid     int32
 }
 
 // CapUserData is equivalent to Linux's cap_user_data_t.
+//
+// +marshal slice:CapUserDataSlice
 type CapUserData struct {
 	Effective   uint32
 	Permitted   uint32

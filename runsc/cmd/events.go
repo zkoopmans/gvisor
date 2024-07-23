@@ -22,7 +22,8 @@ import (
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 )
@@ -65,47 +66,46 @@ func (evs *Events) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (evs *Events) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading sandbox: %v", err)
+		util.Fatalf("loading sandbox: %v", err)
 	}
 
-	// Repeatedly get stats from the container.
-	for {
+	// Repeatedly get stats from the container. Sleep a bit after every loop
+	// except the first one.
+	for dur := time.Duration(evs.intervalSec) * time.Second; true; time.Sleep(dur) {
 		// Get the event and print it as JSON.
 		ev, err := c.Event()
 		if err != nil {
 			log.Warningf("Error getting events for container: %v", err)
-		}
-		// err must be preserved because it is used below when breaking
-		// out of the loop.
-		b, err := json.Marshal(ev)
-		if err != nil {
-			log.Warningf("Error while marshalling event %v: %v", ev, err)
-		} else {
-			os.Stdout.Write(b)
-		}
-
-		// If we're only running once, break. If we're only running
-		// once and there was an error, the command failed.
-		if evs.stats {
-			if err != nil {
+			if evs.stats {
 				return subcommands.ExitFailure
 			}
-			break
+			continue
+		}
+		log.Debugf("Events: %+v", ev)
+
+		if err := json.NewEncoder(os.Stdout).Encode(ev.Event); err != nil {
+			log.Warningf("Error encoding event %+v: %v", ev.Event, err)
+			if evs.stats {
+				return subcommands.ExitFailure
+			}
+			continue
 		}
 
-		time.Sleep(time.Duration(evs.intervalSec) * time.Second)
+		// Break if we're only running once. If we got this far it was a success.
+		if evs.stats {
+			return subcommands.ExitSuccess
+		}
 	}
-
-	return subcommands.ExitSuccess
+	panic("should never get here")
 }

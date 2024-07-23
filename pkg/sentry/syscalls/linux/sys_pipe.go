@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,56 +16,52 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-// pipe2 implements the actual system call with flags.
-func pipe2(t *kernel.Task, addr usermem.Addr, flags uint) (uintptr, error) {
+// Pipe implements Linux syscall pipe(2).
+func Pipe(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
+	return 0, nil, pipe2(t, addr, 0)
+}
+
+// Pipe2 implements Linux syscall pipe2(2).
+func Pipe2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
+	flags := args[1].Int()
+	return 0, nil, pipe2(t, addr, flags)
+}
+
+func pipe2(t *kernel.Task, addr hostarch.Addr, flags int32) error {
 	if flags&^(linux.O_NONBLOCK|linux.O_CLOEXEC) != 0 {
-		return 0, syserror.EINVAL
+		return linuxerr.EINVAL
 	}
-	r, w := pipe.NewConnectedPipe(t, pipe.DefaultPipeSize, usermem.PageSize)
+	r, w, err := pipefs.NewConnectedPipeFDs(t, t.Kernel().PipeMount(), uint32(flags&linux.O_NONBLOCK))
+	if err != nil {
+		return err
+	}
+	defer r.DecRef(t)
+	defer w.DecRef(t)
 
-	r.SetFlags(linuxToFlags(flags).Settable())
-	defer r.DecRef()
-
-	w.SetFlags(linuxToFlags(flags).Settable())
-	defer w.DecRef()
-
-	fds, err := t.NewFDs(0, []*fs.File{r, w}, kernel.FDFlags{
+	fds, err := t.NewFDs(0, []*vfs.FileDescription{r, w}, kernel.FDFlags{
 		CloseOnExec: flags&linux.O_CLOEXEC != 0,
 	})
 	if err != nil {
-		return 0, err
+		return err
 	}
-
-	if _, err := t.CopyOut(addr, fds); err != nil {
-		// The files are not closed in this case, the exact semantics
-		// of this error case are not well defined, but they could have
-		// already been observed by user space.
-		return 0, syserror.EFAULT
+	if _, err := primitive.CopyInt32SliceOut(t, addr, fds); err != nil {
+		for _, fd := range fds {
+			if file := t.FDTable().Remove(t, fd); file != nil {
+				file.DecRef(t)
+			}
+		}
+		return err
 	}
-	return 0, nil
-}
-
-// Pipe implements linux syscall pipe(2).
-func Pipe(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	addr := args[0].Pointer()
-
-	n, err := pipe2(t, addr, 0)
-	return n, nil, err
-}
-
-// Pipe2 implements linux syscall pipe2(2).
-func Pipe2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	addr := args[0].Pointer()
-	flags := uint(args[1].Uint())
-
-	n, err := pipe2(t, addr, flags)
-	return n, nil, err
+	return nil
 }

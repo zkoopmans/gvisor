@@ -18,9 +18,11 @@ import (
 	"context"
 
 	"github.com/google/subcommands"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // Start implements subcommands.Command for the "start" command.
@@ -42,24 +44,30 @@ func (*Start) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (*Start) SetFlags(f *flag.FlagSet) {}
+func (*Start) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.Execute.
-func (*Start) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*Start) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		util.Fatalf("loading container: %v", err)
 	}
+	// Read the spec again here to ensure flag annotations from the spec are
+	// applied to "conf".
+	if _, err := specutils.ReadSpec(c.BundleDir, conf); err != nil {
+		util.Fatalf("reading spec: %v", err)
+	}
+
 	if err := c.Start(conf); err != nil {
-		Fatalf("starting container: %v", err)
+		util.Fatalf("starting container: %v", err)
 	}
 	return subcommands.ExitSuccess
 }

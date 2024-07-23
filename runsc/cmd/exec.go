@@ -24,16 +24,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -57,6 +57,13 @@ type Exec struct {
 	// file descriptor referencing the master end of the console's
 	// pseudoterminal.
 	consoleSocket string
+
+	// passFDs are user-supplied FDs from the host to be exposed to the
+	// sandboxed app.
+	passFDs fdMappings
+
+	// execFD is the host file descriptor used for program execution.
+	execFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -100,44 +107,83 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
 	f.StringVar(&ex.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
+	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
+	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 }
 
 // Execute implements subcommands.Command.Execute. It starts a process in an
 // already created container.
-func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-	conf := args[0].(*boot.Config)
+func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	conf := args[0].(*config.Config)
 	e, id, err := ex.parseArgs(f, conf.EnableRaw)
 	if err != nil {
-		Fatalf("parsing process spec: %v", err)
+		util.Fatalf("parsing process spec: %v", err)
 	}
-	waitStatus := args[1].(*syscall.WaitStatus)
+	waitStatus := args[1].(*unix.WaitStatus)
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading sandbox: %v", err)
+		util.Fatalf("loading sandbox: %v", err)
 	}
 
 	log.Debugf("Exec arguments: %+v", e)
-	log.Debugf("Exec capablities: %+v", e.Capabilities)
+	log.Debugf("Exec capabilities: %+v", e.Capabilities)
 
 	// Replace empty settings with defaults from container.
 	if e.WorkingDirectory == "" {
 		e.WorkingDirectory = c.Spec.Process.Cwd
 	}
 	if e.Envv == nil {
-		e.Envv, err = resolveEnvs(c.Spec.Process.Env, ex.env)
+		e.Envv, err = specutils.ResolveEnvs(c.Spec.Process.Env, ex.env)
 		if err != nil {
-			Fatalf("getting environment variables: %v", err)
+			util.Fatalf("getting environment variables: %v", err)
 		}
 	}
 
 	if e.Capabilities == nil {
 		e.Capabilities, err = specutils.Capabilities(conf.EnableRaw, c.Spec.Process.Capabilities)
 		if err != nil {
-			Fatalf("creating capabilities: %v", err)
+			util.Fatalf("creating capabilities: %v", err)
 		}
 		log.Infof("Using exec capabilities from container: %+v", e.Capabilities)
 	}
+
+	// Create the file descriptor map for the process in the container.
+	fdMap := map[int]*os.File{
+		0: os.Stdin,
+		1: os.Stdout,
+		2: os.Stderr,
+	}
+
+	// Add custom file descriptors to the map.
+	for _, mapping := range ex.passFDs {
+		file := os.NewFile(uintptr(mapping.Host), "")
+		if file == nil {
+			util.Fatalf("failed to create file from file descriptor %d", mapping.Host)
+		}
+		fdMap[mapping.Guest] = file
+	}
+
+	var execFile *os.File
+	if ex.execFD >= 0 {
+		execFile = os.NewFile(uintptr(ex.execFD), "exec-fd")
+	}
+
+	// Close the underlying file descriptors after we have passed them.
+	defer func() {
+		for _, file := range fdMap {
+			fd := file.Fd()
+			if file.Close() != nil {
+				log.Debugf("Failed to close FD %d", fd)
+			}
+		}
+
+		if execFile != nil && execFile.Close() != nil {
+			log.Debugf("Failed to close exec FD")
+		}
+	}()
+
+	e.FilePayload = control.NewFilePayload(fdMap, execFile)
 
 	// containerd expects an actual process to represent the container being
 	// executed. If detach was specified, starts a child in non-detach mode,
@@ -146,14 +192,14 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	if ex.detach {
 		return ex.execChildAndWait(waitStatus)
 	}
-	return ex.exec(c, e, waitStatus)
+	return ex.exec(conf, c, e, waitStatus)
 }
 
-func (ex *Exec) exec(c *container.Container, e *control.ExecArgs, waitStatus *syscall.WaitStatus) subcommands.ExitStatus {
-	// Start the new process and get it pid.
-	pid, err := c.Execute(e)
+func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+	// Start the new process and get its pid.
+	pid, err := c.Execute(conf, e)
 	if err != nil {
-		return Errorf("executing processes for container: %v", err)
+		return util.Errorf("executing processes for container: %v", err)
 	}
 
 	if e.StdioIsPty {
@@ -167,7 +213,7 @@ func (ex *Exec) exec(c *container.Container, e *control.ExecArgs, waitStatus *sy
 	if ex.internalPidFile != "" {
 		pidStr := []byte(strconv.Itoa(int(pid)))
 		if err := ioutil.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
-			return Errorf("writing internal pid file %q: %v", ex.internalPidFile, err)
+			return util.Errorf("writing internal pid file %q: %v", ex.internalPidFile, err)
 		}
 	}
 
@@ -176,20 +222,20 @@ func (ex *Exec) exec(c *container.Container, e *control.ExecArgs, waitStatus *sy
 	// `runsc exec -d` returns.
 	if ex.pidFile != "" {
 		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-			return Errorf("writing pid file: %v", err)
+			return util.Errorf("writing pid file: %v", err)
 		}
 	}
 
 	// Wait for the process to exit.
 	ws, err := c.WaitPID(pid)
 	if err != nil {
-		return Errorf("waiting on pid %d: %v", pid, err)
+		return util.Errorf("waiting on pid %d: %v", pid, err)
 	}
 	*waitStatus = ws
 	return subcommands.ExitSuccess
 }
 
-func (ex *Exec) execChildAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStatus {
+func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitStatus {
 	var args []string
 	for _, a := range os.Args[1:] {
 		if !strings.Contains(a, "detach") {
@@ -204,7 +250,7 @@ func (ex *Exec) execChildAndWait(waitStatus *syscall.WaitStatus) subcommands.Exi
 	if pidFile == "" {
 		tmpDir, err := ioutil.TempDir("", "exec-pid-")
 		if err != nil {
-			Fatalf("creating TempDir: %v", err)
+			util.Fatalf("creating TempDir: %v", err)
 		}
 		defer os.RemoveAll(tmpDir)
 		pidFile = filepath.Join(tmpDir, "pid")
@@ -220,20 +266,20 @@ func (ex *Exec) execChildAndWait(waitStatus *syscall.WaitStatus) subcommands.Exi
 	cmd.Stderr = os.Stderr
 
 	// If the console control socket file is provided, then create a new
-	// pty master/slave pair and set the TTY on the sandbox process.
+	// pty master/replica pair and set the TTY on the sandbox process.
 	if ex.consoleSocket != "" {
 		// Create a new TTY pair and send the master on the provided socket.
 		tty, err := console.NewWithSocket(ex.consoleSocket)
 		if err != nil {
-			Fatalf("setting up console with socket %q: %v", ex.consoleSocket, err)
+			util.Fatalf("setting up console with socket %q: %v", ex.consoleSocket, err)
 		}
 		defer tty.Close()
 
-		// Set stdio to the new TTY slave.
+		// Set stdio to the new TTY replica.
 		cmd.Stdin = tty
 		cmd.Stdout = tty
 		cmd.Stderr = tty
-		cmd.SysProcAttr = &syscall.SysProcAttr{
+		cmd.SysProcAttr = &unix.SysProcAttr{
 			Setsid:  true,
 			Setctty: true,
 			// The Ctty FD must be the FD in the child process's FD
@@ -245,7 +291,7 @@ func (ex *Exec) execChildAndWait(waitStatus *syscall.WaitStatus) subcommands.Exi
 	}
 
 	if err := cmd.Start(); err != nil {
-		Fatalf("failure to start child exec process, err: %v", err)
+		util.Fatalf("failure to start child exec process, err: %v", err)
 	}
 
 	log.Infof("Started child (PID: %d) to exec and wait: %s %s", cmd.Process.Pid, specutils.ExePath, args)
@@ -263,7 +309,7 @@ func (ex *Exec) execChildAndWait(waitStatus *syscall.WaitStatus) subcommands.Exi
 			}
 			return pid == cmd.Process.Pid, nil
 		}
-		if pe, ok := err.(*os.PathError); !ok || pe.Err != syscall.ENOENT {
+		if pe, ok := err.(*os.PathError); !ok || pe.Err != unix.ENOENT {
 			return false, err
 		}
 		// No file yet, continue to wait...
@@ -307,7 +353,7 @@ func (ex *Exec) argsFromCLI(argv []string, enableRaw bool) (*control.ExecArgs, e
 	for _, s := range ex.extraKGIDs {
 		kgid, err := strconv.Atoi(s)
 		if err != nil {
-			Fatalf("parsing GID: %s, %v", s, err)
+			util.Fatalf("parsing GID: %s, %v", s, err)
 		}
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
@@ -328,8 +374,12 @@ func (ex *Exec) argsFromCLI(argv []string, enableRaw bool) (*control.ExecArgs, e
 		KGID:             ex.user.kgid,
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
-		StdioIsPty:       ex.consoleSocket != "",
-		FilePayload:      urpc.FilePayload{[]*os.File{os.Stdin, os.Stdout, os.Stderr}},
+		StdioIsPty:       ex.consoleSocket != "" || console.IsPty(os.Stdin.Fd()),
+		FilePayload: control.NewFilePayload(map[int]*os.File{
+			0: os.Stdin,
+			1: os.Stdout,
+			2: os.Stderr,
+		}, nil),
 	}, nil
 }
 
@@ -378,33 +428,12 @@ func argsFromProcess(p *specs.Process, enableRaw bool) (*control.ExecArgs, error
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
 		StdioIsPty:       p.Terminal,
-		FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}},
+		FilePayload: control.NewFilePayload(map[int]*os.File{
+			0: os.Stdin,
+			1: os.Stdout,
+			2: os.Stderr,
+		}, nil),
 	}, nil
-}
-
-// resolveEnvs transforms lists of environment variables into a single list of
-// environment variables. If a variable is defined multiple times, the last
-// value is used.
-func resolveEnvs(envs ...[]string) ([]string, error) {
-	// First create a map of variable names to values. This removes any
-	// duplicates.
-	envMap := make(map[string]string)
-	for _, env := range envs {
-		for _, str := range env {
-			parts := strings.SplitN(str, "=", 2)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid variable: %s", str)
-			}
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	// Reassemble envMap into a list of environment variables of the form
-	// NAME=VALUE.
-	env := make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
-	}
-	return env, nil
 }
 
 // capabilities takes a list of capabilities as strings and returns an
@@ -434,17 +463,17 @@ type stringSlice []string
 
 // String implements flag.Value.String.
 func (ss *stringSlice) String() string {
-	return fmt.Sprintf("%v", *ss)
+	return strings.Join(*ss, ",")
 }
 
 // Get implements flag.Value.Get.
-func (ss *stringSlice) Get() interface{} {
+func (ss *stringSlice) Get() any {
 	return ss
 }
 
-// Set implements flag.Value.Set.
+// Set implements flag.Value.Set. Set(String()) should be idempotent.
 func (ss *stringSlice) Set(s string) error {
-	*ss = append(*ss, s)
+	*ss = append(*ss, strings.Split(s, ",")...)
 	return nil
 }
 
@@ -455,14 +484,17 @@ type user struct {
 	kgid auth.KGID
 }
 
+// String implements flag.Value.String.
 func (u *user) String() string {
-	return fmt.Sprintf("%+v", *u)
+	return fmt.Sprintf("%d:%d", u.kuid, u.kgid)
 }
 
-func (u *user) Get() interface{} {
+// Get implements flag.Value.Get.
+func (u *user) Get() any {
 	return u
 }
 
+// Set implements flag.Value.Set. Set(String()) should be idempotent.
 func (u *user) Set(s string) error {
 	parts := strings.SplitN(s, ":", 2)
 	kuid, err := strconv.Atoi(parts[0])

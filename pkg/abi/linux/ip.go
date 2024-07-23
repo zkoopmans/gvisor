@@ -32,6 +32,7 @@ const (
 	IPPROTO_GRE     = 47
 	IPPROTO_ESP     = 50
 	IPPROTO_AH      = 51
+	IPPROTO_ICMPV6  = 58
 	IPPROTO_MTP     = 92
 	IPPROTO_BEETPH  = 94
 	IPPROTO_ENCAP   = 98
@@ -92,6 +93,16 @@ const (
 	IP_UNICAST_IF             = 50
 )
 
+// IP_MTU_DISCOVER values from uapi/linux/in.h
+const (
+	IP_PMTUDISC_DONT      = 0
+	IP_PMTUDISC_WANT      = 1
+	IP_PMTUDISC_DO        = 2
+	IP_PMTUDISC_PROBE     = 3
+	IP_PMTUDISC_INTERFACE = 4
+	IP_PMTUDISC_OMIT      = 5
+)
+
 // Socket options from uapi/linux/in6.h
 const (
 	IPV6_ADDRFORM         = 1
@@ -148,4 +159,9 @@ const (
 	IPV6_UNICAST_IF       = 76
 	IPV6_RECVFRAGSIZE     = 77
 	IPV6_FREEBIND         = 78
+)
+
+// Socket options from uapi/linux/icmpv6.h
+const (
+	ICMPV6_FILTER = 1
 )

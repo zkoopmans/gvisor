@@ -18,7 +18,8 @@ import (
 	"context"
 
 	"github.com/google/subcommands"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -44,7 +45,7 @@ type Create struct {
 	// userLog is the path to send user-visible logs to. This log is different
 	// from debug logs. The former is meant to be consumed by the users and should
 	// contain only information that is relevant to the person running the
-	// container, e.g. unsuported syscalls, while the later is more verbose and
+	// container, e.g. unsupported syscalls, while the later is more verbose and
 	// consumed by developers.
 	userLog string
 }
@@ -74,28 +75,28 @@ func (c *Create) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 
 	if conf.Rootless {
-		return Errorf("Rootless mode not supported with %q", c.Name())
+		return util.Errorf("Rootless mode not supported with %q", c.Name())
 	}
 
 	bundleDir := c.bundleDir
 	if bundleDir == "" {
 		bundleDir = getwdOrDie()
 	}
-	spec, err := specutils.ReadSpec(bundleDir)
+	spec, err := specutils.ReadSpec(bundleDir, conf)
 	if err != nil {
-		return Errorf("reading spec: %v", err)
+		return util.Errorf("reading spec: %v", err)
 	}
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	// Create the container. A new sandbox will be created for the
 	// container unless the metadata specifies that it should be run in an
@@ -109,7 +110,7 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 		UserLog:       c.userLog,
 	}
 	if _, err := container.New(conf, contArgs); err != nil {
-		return Errorf("creating container: %v", err)
+		return util.Errorf("creating container: %v", err)
 	}
 	return subcommands.ExitSuccess
 }

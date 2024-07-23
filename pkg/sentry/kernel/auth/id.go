@@ -19,9 +19,13 @@ import (
 )
 
 // UID is a user ID in an unspecified user namespace.
+//
+// +marshal
 type UID uint32
 
 // GID is a group ID in an unspecified user namespace.
+//
+// +marshal slice:GIDSlice
 type GID uint32
 
 // In the root user namespace, user/group IDs have a 1-to-1 relationship with
@@ -42,15 +46,15 @@ const (
 	// NoID is uint32(-1). -1 is consistently used as a special value, in Linux
 	// and by extension in the auth package, to mean "no ID":
 	//
-	// - ID mapping returns -1 if the ID is not mapped.
+	//	- ID mapping returns -1 if the ID is not mapped.
 	//
-	// - Most set*id() syscalls accept -1 to mean "do not change this ID".
+	//	- Most set*id() syscalls accept -1 to mean "do not change this ID".
 	NoID = math.MaxUint32
 
 	// OverflowUID is the default value of /proc/sys/kernel/overflowuid. The
 	// "overflow UID" is usually [1] used when translating a user ID between
-	// namespaces fails because the ID is not mapped. (We don't implement this
-	// file, so the overflow UID is constant.)
+	// namespaces fails because the ID is not mapped. (We implement this
+	// file as read-only, so the overflow UID is constant.)
 	//
 	// [1] "There is one notable case where unmapped user and group IDs are not
 	// converted to the corresponding overflow ID value. When viewing a uid_map
@@ -58,18 +62,28 @@ const (
 	// field is displayed as 4294967295 (-1 as an unsigned integer);" -
 	// user_namespaces(7)
 	OverflowUID = UID(65534)
+
+	// OverflowGID is the group equivalent to OverflowUID.
 	OverflowGID = GID(65534)
 
 	// NobodyKUID is the user ID usually reserved for the least privileged user
 	// "nobody".
 	NobodyKUID = KUID(65534)
+
+	// NobodyKGID is the group equivalent to NobodyKUID.
 	NobodyKGID = KGID(65534)
 
 	// RootKUID is the user ID usually used for the most privileged user "root".
 	RootKUID = KUID(0)
+
+	// RootKGID is the group equivalent to RootKUID.
 	RootKGID = KGID(0)
-	RootUID  = UID(0)
-	RootGID  = GID(0)
+
+	// RootUID is the root user.
+	RootUID = UID(0)
+
+	// RootGID is the root group.
+	RootGID = GID(0)
 )
 
 // Ok returns true if uid is not -1.

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package arch
@@ -19,13 +20,14 @@ package arch
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
-	"syscall"
 
-	"gvisor.dev/gvisor/pkg/binary"
-	"gvisor.dev/gvisor/pkg/cpuid"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/rand"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Host specifies the host architecture.
@@ -35,7 +37,7 @@ const Host = AMD64
 const (
 	// maxAddr64 is the maximum userspace address. It is TASK_SIZE in Linux
 	// for a 64-bit process.
-	maxAddr64 usermem.Addr = (1 << 47) - usermem.PageSize
+	maxAddr64 hostarch.Addr = (1 << 47) - hostarch.PageSize
 
 	// maxStackRand64 is the maximum randomization to apply to the stack.
 	// It is defined by arch/x86/mm/mmap.c:stack_maxrandom_size in Linux.
@@ -43,7 +45,7 @@ const (
 
 	// maxMmapRand64 is the maximum randomization to apply to the mmap
 	// layout. It is defined by arch/x86/mm/mmap.c:arch_mmap_rnd in Linux.
-	maxMmapRand64 = (1 << 28) * usermem.PageSize
+	maxMmapRand64 = (1 << 28) * hostarch.PageSize
 
 	// minGap64 is the minimum gap to leave at the top of the address space
 	// for the stack. It is defined by arch/x86/mm/mmap.c:MIN_GAP in Linux.
@@ -54,7 +56,7 @@ const (
 	//
 	// The Platform {Min,Max}UserAddress() may preclude loading at this
 	// address. See other preferredFoo comments below.
-	preferredPIELoadAddr usermem.Addr = maxAddr64 / 3 * 2
+	preferredPIELoadAddr hostarch.Addr = maxAddr64 / 3 * 2
 )
 
 // These constants are selected as heuristics to help make the Platform's
@@ -90,81 +92,76 @@ const (
 	// This is all "preferred" because the layout min/max address may not
 	// allow us to select such a TopDownBase, in which case we have to fall
 	// back to a layout that TSAN may not be happy with.
-	preferredTopDownAllocMin usermem.Addr = 0x7e8000000000
-	preferredAllocationGap                = 128 << 30 // 128 GB
-	preferredTopDownBaseMin               = preferredTopDownAllocMin + preferredAllocationGap
+	preferredTopDownAllocMin hostarch.Addr = 0x7e8000000000
+	preferredAllocationGap                 = 128 << 30 // 128 GB
+	preferredTopDownBaseMin                = preferredTopDownAllocMin + preferredAllocationGap
 
 	// minMmapRand64 is the smallest we are willing to make the
 	// randomization to stay above preferredTopDownBaseMin.
-	minMmapRand64 = (1 << 26) * usermem.PageSize
+	minMmapRand64 = (1 << 26) * hostarch.PageSize
 )
 
-// context64 represents an AMD64 context.
+// Context64 represents an AMD64 context.
 //
 // +stateify savable
-type context64 struct {
+type Context64 struct {
 	State
-	sigFPState []x86FPState // fpstate to be restored on sigreturn.
 }
 
 // Arch implements Context.Arch.
-func (c *context64) Arch() Arch {
+func (c *Context64) Arch() Arch {
 	return AMD64
 }
 
-func (c *context64) copySigFPState() []x86FPState {
-	var sigfps []x86FPState
-	for _, s := range c.sigFPState {
-		sigfps = append(sigfps, s.fork())
-	}
-	return sigfps
+// FloatingPointData returns the state of the floating-point unit.
+func (c *Context64) FloatingPointData() *fpu.State {
+	return &c.State.fpState
 }
 
 // Fork returns an exact copy of this context.
-func (c *context64) Fork() Context {
-	return &context64{
-		State:      c.State.Fork(),
-		sigFPState: c.copySigFPState(),
+func (c *Context64) Fork() *Context64 {
+	return &Context64{
+		State: c.State.Fork(),
 	}
 }
 
 // Return returns the current syscall return value.
-func (c *context64) Return() uintptr {
+func (c *Context64) Return() uintptr {
 	return uintptr(c.Regs.Rax)
 }
 
 // SetReturn sets the syscall return value.
-func (c *context64) SetReturn(value uintptr) {
+func (c *Context64) SetReturn(value uintptr) {
 	c.Regs.Rax = uint64(value)
 }
 
 // IP returns the current instruction pointer.
-func (c *context64) IP() uintptr {
+func (c *Context64) IP() uintptr {
 	return uintptr(c.Regs.Rip)
 }
 
 // SetIP sets the current instruction pointer.
-func (c *context64) SetIP(value uintptr) {
+func (c *Context64) SetIP(value uintptr) {
 	c.Regs.Rip = uint64(value)
 }
 
 // Stack returns the current stack pointer.
-func (c *context64) Stack() uintptr {
+func (c *Context64) Stack() uintptr {
 	return uintptr(c.Regs.Rsp)
 }
 
 // SetStack sets the current stack pointer.
-func (c *context64) SetStack(value uintptr) {
+func (c *Context64) SetStack(value uintptr) {
 	c.Regs.Rsp = uint64(value)
 }
 
 // TLS returns the current TLS pointer.
-func (c *context64) TLS() uintptr {
+func (c *Context64) TLS() uintptr {
 	return uintptr(c.Regs.Fs_base)
 }
 
 // SetTLS sets the current TLS pointer. Returns false if value is invalid.
-func (c *context64) SetTLS(value uintptr) bool {
+func (c *Context64) SetTLS(value uintptr) bool {
 	if !isValidSegmentBase(uint64(value)) {
 		return false
 	}
@@ -175,41 +172,36 @@ func (c *context64) SetTLS(value uintptr) bool {
 }
 
 // SetOldRSeqInterruptedIP implements Context.SetOldRSeqInterruptedIP.
-func (c *context64) SetOldRSeqInterruptedIP(value uintptr) {
+func (c *Context64) SetOldRSeqInterruptedIP(value uintptr) {
 	c.Regs.R10 = uint64(value)
 }
 
 // Native returns the native type for the given val.
-func (c *context64) Native(val uintptr) interface{} {
-	v := uint64(val)
+func (c *Context64) Native(val uintptr) marshal.Marshallable {
+	v := primitive.Uint64(val)
 	return &v
 }
 
 // Value returns the generic val for the given native type.
-func (c *context64) Value(val interface{}) uintptr {
-	return uintptr(*val.(*uint64))
+func (c *Context64) Value(val marshal.Marshallable) uintptr {
+	return uintptr(*val.(*primitive.Uint64))
 }
 
 // Width returns the byte width of this architecture.
-func (c *context64) Width() uint {
+func (c *Context64) Width() uint {
 	return 8
 }
 
-// FeatureSet returns the FeatureSet in use.
-func (c *context64) FeatureSet() *cpuid.FeatureSet {
-	return c.State.FeatureSet
-}
-
 // mmapRand returns a random adjustment for randomizing an mmap layout.
-func mmapRand(max uint64) usermem.Addr {
-	return usermem.Addr(rand.Int63n(int64(max))).RoundDown()
+func mmapRand(max uint64) hostarch.Addr {
+	return hostarch.Addr(rand.Int63n(int64(max))).RoundDown()
 }
 
 // NewMmapLayout implements Context.NewMmapLayout consistently with Linux.
-func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (MmapLayout, error) {
+func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (MmapLayout, error) {
 	min, ok := min.RoundUp()
 	if !ok {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 	if max > maxAddr64 {
 		max = maxAddr64
@@ -217,14 +209,14 @@ func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (Mm
 	max = max.RoundDown()
 
 	if min > max {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 
 	stackSize := r.Get(limits.Stack)
 
 	// MAX_GAP in Linux.
 	maxGap := (max / 6) * 5
-	gap := usermem.Addr(stackSize.Cur)
+	gap := hostarch.Addr(stackSize.Cur)
 	if gap < minGap64 {
 		gap = minGap64
 	}
@@ -237,7 +229,7 @@ func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (Mm
 	}
 
 	topDownMin := max - gap - maxMmapRand64
-	maxRand := usermem.Addr(maxMmapRand64)
+	maxRand := hostarch.Addr(maxMmapRand64)
 	if topDownMin < preferredTopDownBaseMin {
 		// Try to keep TopDownBase above preferredTopDownBaseMin by
 		// shrinking maxRand.
@@ -272,7 +264,7 @@ func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (Mm
 }
 
 // PIELoadAddress implements Context.PIELoadAddress.
-func (c *context64) PIELoadAddress(l MmapLayout) usermem.Addr {
+func (c *Context64) PIELoadAddress(l MmapLayout) hostarch.Addr {
 	base := preferredPIELoadAddr
 	max, ok := base.AddLength(maxMmapRand64)
 	if !ok {
@@ -294,29 +286,33 @@ func (c *context64) PIELoadAddress(l MmapLayout) usermem.Addr {
 const userStructSize = 928
 
 // PtracePeekUser implements Context.PtracePeekUser.
-func (c *context64) PtracePeekUser(addr uintptr) (interface{}, error) {
+func (c *Context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 	if addr&7 != 0 || addr >= userStructSize {
-		return nil, syscall.EIO
+		return nil, unix.EIO
 	}
 	// PTRACE_PEEKUSER and PTRACE_POKEUSER are only effective on regs and
 	// u_debugreg, returning 0 or silently no-oping for other fields
 	// respectively.
-	if addr < uintptr(ptraceRegsSize) {
-		buf := binary.Marshal(nil, usermem.ByteOrder, c.ptraceGetRegs())
-		return c.Native(uintptr(usermem.ByteOrder.Uint64(buf[addr:]))), nil
+	if addr < uintptr(ptraceRegistersSize) {
+		regs := c.ptraceGetRegs()
+		buf := make([]byte, regs.SizeBytes())
+		regs.MarshalUnsafe(buf)
+		return c.Native(uintptr(hostarch.ByteOrder.Uint64(buf[addr:]))), nil
 	}
 	// Note: x86 debug registers are missing.
 	return c.Native(0), nil
 }
 
 // PtracePokeUser implements Context.PtracePokeUser.
-func (c *context64) PtracePokeUser(addr, data uintptr) error {
+func (c *Context64) PtracePokeUser(addr, data uintptr) error {
 	if addr&7 != 0 || addr >= userStructSize {
-		return syscall.EIO
+		return unix.EIO
 	}
-	if addr < uintptr(ptraceRegsSize) {
-		buf := binary.Marshal(nil, usermem.ByteOrder, c.ptraceGetRegs())
-		usermem.ByteOrder.PutUint64(buf[addr:], uint64(data))
+	if addr < uintptr(ptraceRegistersSize) {
+		regs := c.ptraceGetRegs()
+		buf := make([]byte, regs.SizeBytes())
+		regs.MarshalUnsafe(buf)
+		hostarch.ByteOrder.PutUint64(buf[addr:], uint64(data))
 		_, err := c.PtraceSetRegs(bytes.NewBuffer(buf))
 		return err
 	}

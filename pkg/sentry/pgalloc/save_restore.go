@@ -20,22 +20,39 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/state"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
+// SaveOpts provides options to MemoryFile.SaveTo().
+type SaveOpts struct {
+	// If ExcludeCommittedZeroPages is true, SaveTo() will scan both committed
+	// and possibly-committed pages to find zero pages, whose contents are
+	// saved implicitly rather than explicitly to reduce checkpoint size. If
+	// ExcludeCommittedZeroPages is false, SaveTo() will scan only
+	// possibly-committed pages to find zero pages.
+	//
+	// Enabling ExcludeCommittedZeroPages will usually increase the time taken
+	// by SaveTo() (due to the larger number of pages that must be scanned),
+	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
+	// size, if the application has many committed zero pages.
+	ExcludeCommittedZeroPages bool
+}
+
 // SaveTo writes f's state to the given stream.
-func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer) error {
-	// Wait for reclaim.
+func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, pw io.Writer, opts SaveOpts) error {
+	// Wait for memory release.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for f.reclaimable {
-		f.reclaimCond.Signal()
+	for f.haveWaste {
 		f.mu.Unlock()
 		runtime.Gosched()
 		f.mu.Lock()
@@ -46,115 +63,237 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer) error {
 		panic(fmt.Sprintf("evictions still pending for %d users; call StartEvictions and WaitForEvictions before SaveTo", len(f.evictable)))
 	}
 
-	// Ensure that all pages that contain data have knownCommitted set, since
-	// we only store knownCommitted pages below.
-	zeroPage := make([]byte, usermem.PageSize)
-	err := f.updateUsageLocked(0, func(bs []byte, committed []byte) error {
-		for pgoff := 0; pgoff < len(bs); pgoff += usermem.PageSize {
-			i := pgoff / usermem.PageSize
-			pg := bs[pgoff : pgoff+usermem.PageSize]
+	// Ensure that all pages that contain non-zero bytes are marked
+	// known-committed, since we only store known-committed pages below.
+	zeroPage := make([]byte, hostarch.PageSize)
+	var (
+		decommitWarnOnce  sync.Once
+		decommitPendingFR memmap.FileRange
+		scanTotal         uint64
+		decommitTotal     uint64
+		decommitCount     uint64
+	)
+	decommitNow := func(fr memmap.FileRange) {
+		decommitTotal += fr.Length()
+		decommitCount++
+		if err := f.decommitFile(fr); err != nil {
+			// This doesn't impact the correctness of saved memory, it just
+			// means that we're incrementally more likely to OOM. Complain, but
+			// don't abort saving.
+			decommitWarnOnce.Do(func() {
+				log.Warningf("Decommitting MemoryFile offsets %v while saving failed: %v", fr, err)
+			})
+		}
+	}
+	decommitAddPage := func(off uint64) {
+		// Invariants:
+		// (1) All of decommitPendingFR lies within a single huge page.
+		// (2) decommitPendingFR.End is hugepage-aligned iff
+		// decommitPendingFR.Length() == 0.
+		end := off + hostarch.PageSize
+		if decommitPendingFR.End == off {
+			// Merge with the existing range. By invariants, the page {off,
+			// end} must be within the same huge page as the rest of
+			// decommitPendingFR.
+			decommitPendingFR.End = end
+		} else {
+			// Decommit the existing range and start a new one.
+			if decommitPendingFR.Length() != 0 {
+				decommitNow(decommitPendingFR)
+			}
+			decommitPendingFR = memmap.FileRange{off, end}
+		}
+		// Maintain invariants by decommitting if we've reached the end of the
+		// containing huge page.
+		if hostarch.IsHugePageAligned(end) {
+			decommitNow(decommitPendingFR)
+			decommitPendingFR = memmap.FileRange{}
+		}
+	}
+	err := f.updateUsageLocked(nil, opts.ExcludeCommittedZeroPages, func(bs []byte, committed []byte, off uint64, wasCommitted bool) error {
+		scanTotal += uint64(len(bs))
+		for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
+			i := pgoff / hostarch.PageSize
+			pg := bs[pgoff : pgoff+hostarch.PageSize]
 			if !bytes.Equal(pg, zeroPage) {
 				committed[i] = 1
 				continue
 			}
 			committed[i] = 0
-			// Reading the page caused it to be committed; decommit it to
-			// reduce memory usage.
-			//
-			// "MADV_REMOVE [...] Free up a given range of pages and its
-			// associated backing store. This is equivalent to punching a hole
-			// in the corresponding byte range of the backing store (see
-			// fallocate(2))." - madvise(2)
-			if err := syscall.Madvise(pg, syscall.MADV_REMOVE); err != nil {
-				// This doesn't impact the correctness of saved memory, it
-				// just means that we're incrementally more likely to OOM.
-				// Complain, but don't abort saving.
-				log.Warningf("Decommitting page %p while saving failed: %v", pg, err)
+			if !wasCommitted {
+				// Reading the page may have caused it to be committed;
+				// decommit it to reduce memory usage.
+				decommitAddPage(off + uint64(pgoff))
 			}
 		}
 		return nil
 	})
+	if decommitPendingFR.Length() != 0 {
+		decommitNow(decommitPendingFR)
+		decommitPendingFR = memmap.FileRange{}
+	}
 	if err != nil {
 		return err
 	}
+	log.Debugf("MemoryFile.SaveTo: scanned %d bytes, decommitted %d bytes in %d syscalls", scanTotal, decommitTotal, decommitCount)
 
 	// Save metadata.
-	if err := state.Save(ctx, w, &f.fileSize, nil); err != nil {
+	if _, err := state.Save(ctx, w, &f.unwasteSmall); err != nil {
 		return err
 	}
-	if err := state.Save(ctx, w, &f.usage, nil); err != nil {
+	if _, err := state.Save(ctx, w, &f.unwasteHuge); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.unfreeSmall); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.unfreeHuge); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.subreleased); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.memAcct); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.knownCommittedBytes); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, &f.commitSeq); err != nil {
+		return err
+	}
+	if _, err := state.Save(ctx, w, f.chunks.Load()); err != nil {
 		return err
 	}
 
 	// Dump out committed pages.
-	for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		if !seg.Value().knownCommitted {
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		if !maseg.ValuePtr().knownCommitted {
 			continue
 		}
 		// Write a header to distinguish from objects.
-		if err := state.WriteHeader(w, uint64(seg.Range().Length()), false); err != nil {
+		if err := state.WriteHeader(w, uint64(maseg.Range().Length()), false); err != nil {
 			return err
 		}
 		// Write out data.
 		var ioErr error
-		err := f.forEachMappingSlice(seg.Range(), func(s []byte) {
+		f.forEachMappingSlice(maseg.Range(), func(s []byte) {
 			if ioErr != nil {
 				return
 			}
-			_, ioErr = w.Write(s)
+			_, ioErr = pw.Write(s)
 		})
 		if ioErr != nil {
 			return ioErr
-		}
-		if err != nil {
-			return err
 		}
 	}
 
 	return nil
 }
 
-// LoadFrom loads MemoryFile state from the given stream.
-func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader) error {
-	// Load metadata.
-	if err := state.Load(ctx, r, &f.fileSize, nil); err != nil {
-		return err
-	}
-	if err := f.file.Truncate(f.fileSize); err != nil {
-		return err
-	}
-	newMappings := make([]uintptr, f.fileSize>>chunkShift)
-	f.mappings.Store(newMappings)
-	if err := state.Load(ctx, r, &f.usage, nil); err != nil {
-		return err
-	}
+// MarkSavable marks f as savable.
+func (f *MemoryFile) MarkSavable() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.savable = true
+}
 
-	// Try to map committed chunks concurrently: For any given chunk, either
-	// this loop or the following one will mmap the chunk first and cache it in
-	// f.mappings for the other, but this loop is likely to run ahead of the
-	// other since it doesn't do any work between mmaps. The rest of this
-	// function doesn't mutate f.usage, so it's safe to iterate concurrently.
-	mapperDone := make(chan struct{})
-	mapperCanceled := int32(0)
-	go func() { // S/R-SAFE: see comment
-		defer func() { close(mapperDone) }()
-		for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-			if atomic.LoadInt32(&mapperCanceled) != 0 {
-				return
-			}
-			if seg.Value().knownCommitted {
-				f.forEachMappingSlice(seg.Range(), func(s []byte) {})
-			}
+// IsSavable returns true if f is savable.
+func (f *MemoryFile) IsSavable() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.savable
+}
+
+// RestoreID returns the restore ID for f.
+func (f *MemoryFile) RestoreID() string {
+	return f.opts.RestoreID
+}
+
+// LoadFrom loads MemoryFile state from the given stream.
+func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, pr *statefile.AsyncReader) error {
+	// Clear sets since non-empty sets will panic if loaded into.
+	f.unwasteSmall.RemoveAll()
+	f.unwasteHuge.RemoveAll()
+	f.unfreeSmall.RemoveAll()
+	f.unfreeHuge.RemoveAll()
+	f.memAcct.RemoveAll()
+
+	// Load metadata.
+	if _, err := state.Load(ctx, r, &f.unwasteSmall); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.unwasteHuge); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.unfreeSmall); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.unfreeHuge); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.subreleased); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.memAcct); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.knownCommittedBytes); err != nil {
+		return err
+	}
+	if _, err := state.Load(ctx, r, &f.commitSeq); err != nil {
+		return err
+	}
+	var chunks []chunkInfo
+	if _, err := state.Load(ctx, r, &chunks); err != nil {
+		return err
+	}
+	f.chunks.Store(&chunks)
+	if err := f.file.Truncate(int64(len(chunks)) * chunkSize); err != nil {
+		return err
+	}
+	// Obtain chunk mappings, then madvise them concurrently with loading data.
+	var (
+		madviseEnd  atomicbitops.Uint64
+		madviseChan = make(chan struct{}, 1)
+		madviseWG   sync.WaitGroup
+	)
+	if len(chunks) != 0 {
+		m, _, errno := unix.Syscall6(
+			unix.SYS_MMAP,
+			0,
+			uintptr(len(chunks)*chunkSize),
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED,
+			f.file.Fd(),
+			0)
+		if errno != 0 {
+			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
 		}
-	}()
-	defer func() {
-		atomic.StoreInt32(&mapperCanceled, 1)
-		<-mapperDone
-	}()
+		for i := range chunks {
+			chunk := &chunks[i]
+			chunk.mapping = m
+			m += chunkSize
+		}
+		madviseWG.Add(1)
+		go func() {
+			defer madviseWG.Done()
+			for i := range chunks {
+				chunk := &chunks[i]
+				f.madviseChunkMapping(chunk.mapping, chunkSize, chunk.huge)
+				madviseEnd.Add(chunkSize)
+				select {
+				case madviseChan <- struct{}{}:
+				default:
+				}
+			}
+		}()
+	}
+	defer madviseWG.Wait()
 
 	// Load committed pages.
-	for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		if !seg.Value().knownCommitted {
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		if !maseg.ValuePtr().knownCommitted {
 			continue
 		}
 		// Verify header.
@@ -166,46 +305,38 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader) error {
 			// Not expected.
 			return fmt.Errorf("unexpected object")
 		}
-		if expected := uint64(seg.Range().Length()); length != expected {
+		if expected := uint64(maseg.Range().Length()); length != expected {
 			// Size mismatch.
 			return fmt.Errorf("mismatched segment: expected %d, got %d", expected, length)
 		}
+		// Wait for all chunks spanned by this segment to be madvised.
+		for madviseEnd.Load() < maseg.End() {
+			<-madviseChan
+		}
 		// Read data.
 		var ioErr error
-		err = f.forEachMappingSlice(seg.Range(), func(s []byte) {
+		f.forEachMappingSlice(maseg.Range(), func(s []byte) {
 			if ioErr != nil {
 				return
 			}
-			_, ioErr = io.ReadFull(r, s)
+			if pr != nil {
+				pr.ReadAsync(s)
+			} else {
+				_, ioErr = io.ReadFull(r, s)
+			}
 		})
 		if ioErr != nil {
 			return ioErr
-		}
-		if err != nil {
-			return err
 		}
 
 		// Update accounting for restored pages. We need to do this here since
 		// these segments are marked as "known committed", and will be skipped
 		// over on accounting scans.
-		usage.MemoryAccounting.Inc(seg.End()-seg.Start(), seg.Value().kind)
+		if !f.opts.DisableMemoryAccounting {
+			amount := maseg.Range().Length()
+			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
+		}
 	}
 
 	return nil
-}
-
-// MemoryFileProvider provides the MemoryFile method.
-//
-// This type exists to work around a save/restore defect. The only object in a
-// saved object graph that S/R allows to be replaced at time of restore is the
-// starting point of the restore, kernel.Kernel. However, the MemoryFile
-// changes between save and restore as well, so objects that need persistent
-// access to the MemoryFile must instead store a pointer to the Kernel and call
-// Kernel.MemoryFile() as required. In most cases, depending on the kernel
-// package directly would create a package dependency loop, so the stored
-// pointer must instead be a MemoryProvider interface object. Correspondingly,
-// kernel.Kernel is the only implementation of this interface.
-type MemoryFileProvider interface {
-	// MemoryFile returns the Kernel MemoryFile.
-	MemoryFile() *MemoryFile
 }

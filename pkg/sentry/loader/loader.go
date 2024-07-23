@@ -23,18 +23,23 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
+)
+
+const (
+	securityCapability = linux.XATTR_SECURITY_PREFIX + "capability"
 )
 
 // LoadArgs holds specifications for an executable file to be loaded.
@@ -54,14 +59,21 @@ type LoadArgs struct {
 	// Filename is the path for the executable.
 	Filename string
 
-	// File is an open fs.File object of the executable. If File is not
-	// nil, then File will be loaded and Filename will be ignored.
+	// File is an open FD of the executable. If File is not nil, then File will
+	// be loaded and Filename will be ignored.
 	//
 	// The caller is responsible for checking that the user can execute this file.
-	File fsbridge.File
+	File *vfs.FileDescription
 
-	// Opener is used to open the executable file when 'File' is nil.
-	Opener fsbridge.Lookup
+	// Root is the current filesystem root.
+	Root vfs.VirtualDentry
+
+	// WorkingDir is the current working directory.
+	WorkingDir vfs.VirtualDentry
+
+	// If AfterOpen is not nil, it is called after every successful call to
+	// Opener.OpenPath().
+	AfterOpen func(f *vfs.FileDescription)
 
 	// CloseOnExec indicates that the executable (or one of its parent
 	// directories) was opened with O_CLOEXEC. If the executable is an
@@ -77,23 +89,7 @@ type LoadArgs struct {
 	Envv []string
 
 	// Features specifies the CPU feature set for the executable.
-	Features *cpuid.FeatureSet
-}
-
-// readFull behaves like io.ReadFull for an *fs.File.
-func readFull(ctx context.Context, f *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
-	var total int64
-	for dst.NumBytes() > 0 {
-		n, err := f.Preadv(ctx, dst, offset+total)
-		total += n
-		if err == io.EOF && total != 0 {
-			return total, io.ErrUnexpectedEOF
-		} else if err != nil {
-			return total, err
-		}
-		dst = dst.DropFirst64(n)
-	}
-	return total, nil
+	Features cpuid.FeatureSet
 }
 
 // openPath opens args.Filename and checks that it is valid for loading.
@@ -102,10 +98,10 @@ func readFull(ctx context.Context, f *fs.File, dst usermem.IOSequence, offset in
 // installed in the Task FDTable. The caller takes ownership of both.
 //
 // args.Filename must be a readable, executable, regular file.
-func openPath(ctx context.Context, args LoadArgs) (fsbridge.File, error) {
+func openPath(ctx context.Context, args LoadArgs) (*vfs.FileDescription, error) {
 	if args.Filename == "" {
 		ctx.Infof("cannot open empty name")
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 
 	// TODO(gvisor.dev/issue/160): Linux requires only execute permission,
@@ -117,29 +113,48 @@ func openPath(ctx context.Context, args LoadArgs) (fsbridge.File, error) {
 		Flags:    linux.O_RDONLY,
 		FileExec: true,
 	}
-	return args.Opener.OpenPath(ctx, args.Filename, opts, args.RemainingTraversals, args.ResolveFinal)
+	vfsObj := args.Root.Mount().Filesystem().VirtualFilesystem()
+	creds := auth.CredentialsFromContext(ctx)
+	path := fspath.Parse(args.Filename)
+	pop := &vfs.PathOperation{
+		Root:               args.Root,
+		Start:              args.WorkingDir,
+		Path:               path,
+		FollowFinalSymlink: args.ResolveFinal,
+	}
+	if path.Absolute {
+		pop.Start = args.Root
+	}
+	fd, err := vfsObj.OpenAt(ctx, creds, pop, &opts)
+	if err != nil {
+		return nil, err
+	}
+	if args.AfterOpen != nil {
+		args.AfterOpen(fd)
+	}
+	return fd, nil
 }
 
 // checkIsRegularFile prevents us from trying to execute a directory, pipe, etc.
-func checkIsRegularFile(ctx context.Context, file fsbridge.File, filename string) error {
-	t, err := file.Type(ctx)
+func checkIsRegularFile(ctx context.Context, fd *vfs.FileDescription, filename string) error {
+	stat, err := fd.Stat(ctx, vfs.StatOptions{})
 	if err != nil {
 		return err
 	}
-	if t != linux.ModeRegular {
+	if t := linux.FileMode(stat.Mode).FileType(); t != linux.ModeRegular {
 		ctx.Infof("%q is not a regular file: %v", filename, t)
-		return syserror.EACCES
+		return linuxerr.EACCES
 	}
 	return nil
 }
 
 // allocStack allocates and maps a stack in to any available part of the address space.
-func allocStack(ctx context.Context, m *mm.MemoryManager, a arch.Context) (*arch.Stack, error) {
+func allocStack(ctx context.Context, m *mm.MemoryManager, a *arch.Context64) (*arch.Stack, error) {
 	ar, err := m.MapStack(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &arch.Stack{a, m, ar.End}, nil
+	return &arch.Stack{Arch: a, IO: m, Bottom: ar.End}, nil
 }
 
 const (
@@ -157,11 +172,11 @@ const (
 // interpreter will be loaded.
 //
 // It returns:
-//  * loadedELF, description of the loaded binary
-//  * arch.Context matching the binary arch
-//  * fs.Dirent of the binary file
-//  * Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context, fsbridge.File, []string, error) {
+//   - loadedELF, description of the loaded binary
+//   - arch.Context64 matching the binary arch
+//   - fs.Dirent of the binary file
+//   - Possibly updated args.Argv
+func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
 	for i := 0; i < maxLoaderAttempts; i++ {
 		if args.File == nil {
 			var err error
@@ -171,7 +186,7 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 				return loadedELF{}, nil, nil, nil, err
 			}
 			// Ensure file is release in case the code loops or errors out.
-			defer args.File.DecRef()
+			defer args.File.DecRef(ctx)
 		} else {
 			if err := checkIsRegularFile(ctx, args.File, args.Filename); err != nil {
 				return loadedELF{}, nil, nil, nil, err
@@ -186,7 +201,7 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 		// (e.g., #!a).
 		if err != nil && err != io.ErrUnexpectedEOF {
 			if err == io.EOF {
-				err = syserror.ENOEXEC
+				err = linuxerr.ENOEXEC
 			}
 			return loadedELF{}, nil, nil, nil, err
 		}
@@ -204,7 +219,7 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 
 		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
 			if args.CloseOnExec {
-				return loadedELF{}, nil, nil, nil, syserror.ENOENT
+				return loadedELF{}, nil, nil, nil, linuxerr.ENOENT
 			}
 			args.Filename, args.Argv, err = parseInterpreterScript(ctx, args.Filename, args.File, args.Argv)
 			if err != nil {
@@ -216,13 +231,25 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 
 		default:
 			ctx.Infof("Unknown magic: %v", hdr)
-			return loadedELF{}, nil, nil, nil, syserror.ENOEXEC
+			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
 		args.File = nil
 	}
 
-	return loadedELF{}, nil, nil, nil, syserror.ELOOP
+	return loadedELF{}, nil, nil, nil, linuxerr.ELOOP
+}
+
+// ImageInfo represents the information for the loaded image.
+type ImageInfo struct {
+	// The target operating system of the image.
+	OS abi.OS
+	// AMD64 context.
+	Arch *arch.Context64
+	// The base name of the binary.
+	Name string
+	// The binary's file capability.
+	FileCaps string
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -232,75 +259,82 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 // path and argv.
 //
 // Preconditions:
-//  * The Task MemoryManager is empty.
-//  * Load is called on the Task goroutine.
-func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (abi.OS, arch.Context, string, *syserr.Error) {
+//   - The Task MemoryManager is empty.
+//   - Load is called on the Task goroutine.
+func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *syserr.Error) {
 	// Load the executable itself.
 	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	defer file.DecRef()
+	defer file.DecRef(ctx)
+	xattr, err := file.GetXattr(ctx, &vfs.GetXattrOptions{Name: securityCapability, Size: linux.XATTR_CAPS_SZ_3})
+	switch {
+	case linuxerr.Equals(linuxerr.ENODATA, err), linuxerr.Equals(linuxerr.ENOTSUP, err):
+		xattr = ""
+	case err != nil:
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("failed to read file capabilities of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
+	}
 
 	// Load the VDSO.
 	vdsoAddr, err := loadVDSO(ctx, args.MemoryManager, vdso, loaded)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Error loading VDSO: %v", err), syserr.FromError(err).ToLinux())
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("error loading VDSO: %v", err), syserr.FromError(err).ToLinux())
 	}
 
 	// Setup the heap. brk starts at the next page after the end of the
-	// executable. Userspace can assume that the remainer of the page after
+	// executable. Userspace can assume that the remainder of the page after
 	// loaded.end is available for its use.
 	e, ok := loaded.end.RoundUp()
 	if !ok {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("brk overflows: %#x", loaded.end), linux.ENOEXEC)
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("brk overflows: %#x", loaded.end), errno.ENOEXEC)
 	}
 	args.MemoryManager.BrkSetup(ctx, e)
 
 	// Allocate our stack.
 	stack, err := allocStack(ctx, args.MemoryManager, ac)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to allocate stack: %v", err), syserr.FromError(err).ToLinux())
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("Failed to allocate stack: %v", err), syserr.FromError(err).ToLinux())
 	}
 
 	// Push the original filename to the stack, for AT_EXECFN.
-	execfn, err := stack.Push(args.Filename)
-	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to push exec filename: %v", err), syserr.FromError(err).ToLinux())
+	if _, err := stack.PushNullTerminatedByteSlice([]byte(args.Filename)); err != nil {
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("Failed to push exec filename: %v", err), syserr.FromError(err).ToLinux())
 	}
+	execfn := stack.Bottom
 
 	// Push 16 random bytes on the stack which AT_RANDOM will point to.
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to read random bytes: %v", err), syserr.FromError(err).ToLinux())
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("Failed to read random bytes: %v", err), syserr.FromError(err).ToLinux())
 	}
-	random, err := stack.Push(b)
-	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to push random bytes: %v", err), syserr.FromError(err).ToLinux())
+	if _, err = stack.PushNullTerminatedByteSlice(b[:]); err != nil {
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("Failed to push random bytes: %v", err), syserr.FromError(err).ToLinux())
 	}
+	random := stack.Bottom
 
 	c := auth.CredentialsFromContext(ctx)
 
 	// Add generic auxv entries.
 	auxv := append(loaded.auxv, arch.Auxv{
-		arch.AuxEntry{linux.AT_UID, usermem.Addr(c.RealKUID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_EUID, usermem.Addr(c.EffectiveKUID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_GID, usermem.Addr(c.RealKGID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_EGID, usermem.Addr(c.EffectiveKGID.In(c.UserNamespace).OrOverflow())},
+		arch.AuxEntry{linux.AT_UID, hostarch.Addr(c.RealKUID.In(c.UserNamespace).OrOverflow())},
+		arch.AuxEntry{linux.AT_EUID, hostarch.Addr(c.EffectiveKUID.In(c.UserNamespace).OrOverflow())},
+		arch.AuxEntry{linux.AT_GID, hostarch.Addr(c.RealKGID.In(c.UserNamespace).OrOverflow())},
+		arch.AuxEntry{linux.AT_EGID, hostarch.Addr(c.EffectiveKGID.In(c.UserNamespace).OrOverflow())},
 		// The conditions that require AT_SECURE = 1 never arise. See
 		// kernel.Task.updateCredsForExecLocked.
 		arch.AuxEntry{linux.AT_SECURE, 0},
 		arch.AuxEntry{linux.AT_CLKTCK, linux.CLOCKS_PER_SEC},
 		arch.AuxEntry{linux.AT_EXECFN, execfn},
 		arch.AuxEntry{linux.AT_RANDOM, random},
-		arch.AuxEntry{linux.AT_PAGESZ, usermem.PageSize},
+		arch.AuxEntry{linux.AT_PAGESZ, hostarch.PageSize},
 		arch.AuxEntry{linux.AT_SYSINFO_EHDR, vdsoAddr},
 	}...)
 	auxv = append(auxv, extraAuxv...)
 
 	sl, err := stack.Load(newArgv, args.Envv, auxv)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
+		return ImageInfo{}, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
 	}
 
 	m := args.MemoryManager
@@ -309,7 +343,8 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	m.SetEnvvStart(sl.EnvvStart)
 	m.SetEnvvEnd(sl.EnvvEnd)
 	m.SetAuxv(auxv)
-	m.SetExecutable(file)
+	m.SetExecutable(ctx, file)
+	m.SetVDSOSigReturn(uint64(vdsoAddr) + vdsoSigreturnOffset - vdsoPrelink)
 
 	ac.SetIP(uintptr(loaded.entry))
 	ac.SetStack(uintptr(stack.Bottom))
@@ -319,5 +354,10 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		name = name[:linux.TASK_COMM_LEN-1]
 	}
 
-	return loaded.os, ac, name, nil
+	return ImageInfo{
+		OS:       loaded.os,
+		Arch:     ac,
+		Name:     name,
+		FileCaps: xattr,
+	}, nil
 }

@@ -14,16 +14,35 @@
 
 package kernel
 
-import "fmt"
+import (
+	"context"
+	"fmt"
 
-// afterLoad is invoked by stateify.
-func (s *SyscallTable) afterLoad() {
-	otherTable, ok := LookupSyscallTable(s.OS, s.Arch)
-	if !ok {
-		// Couldn't find a reference?
-		panic(fmt.Sprintf("syscall table not found for OS %v Arch %v", s.OS, s.Arch))
+	"gvisor.dev/gvisor/pkg/abi"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+)
+
+// syscallTableInfo is used to reload the SyscallTable.
+//
+// +stateify savable
+type syscallTableInfo struct {
+	OS   abi.OS
+	Arch arch.Arch
+}
+
+// saveSt saves the SyscallTable.
+func (image *TaskImage) saveSt() syscallTableInfo {
+	return syscallTableInfo{
+		OS:   image.st.OS,
+		Arch: image.st.Arch,
 	}
+}
 
-	// Copy the table.
-	*s = *otherTable
+// loadSt loads the SyscallTable.
+func (image *TaskImage) loadSt(_ context.Context, sti syscallTableInfo) {
+	st, ok := LookupSyscallTable(sti.OS, sti.Arch)
+	if !ok {
+		panic(fmt.Sprintf("syscall table not found for OS %v, Arch %v", sti.OS, sti.Arch))
+	}
+	image.st = st // Save the table reference.
 }

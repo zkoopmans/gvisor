@@ -16,18 +16,18 @@ package mm
 
 import (
 	"fmt"
-	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // AddressSpace returns the platform.AddressSpace bound to mm.
 //
 // Preconditions: The caller must have called mm.Activate().
 func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
-	if atomic.LoadInt32(&mm.active) == 0 {
+	if mm.active.Load() == 0 {
 		panic("trying to use inactive address space?")
 	}
 	return mm.as
@@ -39,11 +39,18 @@ func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
 //
 // When this MemoryManager is no longer needed by a task, it should call
 // Deactivate to release the reference.
-func (mm *MemoryManager) Activate() error {
+func (mm *MemoryManager) Activate(ctx context.Context) error {
 	// Fast path: the MemoryManager already has an active
 	// platform.AddressSpace, and we just need to indicate that we need it too.
-	if atomicbitops.IncUnlessZeroInt32(&mm.active) {
-		return nil
+	for {
+		active := mm.active.Load()
+		if active == 0 {
+			// Fall back to the slow path.
+			break
+		}
+		if mm.active.CompareAndSwap(active, active+1) {
+			return nil
+		}
 	}
 
 	for {
@@ -54,10 +61,10 @@ func (mm *MemoryManager) Activate() error {
 		// method is commonly in the hot-path.
 
 		// Check if we raced with another goroutine performing activation.
-		if atomic.LoadInt32(&mm.active) > 0 {
+		if mm.active.Load() > 0 {
 			// This can't race; Deactivate can't decrease mm.active from 1 to 0
 			// without holding activeMu.
-			atomic.AddInt32(&mm.active, 1)
+			mm.active.Add(1)
 			mm.activeMu.Unlock()
 			return nil
 		}
@@ -65,7 +72,7 @@ func (mm *MemoryManager) Activate() error {
 		// Do we have a context? If so, then we never unmapped it. This can
 		// only be the case if !mm.p.CooperativelySchedulesAddressSpace().
 		if mm.as != nil {
-			atomic.StoreInt32(&mm.active, 1)
+			mm.active.Store(1)
 			mm.activeMu.Unlock()
 			return nil
 		}
@@ -73,7 +80,7 @@ func (mm *MemoryManager) Activate() error {
 		// Get a new address space. We must force unmapping by passing nil to
 		// NewAddressSpace if requested. (As in the nil interface object, not a
 		// typed nil.)
-		mappingsID := (interface{})(mm)
+		mappingsID := (any)(mm)
 		if mm.unmapAllOnActivate {
 			mappingsID = nil
 		}
@@ -85,16 +92,20 @@ func (mm *MemoryManager) Activate() error {
 		if as == nil {
 			// AddressSpace is unavailable, we must wait.
 			//
-			// activeMu must not be held while waiting, as the user
-			// of the address space we are waiting on may attempt
-			// to take activeMu.
-			//
-			// Don't call UninterruptibleSleepStart to register the
-			// wait to allow the watchdog stuck task to trigger in
-			// case a process is starved waiting for the address
-			// space.
+			// activeMu must not be held while waiting, as the user of the address
+			// space we are waiting on may attempt to take activeMu.
 			mm.activeMu.Unlock()
+
+			sleep := mm.p.CooperativelySchedulesAddressSpace() && mm.sleepForActivation
+			if sleep {
+				// Mark this task sleeping while waiting for the address space to
+				// prevent the watchdog from reporting it as a stuck task.
+				ctx.UninterruptibleSleepStart(false)
+			}
 			<-c
+			if sleep {
+				ctx.UninterruptibleSleepFinish(false)
+			}
 			continue
 		}
 
@@ -107,7 +118,7 @@ func (mm *MemoryManager) Activate() error {
 
 		// Now that m.as has been assigned, we can set m.active to a non-zero value
 		// to enable the fast path.
-		atomic.StoreInt32(&mm.active, 1)
+		mm.active.Store(1)
 
 		mm.activeMu.Unlock()
 		return nil
@@ -118,15 +129,22 @@ func (mm *MemoryManager) Activate() error {
 func (mm *MemoryManager) Deactivate() {
 	// Fast path: this is not the last goroutine to deactivate the
 	// MemoryManager.
-	if atomicbitops.DecUnlessOneInt32(&mm.active) {
-		return
+	for {
+		active := mm.active.Load()
+		if active == 1 {
+			// Fall back to the slow path.
+			break
+		}
+		if mm.active.CompareAndSwap(active, active-1) {
+			return
+		}
 	}
 
 	mm.activeMu.Lock()
 	// Same as Activate.
 
 	// Still active?
-	if atomic.AddInt32(&mm.active, -1) > 0 {
+	if mm.active.Add(-1) > 0 {
 		mm.activeMu.Unlock()
 		return
 	}
@@ -145,22 +163,27 @@ func (mm *MemoryManager) Deactivate() {
 	mm.activeMu.Unlock()
 }
 
-// mapASLocked maps addresses in ar into mm.as. If precommit is true, mappings
-// for all addresses in ar should be precommitted.
+// mapASLocked maps addresses in ar into mm.as.
 //
-// Preconditions: mm.activeMu must be locked. mm.as != nil. ar.Length() != 0.
-// ar must be page-aligned. pseg == mm.pmas.LowerBoundSegment(ar.Start).
-func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, precommit bool) error {
+// Preconditions:
+//   - mm.activeMu must be locked.
+//   - mm.as != nil.
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
+//   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
+func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
-	mapAR := usermem.AddrRange{0, ^usermem.Addr(usermem.PageSize - 1)}
-	if precommit {
-		// When explicitly precommitting, only map ar, since overmapping may
-		// incur unexpected resource usage.
+	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
+	if platformEffect != memmap.PlatformEffectDefault {
+		// When explicitly committing, only map ar, since overmapping may incur
+		// unexpected resource usage. When explicitly populating, do the same
+		// since an underlying device file may be sensitive to the mapped
+		// range.
 		mapAR = ar
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
-		mapMask := usermem.Addr(mapUnit - 1)
+		mapMask := hostarch.Addr(mapUnit - 1)
 		mapAR.Start = ar.Start &^ mapMask
 		// If rounding ar.End up overflows, just keep the existing mapAR.End.
 		if end := (ar.End + mapMask) &^ mapMask; end >= ar.End {
@@ -183,8 +206,10 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, pre
 		if pma.needCOW {
 			perms.Write = false
 		}
-		if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, precommit); err != nil {
-			return err
+		if perms.Any() { // MapFile precondition
+			if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
+				return err
+			}
 		}
 		pseg = pseg.NextSegment()
 	}
@@ -194,7 +219,10 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, pre
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
 //
 // Preconditions: mm.activeMu must be locked.
-func (mm *MemoryManager) unmapASLocked(ar usermem.AddrRange) {
+func (mm *MemoryManager) unmapASLocked(ar hostarch.AddrRange) {
+	if ar.Length() == 0 {
+		return
+	}
 	if mm.as == nil {
 		// No AddressSpace? Force all mappings to be unmapped on the next
 		// Activate.

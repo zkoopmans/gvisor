@@ -48,6 +48,7 @@ import (
 	"compress/flate"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -55,7 +56,6 @@ import (
 	"strings"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/compressio"
 )
 
@@ -83,6 +83,87 @@ var ErrInvalidMetadataLength = fmt.Errorf("metadata length invalid, maximum size
 // ErrMetadataInvalid is returned if passed metadata is invalid.
 var ErrMetadataInvalid = fmt.Errorf("metadata invalid, can't start with _")
 
+// ErrInvalidFlags is returned if passed flags set is invalid.
+var ErrInvalidFlags = fmt.Errorf("flags set is invalid")
+
+const (
+	// CompressionKey is the key for the compression level in the metadata.
+	CompressionKey = "compression"
+)
+
+// CompressionLevel is the image compression level.
+type CompressionLevel string
+
+const (
+	// CompressionLevelFlateBestSpeed represents flate algorithm in best-speed mode.
+	CompressionLevelFlateBestSpeed = CompressionLevel("flate-best-speed")
+	// CompressionLevelNone represents the absence of any compression on an image.
+	CompressionLevelNone = CompressionLevel("none")
+	// CompressionLevelDefault represents the default compression level.
+	CompressionLevelDefault = CompressionLevelFlateBestSpeed
+)
+
+func (c CompressionLevel) String() string {
+	return string(c)
+}
+
+// Options is statefile options.
+type Options struct {
+	// Compression is an image compression type/level.
+	Compression CompressionLevel
+
+	// Resume indicates if the sandbox process should continue running
+	// after checkpointing.
+	Resume bool
+}
+
+// WriteToMetadata save options to the metadata storage.  Method returns the
+// reference to the original metadata map to allow to be used in the chain calls.
+func (o Options) WriteToMetadata(metadata map[string]string) map[string]string {
+	metadata[CompressionKey] = string(o.Compression)
+	return metadata
+}
+
+// CompressionLevelFromString parses a string into the CompressionLevel.
+func CompressionLevelFromString(val string) (CompressionLevel, error) {
+	switch val {
+	case string(CompressionLevelFlateBestSpeed):
+		return CompressionLevelFlateBestSpeed, nil
+	case string(CompressionLevelNone):
+		return CompressionLevelNone, nil
+	case "":
+		return CompressionLevelDefault, nil
+	default:
+		return CompressionLevelNone, ErrInvalidFlags
+	}
+}
+
+// CompressionLevelFromMetadata returns image compression type stored in the metadata.
+// If the metadata doesn't contain compression information the default behavior
+// is the "flate-best-speed" state because the default behavior used to be to always
+// compress. If the parameter is missing it will be set to default.
+func CompressionLevelFromMetadata(metadata map[string]string) (CompressionLevel, error) {
+	compression := CompressionLevelDefault
+
+	if val, ok := metadata[CompressionKey]; ok {
+		var err error
+		if compression, err = CompressionLevelFromString(val); err != nil {
+			return CompressionLevelNone, err
+		}
+	} else {
+		metadata[CompressionKey] = string(compression)
+	}
+
+	return compression, nil
+}
+
+func writeMetadataLen(w io.Writer, val uint64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], val)
+	_, err := w.Write(buf[:])
+	return err
+}
+
 // NewWriter returns a state data writer for a statefile.
 //
 // Note that the returned WriteCloser must be closed.
@@ -109,6 +190,12 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 	metadata["_timestamp"] = time.Now().UTC().String()
 	defer delete(metadata, "_timestamp")
 
+	// Save compression state
+	compression, err := CompressionLevelFromMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+
 	// Write the metadata.
 	b, err := json.Marshal(metadata)
 	if err != nil {
@@ -120,7 +207,7 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 	}
 
 	// Metadata length.
-	if err := binary.WriteUint64(mw, binary.BigEndian, uint64(len(b))); err != nil {
+	if err := writeMetadataLen(mw, uint64(len(b))); err != nil {
 		return nil, err
 	}
 	// Metadata bytes; io.MultiWriter will return a short write error if
@@ -138,17 +225,29 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 		}
 	}
 
-	// Wrap in compression. We always use "best speed" mode here. When using
-	// "best compression" mode, there is usually only a little gain in file
-	// size reduction, which translate to even smaller gain in restore
-	// latency reduction, while inccuring much more CPU usage at save time.
-	return compressio.NewWriter(w, key, compressionChunkSize, flate.BestSpeed)
+	// Wrap in compression. When using "best compression" mode, there is usually
+	// only a little gain in file size reduction, which translate to even smaller
+	// gain in restore latency reduction, while inccuring much more CPU usage at
+	// save time.
+	if compression == CompressionLevelFlateBestSpeed {
+		return compressio.NewWriter(w, key, compressionChunkSize, flate.BestSpeed)
+	}
+
+	return compressio.NewSimpleWriter(w, key)
 }
 
 // MetadataUnsafe reads out the metadata from a state file without verifying any
 // HMAC. This function shouldn't be called for untrusted input files.
 func MetadataUnsafe(r io.Reader) (map[string]string, error) {
 	return metadata(r, nil)
+}
+
+func readMetadataLen(r io.Reader) (uint64, error) {
+	var buf [8]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(buf[:]), nil
 }
 
 // metadata validates the magic header and reads out the metadata from a state
@@ -176,7 +275,7 @@ func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
 			}
 		}()
 
-		metadataLen, err := binary.ReadUint64(r, binary.BigEndian)
+		metadataLen, err := readMetadataLen(r)
 		if err != nil {
 			return nil, err
 		}
@@ -223,10 +322,29 @@ func NewReader(r io.Reader, key []byte) (io.Reader, map[string]string, error) {
 		return nil, nil, err
 	}
 
-	// Wrap in compression.
-	rc, err := compressio.NewReader(r, key)
+	// Determine image compression state. If the metadata doesn't contain
+	// compression information the default behavior is the "compressed" state
+	// because the default behavior used to be to always compress.
+	compression, err := CompressionLevelFromMetadata(metadata)
 	if err != nil {
 		return nil, nil, err
 	}
-	return rc, metadata, nil
+
+	// Pick correct reader
+	var cr io.Reader
+
+	if compression == CompressionLevelFlateBestSpeed {
+		cr, err = compressio.NewReader(r, key)
+	} else if compression == CompressionLevelNone {
+		cr, err = compressio.NewSimpleReader(r, key)
+	} else {
+		// Should never occur, as it has the default path.
+		return nil, nil, fmt.Errorf("metadata contains invalid compression flag value: %v", compression)
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return cr, metadata, nil
 }

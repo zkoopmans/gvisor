@@ -67,8 +67,106 @@ const (
 
 // ioctl(2) requests provided by uapi/linux/sockios.h
 const (
-	SIOCGIFMEM    = 0x891f
-	SIOCGIFPFLAGS = 0x8935
-	SIOCGMIIPHY   = 0x8947
-	SIOCGMIIREG   = 0x8948
+	SIOCGIFNAME    = 0x8910
+	SIOCGIFCONF    = 0x8912
+	SIOCGIFFLAGS   = 0x8913
+	SIOCGIFADDR    = 0x8915
+	SIOCGIFDSTADDR = 0x8917
+	SIOCGIFBRDADDR = 0x8919
+	SIOCGIFNETMASK = 0x891b
+	SIOCGIFMETRIC  = 0x891d
+	SIOCGIFMTU     = 0x8921
+	SIOCGIFMEM     = 0x891f
+	SIOCGIFHWADDR  = 0x8927
+	SIOCGIFINDEX   = 0x8933
+	SIOCGIFPFLAGS  = 0x8935
+	SIOCGIFTXQLEN  = 0x8942
+	SIOCETHTOOL    = 0x8946
+	SIOCGMIIPHY    = 0x8947
+	SIOCGMIIREG    = 0x8948
+	SIOCGIFMAP     = 0x8970
+)
+
+// ioctl(2) requests provided by uapi/asm-generic/sockios.h
+const (
+	SIOCGSTAMP = 0x8906
+)
+
+// ioctl(2) directions. Used to calculate requests number.
+// Constants from asm-generic/ioctl.h.
+const (
+	IOC_NONE  = 0
+	IOC_WRITE = 1
+	IOC_READ  = 2
+)
+
+// Constants from asm-generic/ioctl.h.
+const (
+	IOC_NRBITS   = 8
+	IOC_TYPEBITS = 8
+	IOC_SIZEBITS = 14
+	IOC_DIRBITS  = 2
+
+	IOC_NRSHIFT   = 0
+	IOC_TYPESHIFT = IOC_NRSHIFT + IOC_NRBITS
+	IOC_SIZESHIFT = IOC_TYPESHIFT + IOC_TYPEBITS
+	IOC_DIRSHIFT  = IOC_SIZESHIFT + IOC_SIZEBITS
+)
+
+// IOC outputs the result of _IOC macro in include/uapi/asm-generic/ioctl.h.
+func IOC(dir, typ, nr, size uint32) uint32 {
+	return uint32(dir)<<IOC_DIRSHIFT | typ<<IOC_TYPESHIFT | nr<<IOC_NRSHIFT | size<<IOC_SIZESHIFT
+}
+
+// IO outputs the result of _IO macro in include/uapi/asm-generic/ioctl.h.
+func IO(typ, nr uint32) uint32 {
+	return IOC(IOC_NONE, typ, nr, 0)
+}
+
+// IOR outputs the result of _IOR macro in include/uapi/asm-generic/ioctl.h.
+func IOR(typ, nr, size uint32) uint32 {
+	return IOC(IOC_READ, typ, nr, size)
+}
+
+// IOW outputs the result of _IOW macro in include/uapi/asm-generic/ioctl.h.
+func IOW(typ, nr, size uint32) uint32 {
+	return IOC(IOC_WRITE, typ, nr, size)
+}
+
+// IOWR outputs the result of _IOWR macro in include/uapi/asm-generic/ioctl.h.
+func IOWR(typ, nr, size uint32) uint32 {
+	return IOC(IOC_READ|IOC_WRITE, typ, nr, size)
+}
+
+// IOC_NR outputs the result of IOC_NR macro in
+// include/uapi/asm-generic/ioctl.h.
+func IOC_NR(nr uint32) uint32 {
+	return (nr >> IOC_NRSHIFT) & ((1 << IOC_NRBITS) - 1)
+}
+
+// IOC_SIZE outputs the result of IOC_SIZE macro in
+// include/uapi/asm-generic/ioctl.h.
+func IOC_SIZE(nr uint32) uint32 {
+	return (nr >> IOC_SIZESHIFT) & ((1 << IOC_SIZEBITS) - 1)
+}
+
+// Kcov ioctls from include/uapi/linux/kcov.h.
+var (
+	KCOV_INIT_TRACE = IOR('c', 1, 8)
+	KCOV_ENABLE     = IO('c', 100)
+	KCOV_DISABLE    = IO('c', 101)
+)
+
+// Kcov trace types from include/uapi/linux/kcov.h.
+const (
+	KCOV_TRACE_PC  = 0
+	KCOV_TRACE_CMP = 1
+)
+
+// Kcov state constants from include/uapi/linux/kcov.h.
+const (
+	KCOV_MODE_DISABLED  = 0
+	KCOV_MODE_INIT      = 1
+	KCOV_MODE_TRACE_PC  = 2
+	KCOV_MODE_TRACE_CMP = 3
 )

@@ -18,26 +18,24 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"path"
+	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/host"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
+	"gvisor.dev/gvisor/pkg/sentry/fdimport"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -46,6 +44,52 @@ import (
 // At the moment, this is limited to exec support.
 type Proc struct {
 	Kernel *kernel.Kernel
+}
+
+// FilePayload aids to ensure that payload files and guest file descriptors are
+// consistent when instantiated through the NewFilePayload helper method.
+type FilePayload struct {
+	// FilePayload is the file payload that is transferred via RPC.
+	urpc.FilePayload
+
+	// GuestFDs are the file descriptors in the file descriptor map of the
+	// executed application. They correspond 1:1 to the files in the
+	// urpc.FilePayload. If a program is executed from a host file descriptor,
+	// the file payload may contain one additional file. In that case, the file
+	// used for program execution is the last file in the Files array.
+	GuestFDs []int
+}
+
+// NewFilePayload returns a FilePayload that maps file descriptors to files inside
+// the executed process and provides a file for execution.
+func NewFilePayload(fdMap map[int]*os.File, execFile *os.File) FilePayload {
+	fileCount := len(fdMap)
+	if execFile != nil {
+		fileCount++
+	}
+	files := make([]*os.File, 0, fileCount)
+	guestFDs := make([]int, 0, len(fdMap))
+
+	// Make the map iteration order deterministic for the sake of testing.
+	// Otherwise, the order is randomized and tests relying on the comparison
+	// of equality will fail.
+	for key := range fdMap {
+		guestFDs = append(guestFDs, key)
+	}
+	sort.Ints(guestFDs)
+
+	for _, guestFD := range guestFDs {
+		files = append(files, fdMap[guestFD])
+	}
+
+	if execFile != nil {
+		files = append(files, execFile)
+	}
+
+	return FilePayload{
+		FilePayload: urpc.FilePayload{Files: files},
+		GuestFDs:    guestFDs,
+	}
 }
 
 // ExecArgs is the set of arguments to exec.
@@ -65,13 +109,7 @@ type ExecArgs struct {
 	// A reference on MountNamespace must be held for the lifetime of the
 	// ExecArgs. If MountNamespace is nil, it will default to the init
 	// process's MountNamespace.
-	MountNamespace *fs.MountNamespace
-
-	// MountNamespaceVFS2 is the mount namespace to execute the new process in.
-	// A reference on MountNamespace must be held for the lifetime of the
-	// ExecArgs. If MountNamespace is nil, it will default to the init
-	// process's MountNamespace.
-	MountNamespaceVFS2 *vfs.MountNamespace
+	MountNamespace *vfs.MountNamespace
 
 	// WorkingDirectory defines the working directory for the new process.
 	WorkingDirectory string `json:"wd"`
@@ -84,29 +122,33 @@ type ExecArgs struct {
 	// the root group if not set explicitly.
 	KGID auth.KGID
 
-	// ExtraKGIDs is the list of additional groups to which the user
-	// belongs.
+	// ExtraKGIDs is the list of additional groups to which the user belongs.
 	ExtraKGIDs []auth.KGID
 
 	// Capabilities is the list of capabilities to give to the process.
 	Capabilities *auth.TaskCapabilities
 
-	// StdioIsPty indicates that FDs 0, 1, and 2 are connected to a host
-	// pty FD.
+	// StdioIsPty indicates that FDs 0, 1, and 2 are connected to a host pty FD.
 	StdioIsPty bool
 
 	// FilePayload determines the files to give to the new process.
-	urpc.FilePayload
+	FilePayload
 
 	// ContainerID is the container for the process being executed.
 	ContainerID string
 
 	// PIDNamespace is the pid namespace for the process being executed.
 	PIDNamespace *kernel.PIDNamespace
+
+	// Limits is the limit set for the process being executed.
+	Limits *limits.LimitSet
 }
 
 // String prints the arguments as a string.
-func (args ExecArgs) String() string {
+func (args *ExecArgs) String() string {
+	if len(args.Argv) == 0 {
+		return args.Filename
+	}
 	a := make([]string, len(args.Argv))
 	copy(a, args.Argv)
 	if args.Filename != "" {
@@ -124,31 +166,22 @@ func (proc *Proc) Exec(args *ExecArgs, waitStatus *uint32) error {
 
 	// Wait for completion.
 	newTG.WaitExited()
-	*waitStatus = newTG.ExitStatus().Status()
+	*waitStatus = uint32(newTG.ExitStatus())
 	return nil
 }
 
 // ExecAsync runs a new task, but doesn't wait for it to finish. It is defined
 // as a function rather than a method to avoid exposing execAsync as an RPC.
-func ExecAsync(proc *Proc, args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileOperations, error) {
+func ExecAsync(proc *Proc, args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
 	return proc.execAsync(args)
 }
 
 // execAsync runs a new task, but doesn't wait for it to finish. It returns the
 // newly created thread group and its PID. If the stdio FDs are TTYs, then a
 // TTYFileOperations that wraps the TTY is also returned.
-func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileOperations, error) {
+func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
 	// Import file descriptors.
 	fdTable := proc.Kernel.NewFDTable()
-	defer fdTable.DecRef()
-
-	// No matter what happens, we should close all files in the FilePayload
-	// before returning. Any files that are imported will be duped.
-	defer func() {
-		for _, f := range args.FilePayload.Files {
-			f.Close()
-		}
-	}()
 
 	creds := auth.NewUserCredentials(
 		args.KUID,
@@ -157,114 +190,103 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		args.Capabilities,
 		proc.Kernel.RootUserNamespace())
 
+	pidns := args.PIDNamespace
+	if pidns == nil {
+		pidns = proc.Kernel.RootPIDNamespace()
+	}
+	limitSet := args.Limits
+	if limitSet == nil {
+		limitSet = limits.NewLimitSet()
+	}
 	initArgs := kernel.CreateProcessArgs{
-		Filename:                args.Filename,
-		Argv:                    args.Argv,
-		Envv:                    args.Envv,
-		WorkingDirectory:        args.WorkingDirectory,
-		MountNamespace:          args.MountNamespace,
-		MountNamespaceVFS2:      args.MountNamespaceVFS2,
-		Credentials:             creds,
-		FDTable:                 fdTable,
-		Umask:                   0022,
-		Limits:                  limits.NewLimitSet(),
-		MaxSymlinkTraversals:    linux.MaxSymlinkTraversals,
-		UTSNamespace:            proc.Kernel.RootUTSNamespace(),
-		IPCNamespace:            proc.Kernel.RootIPCNamespace(),
-		AbstractSocketNamespace: proc.Kernel.RootAbstractSocketNamespace(),
-		ContainerID:             args.ContainerID,
-		PIDNamespace:            args.PIDNamespace,
+		Filename:             args.Filename,
+		Argv:                 args.Argv,
+		Envv:                 args.Envv,
+		WorkingDirectory:     args.WorkingDirectory,
+		MountNamespace:       args.MountNamespace,
+		Credentials:          creds,
+		FDTable:              fdTable,
+		Umask:                0022,
+		Limits:               limitSet,
+		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
+		UTSNamespace:         proc.Kernel.RootUTSNamespace(),
+		IPCNamespace:         proc.Kernel.RootIPCNamespace(),
+		ContainerID:          args.ContainerID,
+		PIDNamespace:         pidns,
+		Origin:               kernel.OriginExec,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
 		// be donated to the new process in CreateProcess.
 		initArgs.MountNamespace.IncRef()
 	}
-	if initArgs.MountNamespaceVFS2 != nil {
-		// initArgs must hold a reference on MountNamespaceVFS2, which will
-		// be donated to the new process in CreateProcess.
-		initArgs.MountNamespaceVFS2.IncRef()
-	}
 	ctx := initArgs.NewContext(proc.Kernel)
+	defer fdTable.DecRef(ctx)
 
-	if initArgs.Filename == "" {
-		if kernel.VFS2Enabled {
-			// Get the full path to the filename from the PATH env variable.
-			if initArgs.MountNamespaceVFS2 == nil {
-				// Set initArgs so that 'ctx' returns the namespace.
-				//
-				// MountNamespaceVFS2 adds a reference to the namespace, which is
-				// transferred to the new process.
-				initArgs.MountNamespaceVFS2 = proc.Kernel.GlobalInit().Leader().MountNamespaceVFS2()
-			}
-
-			paths := fs.GetPath(initArgs.Envv)
-			vfsObj := proc.Kernel.VFS()
-			file, err := ResolveExecutablePath(ctx, vfsObj, initArgs.WorkingDirectory, initArgs.Argv[0], paths)
-			if err != nil {
-				return nil, 0, nil, fmt.Errorf("error finding executable %q in PATH %v: %v", initArgs.Argv[0], paths, err)
-			}
-			initArgs.File = fsbridge.NewVFSFile(file)
-		} else {
-			// Get the full path to the filename from the PATH env variable.
-			paths := fs.GetPath(initArgs.Envv)
-			if initArgs.MountNamespace == nil {
-				// Set initArgs so that 'ctx' returns the namespace.
-				initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
-
-				// initArgs must hold a reference on MountNamespace, which will
-				// be donated to the new process in CreateProcess.
-				initArgs.MountNamespaceVFS2.IncRef()
-			}
-			f, err := initArgs.MountNamespace.ResolveExecutablePath(ctx, initArgs.WorkingDirectory, initArgs.Argv[0], paths)
-			if err != nil {
-				return nil, 0, nil, fmt.Errorf("error finding executable %q in PATH %v: %v", initArgs.Argv[0], paths, err)
-			}
-			initArgs.Filename = f
-		}
+	// Get the full path to the filename from the PATH env variable.
+	if initArgs.MountNamespace == nil {
+		// Set initArgs so that 'ctx' returns the namespace.
+		//
+		// Add a reference to the namespace, which is transferred to the new process.
+		initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
+		initArgs.MountNamespace.IncRef()
 	}
 
-	mounter := fs.FileOwnerFromContext(ctx)
-
-	// TODO(gvisor.dev/issue/1623): Use host FD when supported in VFS2.
-	var ttyFile *fs.File
-	for appFD, hostFile := range args.FilePayload.Files {
-		var appFile *fs.File
-
-		if args.StdioIsPty && appFD < 3 {
-			// Import the file as a host TTY file.
-			if ttyFile == nil {
-				var err error
-				appFile, err = host.ImportFile(ctx, int(hostFile.Fd()), mounter, true /* isTTY */)
-				if err != nil {
-					return nil, 0, nil, err
-				}
-				defer appFile.DecRef()
-
-				// Remember this in the TTY file, as we will
-				// use it for the other stdio FDs.
-				ttyFile = appFile
-			} else {
-				// Re-use the existing TTY file, as all three
-				// stdio FDs must point to the same fs.File in
-				// order to share TTY state, specifically the
-				// foreground process group id.
-				appFile = ttyFile
-			}
-		} else {
-			// Import the file as a regular host file.
-			var err error
-			appFile, err = host.ImportFile(ctx, int(hostFile.Fd()), mounter, false /* isTTY */)
-			if err != nil {
-				return nil, 0, nil, err
-			}
-			defer appFile.DecRef()
+	fdMap, execFD, err := args.unpackFiles()
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("creating fd map: %w", err)
+	}
+	defer func() {
+		for _, hostFD := range fdMap {
+			_ = hostFD.Close()
 		}
+	}()
 
-		// Add the file to the FD map.
-		if err := fdTable.NewFDAt(ctx, int32(appFD), appFile, kernel.FDFlags{}); err != nil {
+	if execFD != nil {
+		if initArgs.Filename != "" {
+			return nil, 0, nil, fmt.Errorf("process must either be started from a file or a filename, not both")
+		}
+		file, err := host.NewFD(ctx, proc.Kernel.HostMount(), execFD.FD(), &host.NewFDOptions{
+			Readonly:     true,
+			Savable:      true,
+			VirtualOwner: true,
+			UID:          args.KUID,
+			GID:          args.KGID,
+		})
+		if err != nil {
 			return nil, 0, nil, err
 		}
+		defer file.DecRef(ctx)
+		execFD.Release()
+		initArgs.File = file
+	} else {
+		resolved, err := user.ResolveExecutablePath(ctx, &initArgs)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		initArgs.Filename = resolved
+	}
+
+	// TODO(gvisor.dev/issue/1956): Container name is not really needed because
+	// exec processes are not restored, but add it for completeness.
+	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap, "")
+	if err != nil {
+		return nil, 0, nil, err
+	}
+
+	// Set cgroups to the new exec task if cgroups are mounted.
+	cgroupRegistry := proc.Kernel.CgroupRegistry()
+	initialCgrps := map[kernel.Cgroup]struct{}{}
+	for _, ctrl := range kernel.CgroupCtrls {
+		cg, err := cgroupRegistry.FindCgroup(ctx, ctrl, "/"+args.ContainerID)
+		if err != nil {
+			log.Warningf("cgroup mount for controller %v not found", ctrl)
+			continue
+		}
+		initialCgrps[cg] = struct{}{}
+	}
+	if len(initialCgrps) > 0 {
+		initArgs.InitialCgroups = initialCgrps
 	}
 
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
@@ -272,18 +294,15 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		return nil, 0, nil, err
 	}
 
-	var ttyFileOps *host.TTYFileOperations
+	// Set the foreground process group on the TTY before starting the process.
 	if ttyFile != nil {
-		// Set the foreground process group on the TTY before starting
-		// the process.
-		ttyFileOps = ttyFile.FileOperations.(*host.TTYFileOperations)
-		ttyFileOps.InitForegroundProcessGroup(tg.ProcessGroup())
+		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
 	}
 
 	// Start the newly created process.
 	proc.Kernel.StartProcess(tg)
 
-	return tg, tid, ttyFileOps, nil
+	return tg, tid, ttyFile, nil
 }
 
 // PsArgs is the set of arguments to ps.
@@ -380,8 +399,8 @@ func PrintPIDsJSON(pl []*Process) (string, error) {
 func Processes(k *kernel.Kernel, containerID string, out *[]*Process) error {
 	ts := k.TaskSet()
 	now := k.RealtimeClock().Now()
-	for _, tg := range ts.Root.ThreadGroups() {
-		pidns := tg.PIDNamespace()
+	pidns := ts.Root
+	for _, tg := range pidns.ThreadGroups() {
 		pid := pidns.IDOfThreadGroup(tg)
 
 		// If tg has already been reaped ignore it.
@@ -414,9 +433,9 @@ func Processes(k *kernel.Kernel, containerID string, out *[]*Process) error {
 }
 
 // formatStartTime formats startTime depending on the current time:
-// - If startTime was today, HH:MM is used.
-// - If startTime was not today but was this year, MonDD is used (e.g. Jan02)
-// - If startTime was not this year, the year is used.
+//   - If startTime was today, HH:MM is used.
+//   - If startTime was not today but was this year, MonDD is used (e.g. Jan02)
+//   - If startTime was not this year, the year is used.
 func formatStartTime(now, startTime ktime.Time) string {
 	nowS, nowNs := now.Unix()
 	n := time.Unix(nowS, nowNs)
@@ -455,66 +474,48 @@ func ttyName(tty *kernel.TTY) string {
 	return fmt.Sprintf("pts/%d", tty.Index)
 }
 
-// ResolveExecutablePath resolves the given executable name given a set of
-// paths that might contain it.
-func ResolveExecutablePath(ctx context.Context, vfsObj *vfs.VirtualFilesystem, wd, name string, paths []string) (*vfs.FileDescription, error) {
-	root := vfs.RootFromContext(ctx)
-	defer root.DecRef()
-	creds := auth.CredentialsFromContext(ctx)
-
-	// Absolute paths can be used directly.
-	if path.IsAbs(name) {
-		return openExecutable(ctx, vfsObj, creds, root, name)
+// ContainerUsage retrieves per-container CPU usage.
+func ContainerUsage(kr *kernel.Kernel) map[string]uint64 {
+	cusage := make(map[string]uint64)
+	for _, tg := range kr.TaskSet().Root.ThreadGroups() {
+		// We want each tg's usage including reaped children.
+		cid := tg.Leader().ContainerID()
+		stats := tg.CPUStats()
+		stats.Accumulate(tg.JoinedChildCPUStats())
+		cusage[cid] += uint64(stats.UserTime.Nanoseconds()) + uint64(stats.SysTime.Nanoseconds())
 	}
-
-	// Paths with '/' in them should be joined to the working directory, or
-	// to the root if working directory is not set.
-	if strings.IndexByte(name, '/') > 0 {
-		if len(wd) == 0 {
-			wd = "/"
-		}
-		if !path.IsAbs(wd) {
-			return nil, fmt.Errorf("working directory %q must be absolute", wd)
-		}
-		return openExecutable(ctx, vfsObj, creds, root, path.Join(wd, name))
-	}
-
-	// Otherwise, we must lookup the name in the paths, starting from the
-	// calling context's root directory.
-	for _, p := range paths {
-		if !path.IsAbs(p) {
-			// Relative paths aren't safe, no one should be using them.
-			log.Warningf("Skipping relative path %q in $PATH", p)
-			continue
-		}
-
-		binPath := path.Join(p, name)
-		f, err := openExecutable(ctx, vfsObj, creds, root, binPath)
-		if err != nil {
-			return nil, err
-		}
-		if f == nil {
-			continue // Not found/no access.
-		}
-		return f, nil
-	}
-	return nil, syserror.ENOENT
+	return cusage
 }
 
-func openExecutable(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, path string) (*vfs.FileDescription, error) {
-	pop := vfs.PathOperation{
-		Root:               root,
-		Start:              root, // binPath is absolute, Start can be anything.
-		Path:               fspath.Parse(path),
-		FollowFinalSymlink: true,
+// unpackFiles unpacks the file descriptor map and, if applicable, the file
+// descriptor to be used for execution from the unmarshalled ExecArgs.
+func (args *ExecArgs) unpackFiles() (map[int]*fd.FD, *fd.FD, error) {
+	var execFD *fd.FD
+	var err error
+
+	// If there is one additional file, the last file is used for program
+	// execution.
+	if len(args.Files) == len(args.GuestFDs)+1 {
+		execFD, err = fd.NewFromFile(args.Files[len(args.Files)-1])
+		if err != nil {
+			return nil, nil, fmt.Errorf("duplicating exec file: %w", err)
+		}
+	} else if len(args.Files) != len(args.GuestFDs) {
+		return nil, nil, fmt.Errorf("length of payload files does not match length of file descriptor array")
 	}
-	opts := &vfs.OpenOptions{
-		Flags:    linux.O_RDONLY,
-		FileExec: true,
+
+	// GuestFDs are the indexes of our FD map.
+	fdMap := make(map[int]*fd.FD, len(args.GuestFDs))
+	for i, appFD := range args.GuestFDs {
+		file := args.Files[i]
+		if appFD < 0 {
+			return nil, nil, fmt.Errorf("guest file descriptors must be 0 or greater")
+		}
+		hostFD, err := fd.NewFromFile(file)
+		if err != nil {
+			return nil, nil, fmt.Errorf("duplicating payload files: %w", err)
+		}
+		fdMap[appFD] = hostFD
 	}
-	f, err := vfsObj.OpenAt(ctx, creds, &pop, opts)
-	if err == syserror.ENOENT || err == syserror.EACCES {
-		return nil, nil
-	}
-	return f, err
+	return fdMap, execFD, nil
 }

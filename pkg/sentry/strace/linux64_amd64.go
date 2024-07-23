@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package strace
@@ -33,7 +34,7 @@ var linuxAMD64 = SyscallMap{
 	6:   makeSyscallInfo("lstat", Path, Stat),
 	7:   makeSyscallInfo("poll", PollFDs, Hex, Hex),
 	8:   makeSyscallInfo("lseek", Hex, Hex, Hex),
-	9:   makeSyscallInfo("mmap", Hex, Hex, Hex, Hex, FD, Hex),
+	9:   makeSyscallInfo("mmap", Hex, Hex, MmapProt, MmapFlags, FD, Hex),
 	10:  makeSyscallInfo("mprotect", Hex, Hex, Hex),
 	11:  makeSyscallInfo("munmap", Hex, Hex),
 	12:  makeSyscallInfo("brk", Hex),
@@ -256,8 +257,8 @@ var linuxAMD64 = SyscallMap{
 	229: makeSyscallInfo("clock_getres", Hex, PostTimespec),
 	230: makeSyscallInfo("clock_nanosleep", Hex, Hex, Timespec, PostTimespec),
 	231: makeSyscallInfo("exit_group", Hex),
-	232: makeSyscallInfo("epoll_wait", Hex, Hex, Hex, Hex),
-	233: makeSyscallInfo("epoll_ctl", Hex, Hex, FD, Hex),
+	232: makeSyscallInfo("epoll_wait", FD, EpollEvents, Hex, Hex),
+	233: makeSyscallInfo("epoll_ctl", FD, EpollCtlOp, FD, EpollEvent),
 	234: makeSyscallInfo("tgkill", Hex, Hex, Signal),
 	235: makeSyscallInfo("utimes", Path, Timeval),
 	// 236: vserver (not implemented in the Linux kernel)
@@ -290,7 +291,7 @@ var linuxAMD64 = SyscallMap{
 	263: makeSyscallInfo("unlinkat", FD, Path, Hex),
 	264: makeSyscallInfo("renameat", FD, Path, Hex, Path),
 	265: makeSyscallInfo("linkat", FD, Path, Hex, Path, Hex),
-	266: makeSyscallInfo("symlinkat", Path, Hex, Path),
+	266: makeSyscallInfo("symlinkat", Path, FD, Path),
 	267: makeSyscallInfo("readlinkat", FD, Path, ReadBuffer, Hex),
 	268: makeSyscallInfo("fchmodat", FD, Path, Mode),
 	269: makeSyscallInfo("faccessat", FD, Path, Oct, Hex),
@@ -305,7 +306,7 @@ var linuxAMD64 = SyscallMap{
 	278: makeSyscallInfo("vmsplice", FD, Hex, Hex, Hex),
 	279: makeSyscallInfo("move_pages", Hex, Hex, Hex, Hex, Hex, Hex),
 	280: makeSyscallInfo("utimensat", FD, Path, UTimeTimespec, Hex),
-	281: makeSyscallInfo("epoll_pwait", Hex, Hex, Hex, Hex, SigSet, Hex),
+	281: makeSyscallInfo("epoll_pwait", FD, EpollEvents, Hex, Hex, SigSet, Hex),
 	282: makeSyscallInfo("signalfd", Hex, Hex, Hex),
 	283: makeSyscallInfo("timerfd_create", Hex, Hex),
 	284: makeSyscallInfo("eventfd", Hex),
@@ -371,6 +372,9 @@ var linuxAMD64 = SyscallMap{
 	433: makeSyscallInfo("fspick", FD, Path, Hex),
 	434: makeSyscallInfo("pidfd_open", Hex, Hex),
 	435: makeSyscallInfo("clone3", Hex, Hex),
+	436: makeSyscallInfo("close_range", FD, FD, CloseRangeFlags),
+	439: makeSyscallInfo("faccessat2", FD, Path, Oct, Hex),
+	441: makeSyscallInfo("epoll_pwait2", FD, EpollEvents, Hex, Timespec, SigSet),
 }
 
 func init() {

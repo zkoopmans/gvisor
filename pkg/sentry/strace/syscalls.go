@@ -228,6 +228,25 @@ const (
 	// SockOptLevel is the optname argument in getsockopt(2) and
 	// setsockopt(2).
 	SockOptName
+
+	// EpollCtlOp is the op argument to epoll_ctl(2).
+	EpollCtlOp
+
+	// EpollEvent is the event argument in epoll_ctl(2).
+	EpollEvent
+
+	// EpollEvents is an array of struct epoll_event. It is the events
+	// argument in epoll_wait(2)/epoll_pwait(2).
+	EpollEvents
+
+	// MmapProt is the protection argument in mmap(2).
+	MmapProt
+
+	// MmapFlags is the flags argument in mmap(2).
+	MmapFlags
+
+	// CloseRangeFlags are close_range(2) flags.
+	CloseRangeFlags
 )
 
 // defaultFormat is the syscall argument format to use if the actual format is

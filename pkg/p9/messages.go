@@ -19,6 +19,7 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/log"
 )
 
 // ErrInvalidMsgType is returned when an unsupported message type is found.
@@ -254,8 +255,8 @@ func (r *Rwalk) decode(b *buffer) {
 // encode implements encoder.encode.
 func (r *Rwalk) encode(b *buffer) {
 	b.Write16(uint16(len(r.QIDs)))
-	for _, q := range r.QIDs {
-		q.encode(b)
+	for i := range r.QIDs {
+		r.QIDs[i].encode(b)
 	}
 }
 
@@ -315,6 +316,64 @@ func (*Rclunk) Type() MsgType {
 // String implements fmt.Stringer.
 func (r *Rclunk) String() string {
 	return "Rclunk{}"
+}
+
+// Tsetattrclunk is a setattr+close request.
+type Tsetattrclunk struct {
+	// FID is the FID to change.
+	FID FID
+
+	// Valid is the set of bits which will be used.
+	Valid SetAttrMask
+
+	// SetAttr is the set request.
+	SetAttr SetAttr
+}
+
+// decode implements encoder.decode.
+func (t *Tsetattrclunk) decode(b *buffer) {
+	t.FID = b.ReadFID()
+	t.Valid.decode(b)
+	t.SetAttr.decode(b)
+}
+
+// encode implements encoder.encode.
+func (t *Tsetattrclunk) encode(b *buffer) {
+	b.WriteFID(t.FID)
+	t.Valid.encode(b)
+	t.SetAttr.encode(b)
+}
+
+// Type implements message.Type.
+func (*Tsetattrclunk) Type() MsgType {
+	return MsgTsetattrclunk
+}
+
+// String implements fmt.Stringer.
+func (t *Tsetattrclunk) String() string {
+	return fmt.Sprintf("Tsetattrclunk{FID: %d, Valid: %v, SetAttr: %s}", t.FID, t.Valid, t.SetAttr)
+}
+
+// Rsetattrclunk is a setattr+close response.
+type Rsetattrclunk struct {
+}
+
+// decode implements encoder.decode.
+func (*Rsetattrclunk) decode(*buffer) {
+}
+
+// encode implements encoder.encode.
+func (*Rsetattrclunk) encode(*buffer) {
+}
+
+// Type implements message.Type.
+func (*Rsetattrclunk) Type() MsgType {
+	return MsgRsetattrclunk
+}
+
+// String implements fmt.Stringer.
+func (r *Rsetattrclunk) String() string {
+	return "Rsetattrclunk{}"
 }
 
 // Tremove is a remove request.
@@ -1858,8 +1917,8 @@ type Treaddir struct {
 	// Directory is the directory FID to read.
 	Directory FID
 
-	// Offset is the offset to read at.
-	Offset uint64
+	// DirentOffset is the dirent offset to read at.
+	DirentOffset uint64
 
 	// Count is the number of bytes to read.
 	Count uint32
@@ -1868,14 +1927,14 @@ type Treaddir struct {
 // decode implements encoder.decode.
 func (t *Treaddir) decode(b *buffer) {
 	t.Directory = b.ReadFID()
-	t.Offset = b.Read64()
+	t.DirentOffset = b.Read64()
 	t.Count = b.Read32()
 }
 
 // encode implements encoder.encode.
 func (t *Treaddir) encode(b *buffer) {
 	b.WriteFID(t.Directory)
-	b.Write64(t.Offset)
+	b.Write64(t.DirentOffset)
 	b.Write32(t.Count)
 }
 
@@ -1886,7 +1945,7 @@ func (*Treaddir) Type() MsgType {
 
 // String implements fmt.Stringer.
 func (t *Treaddir) String() string {
-	return fmt.Sprintf("Treaddir{DirectoryFID: %d, Offset: %d, Count: %d}", t.Directory, t.Offset, t.Count)
+	return fmt.Sprintf("Treaddir{DirectoryFID: %d, DirentOffset: %d, Count: %d}", t.Directory, t.DirentOffset, t.Count)
 }
 
 // Rreaddir is a readdir response.
@@ -1926,19 +1985,18 @@ func (r *Rreaddir) decode(b *buffer) {
 // encode implements encoder.encode.
 func (r *Rreaddir) encode(b *buffer) {
 	entriesBuf := buffer{}
-	for _, d := range r.Entries {
+	payloadSize := 0
+	for i, d := range r.Entries {
 		d.encode(&entriesBuf)
-		if len(entriesBuf.data) >= int(r.Count) {
+		if len(entriesBuf.data) > int(r.Count) {
+			log.Warningf("hit Rreaddir.Count limit while encoding dirents, discarding %d dirents", len(r.Entries)-i)
 			break
 		}
+		payloadSize = len(entriesBuf.data)
 	}
-	if len(entriesBuf.data) < int(r.Count) {
-		r.Count = uint32(len(entriesBuf.data))
-		r.payload = entriesBuf.data
-	} else {
-		r.payload = entriesBuf.data[:r.Count]
-	}
-	b.Write32(uint32(r.Count))
+	r.Count = uint32(payloadSize)
+	r.payload = entriesBuf.data[:payloadSize]
+	b.Write32(r.Count)
 }
 
 // Type implements message.Type.
@@ -2187,8 +2245,8 @@ func (r *Rwalkgetattr) encode(b *buffer) {
 	r.Valid.encode(b)
 	r.Attr.encode(b)
 	b.Write16(uint16(len(r.QIDs)))
-	for _, q := range r.QIDs {
-		q.encode(b)
+	for i := range r.QIDs {
+		r.QIDs[i].encode(b)
 	}
 }
 
@@ -2382,25 +2440,114 @@ func (r *Rusymlink) String() string {
 	return fmt.Sprintf("Rusymlink{%v}", &r.Rsymlink)
 }
 
+// Tbind is a bind request.
+type Tbind struct {
+	// Directory is the directory inside which the bound socket file should be
+	// created.
+	Directory FID
+
+	// SockType is the type of socket to be used. This is passed as an argument
+	// to socket(2).
+	SockType uint32
+
+	// SockName is the name of the socket file to be created.
+	SockName string
+
+	// UID is the owning user.
+	UID UID
+
+	// GID is the owning group.
+	GID GID
+
+	// NewFID is the resulting FID for the socket file.
+	NewFID FID
+}
+
+// decode implements encoder.decode.
+func (t *Tbind) decode(b *buffer) {
+	t.Directory = b.ReadFID()
+	t.SockType = b.Read32()
+	t.SockName = b.ReadString()
+	t.UID = b.ReadUID()
+	t.GID = b.ReadGID()
+	t.NewFID = b.ReadFID()
+}
+
+// encode implements encoder.encode.
+func (t *Tbind) encode(b *buffer) {
+	b.WriteFID(t.Directory)
+	b.Write32(t.SockType)
+	b.WriteString(t.SockName)
+	b.WriteUID(t.UID)
+	b.WriteGID(t.GID)
+	b.WriteFID(t.NewFID)
+}
+
+// Type implements message.Type.
+func (*Tbind) Type() MsgType {
+	return MsgTbind
+}
+
+// String implements fmt.Stringer.
+func (t *Tbind) String() string {
+	return fmt.Sprintf("Tbind{Directory: %d, SockType: %d, SockName: %s, UID: %d, GID: %d, NewFID: %d}", t.Directory, t.SockType, t.SockName, t.UID, t.GID, t.NewFID)
+}
+
+// Rbind is a bind response.
+type Rbind struct {
+	// QID is the resulting QID of the created socket file.
+	QID QID
+
+	// Valid indicates which fields are valid.
+	Valid AttrMask
+
+	// Attr is the set of attributes of the created socket file.
+	Attr Attr
+}
+
+// decode implements encoder.decode.
+func (r *Rbind) decode(b *buffer) {
+	r.QID.decode(b)
+	r.Valid.decode(b)
+	r.Attr.decode(b)
+}
+
+// encode implements encoder.encode.
+func (r *Rbind) encode(b *buffer) {
+	r.QID.encode(b)
+	r.Valid.encode(b)
+	r.Attr.encode(b)
+}
+
+// Type implements message.Type.
+func (*Rbind) Type() MsgType {
+	return MsgRbind
+}
+
+// String implements fmt.Stringer.
+func (r *Rbind) String() string {
+	return fmt.Sprintf("Rbind{QID: %s, Valid: %v, Attr: %s}", r.QID, r.Valid, r.Attr)
+}
+
 // Tlconnect is a connect request.
 type Tlconnect struct {
 	// FID is the FID to be connected.
 	FID FID
 
-	// Flags are the connect flags.
-	Flags ConnectFlags
+	// SocketType is the socket type to be connected to.
+	SocketType SocketType
 }
 
 // decode implements encoder.decode.
 func (t *Tlconnect) decode(b *buffer) {
 	t.FID = b.ReadFID()
-	t.Flags = b.ReadConnectFlags()
+	t.SocketType = b.ReadSocketType()
 }
 
 // encode implements encoder.encode.
 func (t *Tlconnect) encode(b *buffer) {
 	b.WriteFID(t.FID)
-	b.WriteConnectFlags(t.Flags)
+	b.WriteSocketType(t.SocketType)
 }
 
 // Type implements message.Type.
@@ -2410,7 +2557,7 @@ func (*Tlconnect) Type() MsgType {
 
 // String implements fmt.Stringer.
 func (t *Tlconnect) String() string {
-	return fmt.Sprintf("Tlconnect{FID: %d, Flags: %v}", t.FID, t.Flags)
+	return fmt.Sprintf("Tlconnect{FID: %d, SocketType: %v}", t.FID, t.SocketType)
 }
 
 // Rlconnect is a connect response.
@@ -2496,6 +2643,80 @@ func (r *Rchannel) String() string {
 	return fmt.Sprintf("Rchannel{Offset: %d, Length: %d}", r.Offset, r.Length)
 }
 
+// Tmultigetattr is a multi-getattr request.
+type Tmultigetattr struct {
+	// FID is the FID to be walked.
+	FID FID
+
+	// Names are the set of names to be walked.
+	Names []string
+}
+
+// decode implements encoder.decode.
+func (t *Tmultigetattr) decode(b *buffer) {
+	t.FID = b.ReadFID()
+	n := b.Read16()
+	t.Names = t.Names[:0]
+	for i := 0; i < int(n); i++ {
+		t.Names = append(t.Names, b.ReadString())
+	}
+}
+
+// encode implements encoder.encode.
+func (t *Tmultigetattr) encode(b *buffer) {
+	b.WriteFID(t.FID)
+	b.Write16(uint16(len(t.Names)))
+	for _, name := range t.Names {
+		b.WriteString(name)
+	}
+}
+
+// Type implements message.Type.
+func (*Tmultigetattr) Type() MsgType {
+	return MsgTmultigetattr
+}
+
+// String implements fmt.Stringer.
+func (t *Tmultigetattr) String() string {
+	return fmt.Sprintf("Tmultigetattr{FID: %d, Names: %v}", t.FID, t.Names)
+}
+
+// Rmultigetattr is a multi-getattr response.
+type Rmultigetattr struct {
+	// Stats are the set of FullStat returned for each of the names in the
+	// request.
+	Stats []FullStat
+}
+
+// decode implements encoder.decode.
+func (r *Rmultigetattr) decode(b *buffer) {
+	n := b.Read16()
+	r.Stats = r.Stats[:0]
+	for i := 0; i < int(n); i++ {
+		var fs FullStat
+		fs.decode(b)
+		r.Stats = append(r.Stats, fs)
+	}
+}
+
+// encode implements encoder.encode.
+func (r *Rmultigetattr) encode(b *buffer) {
+	b.Write16(uint16(len(r.Stats)))
+	for i := range r.Stats {
+		r.Stats[i].encode(b)
+	}
+}
+
+// Type implements message.Type.
+func (*Rmultigetattr) Type() MsgType {
+	return MsgRmultigetattr
+}
+
+// String implements fmt.Stringer.
+func (r *Rmultigetattr) String() string {
+	return fmt.Sprintf("Rmultigetattr{Stats: %v}", r.Stats)
+}
+
 const maxCacheSize = 3
 
 // msgFactory is used to reduce allocations by caching messages for reuse.
@@ -2508,7 +2729,7 @@ type msgFactory struct {
 var msgRegistry registry
 
 type registry struct {
-	factories [math.MaxUint8]msgFactory
+	factories [math.MaxUint8 + 1]msgFactory
 
 	// largestFixedSize is computed so that given some message size M, you can
 	// compute the maximum payload size (e.g. for Twrite, Rread) with
@@ -2655,10 +2876,16 @@ func init() {
 	msgRegistry.register(MsgRumknod, func() message { return &Rumknod{} })
 	msgRegistry.register(MsgTusymlink, func() message { return &Tusymlink{} })
 	msgRegistry.register(MsgRusymlink, func() message { return &Rusymlink{} })
+	msgRegistry.register(MsgTbind, func() message { return &Tbind{} })
+	msgRegistry.register(MsgRbind, func() message { return &Rbind{} })
 	msgRegistry.register(MsgTlconnect, func() message { return &Tlconnect{} })
 	msgRegistry.register(MsgRlconnect, func() message { return &Rlconnect{} })
 	msgRegistry.register(MsgTallocate, func() message { return &Tallocate{} })
 	msgRegistry.register(MsgRallocate, func() message { return &Rallocate{} })
+	msgRegistry.register(MsgTsetattrclunk, func() message { return &Tsetattrclunk{} })
+	msgRegistry.register(MsgRsetattrclunk, func() message { return &Rsetattrclunk{} })
+	msgRegistry.register(MsgTmultigetattr, func() message { return &Tmultigetattr{} })
+	msgRegistry.register(MsgRmultigetattr, func() message { return &Rmultigetattr{} })
 	msgRegistry.register(MsgTchannel, func() message { return &Tchannel{} })
 	msgRegistry.register(MsgRchannel, func() message { return &Rchannel{} })
 }

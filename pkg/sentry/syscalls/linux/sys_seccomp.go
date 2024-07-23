@@ -17,13 +17,15 @@ package linux
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // userSockFprog is equivalent to Linux's struct sock_fprog on amd64.
+//
+// +marshal
 type userSockFprog struct {
 	// Len is the length of the filter in BPF instructions.
 	Len uint16
@@ -31,18 +33,18 @@ type userSockFprog struct {
 	_ [6]byte // padding for alignment
 
 	// Filter is a user pointer to the struct sock_filter array that makes up
-	// the filter program. Filter is a uint64 rather than a usermem.Addr
-	// because usermem.Addr is actually uintptr, which is not a fixed-size
-	// type, and encoding/binary.Read objects to this.
+	// the filter program. Filter is a uint64 rather than a hostarch.Addr
+	// because hostarch.Addr is actually uintptr, which is not a fixed-size
+	// type.
 	Filter uint64
 }
 
 // seccomp applies a seccomp policy to the current task.
-func seccomp(t *kernel.Task, mode, flags uint64, addr usermem.Addr) error {
+func seccomp(t *kernel.Task, mode, flags uint64, addr hostarch.Addr) error {
 	// We only support SECCOMP_SET_MODE_FILTER at the moment.
 	if mode != linux.SECCOMP_SET_MODE_FILTER {
 		// Unsupported mode.
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	tsync := flags&linux.SECCOMP_FILTER_FLAG_TSYNC != 0
@@ -50,27 +52,37 @@ func seccomp(t *kernel.Task, mode, flags uint64, addr usermem.Addr) error {
 	// The only flag we support now is SECCOMP_FILTER_FLAG_TSYNC.
 	if flags&^linux.SECCOMP_FILTER_FLAG_TSYNC != 0 {
 		// Unsupported flag.
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	var fprog userSockFprog
-	if _, err := t.CopyIn(addr, &fprog); err != nil {
+	if _, err := fprog.CopyIn(t, addr); err != nil {
 		return err
+	}
+	if fprog.Len == 0 || fprog.Len > bpf.MaxInstructions {
+		// If the filter is already over the maximum number of instructions,
+		// do not go further and attempt to optimize the bytecode to make it
+		// smaller.
+		return linuxerr.EINVAL
 	}
 	filter := make([]linux.BPFInstruction, int(fprog.Len))
-	if _, err := t.CopyIn(usermem.Addr(fprog.Filter), &filter); err != nil {
+	if _, err := linux.CopyBPFInstructionSliceIn(t, hostarch.Addr(fprog.Filter), filter); err != nil {
 		return err
 	}
-	compiledFilter, err := bpf.Compile(filter)
+	bpfFilter := make([]bpf.Instruction, len(filter))
+	for i, ins := range filter {
+		bpfFilter[i] = bpf.Instruction(ins)
+	}
+	compiledFilter, err := bpf.Compile(bpfFilter, true /* optimize */)
 	if err != nil {
 		t.Debugf("Invalid seccomp-bpf filter: %v", err)
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	return t.AppendSyscallFilter(compiledFilter, tsync)
 }
 
 // Seccomp implements linux syscall seccomp(2).
-func Seccomp(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Seccomp(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	return 0, nil, seccomp(t, args[0].Uint64(), args[1].Uint64(), args[2].Pointer())
 }

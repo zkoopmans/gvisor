@@ -27,14 +27,16 @@ import (
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // Syscalls implements subcommands.Command for the "syscalls" command.
 type Syscalls struct {
-	output string
-	os     string
-	arch   string
+	format   string
+	os       string
+	arch     string
+	filename string
 }
 
 // CompatibilityInfo is a map of system and architecture to compatibility doc.
@@ -95,16 +97,17 @@ func (*Syscalls) Usage() string {
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (s *Syscalls) SetFlags(f *flag.FlagSet) {
-	f.StringVar(&s.output, "o", "table", "Output format (table, csv, json).")
+	f.StringVar(&s.format, "format", "table", "Output format (table, csv, json).")
 	f.StringVar(&s.os, "os", osAll, "The OS (e.g. linux)")
 	f.StringVar(&s.arch, "arch", archAll, "The CPU architecture (e.g. amd64).")
+	f.StringVar(&s.filename, "filename", "", "Output filename (otherwise stdout).")
 }
 
 // Execute implements subcommands.Command.Execute.
-func (s *Syscalls) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-	out, ok := outputMap[s.output]
+func (s *Syscalls) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
+	out, ok := outputMap[s.format]
 	if !ok {
-		Fatalf("Unsupported output format %q", s.output)
+		util.Fatalf("Unsupported output format %q", s.format)
 	}
 
 	// Build map of all supported architectures.
@@ -121,11 +124,18 @@ func (s *Syscalls) Execute(_ context.Context, f *flag.FlagSet, args ...interface
 	// Build a map of the architectures we want to output.
 	info, err := getCompatibilityInfo(s.os, s.arch)
 	if err != nil {
-		Fatalf("%v", err)
+		util.Fatalf("%v", err)
 	}
 
-	if err := out(os.Stdout, info); err != nil {
-		Fatalf("Error writing output: %v", err)
+	w := os.Stdout // Default.
+	if s.filename != "" {
+		w, err = os.OpenFile(s.filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			util.Fatalf("Error opening %q: %v", s.filename, err)
+		}
+	}
+	if err := out(w, info); err != nil {
+		util.Fatalf("Error writing output: %v", err)
 	}
 
 	return subcommands.ExitSuccess
@@ -138,7 +148,7 @@ func getCompatibilityInfo(osName string, archName string) (CompatibilityInfo, er
 	info := CompatibilityInfo(make(map[string]map[string]ArchInfo))
 	if osName == osAll {
 		// Special processing for the 'all' OS name.
-		for osName, _ := range syscallTableMap {
+		for osName := range syscallTableMap {
 			info[osName] = make(map[string]ArchInfo)
 			// osName is a specific OS name.
 			if err := addToCompatibilityInfo(info, osName, archName); err != nil {
@@ -162,7 +172,7 @@ func getCompatibilityInfo(osName string, archName string) (CompatibilityInfo, er
 func addToCompatibilityInfo(info CompatibilityInfo, osName string, archName string) error {
 	if archName == archAll {
 		// Special processing for the 'all' architecture name.
-		for archName, _ := range syscallTableMap[osName] {
+		for archName := range syscallTableMap[osName] {
 			archInfo, err := getArchInfo(osName, archName)
 			if err != nil {
 				return err

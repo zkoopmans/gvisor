@@ -21,9 +21,10 @@ func (pendingSignalElementMapper) linkerFor(elem *pendingSignal) *pendingSignal 
 // The zero value for List is an empty list ready to use.
 //
 // To iterate over a list (where l is a List):
-//      for e := l.Front(); e != nil; e = e.Next() {
-// 		// do something with e.
-//      }
+//
+//	for e := l.Front(); e != nil; e = e.Next() {
+//		// do something with e.
+//	}
 //
 // +stateify savable
 type pendingSignalList struct {
@@ -38,25 +39,45 @@ func (l *pendingSignalList) Reset() {
 }
 
 // Empty returns true iff the list is empty.
+//
+//go:nosplit
 func (l *pendingSignalList) Empty() bool {
 	return l.head == nil
 }
 
 // Front returns the first element of list l or nil.
+//
+//go:nosplit
 func (l *pendingSignalList) Front() *pendingSignal {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
+//
+//go:nosplit
 func (l *pendingSignalList) Back() *pendingSignal {
 	return l.tail
 }
 
-// PushFront inserts the element e at the front of list l.
-func (l *pendingSignalList) PushFront(e *pendingSignal) {
-	pendingSignalElementMapper{}.linkerFor(e).SetNext(l.head)
-	pendingSignalElementMapper{}.linkerFor(e).SetPrev(nil)
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+//
+//go:nosplit
+func (l *pendingSignalList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (pendingSignalElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
 
+// PushFront inserts the element e at the front of list l.
+//
+//go:nosplit
+func (l *pendingSignalList) PushFront(e *pendingSignal) {
+	linker := pendingSignalElementMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
 		pendingSignalElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -66,11 +87,30 @@ func (l *pendingSignalList) PushFront(e *pendingSignal) {
 	l.head = e
 }
 
-// PushBack inserts the element e at the back of list l.
-func (l *pendingSignalList) PushBack(e *pendingSignal) {
-	pendingSignalElementMapper{}.linkerFor(e).SetNext(nil)
-	pendingSignalElementMapper{}.linkerFor(e).SetPrev(l.tail)
+// PushFrontList inserts list m at the start of list l, emptying m.
+//
+//go:nosplit
+func (l *pendingSignalList) PushFrontList(m *pendingSignalList) {
+	if l.head == nil {
+		l.head = m.head
+		l.tail = m.tail
+	} else if m.head != nil {
+		pendingSignalElementMapper{}.linkerFor(l.head).SetPrev(m.tail)
+		pendingSignalElementMapper{}.linkerFor(m.tail).SetNext(l.head)
 
+		l.head = m.head
+	}
+	m.head = nil
+	m.tail = nil
+}
+
+// PushBack inserts the element e at the back of list l.
+//
+//go:nosplit
+func (l *pendingSignalList) PushBack(e *pendingSignal) {
+	linker := pendingSignalElementMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
 		pendingSignalElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -81,6 +121,8 @@ func (l *pendingSignalList) PushBack(e *pendingSignal) {
 }
 
 // PushBackList inserts list m at the end of list l, emptying m.
+//
+//go:nosplit
 func (l *pendingSignalList) PushBackList(m *pendingSignalList) {
 	if l.head == nil {
 		l.head = m.head
@@ -91,17 +133,22 @@ func (l *pendingSignalList) PushBackList(m *pendingSignalList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
+//
+//go:nosplit
 func (l *pendingSignalList) InsertAfter(b, e *pendingSignal) {
-	a := pendingSignalElementMapper{}.linkerFor(b).Next()
-	pendingSignalElementMapper{}.linkerFor(e).SetNext(a)
-	pendingSignalElementMapper{}.linkerFor(e).SetPrev(b)
-	pendingSignalElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := pendingSignalElementMapper{}.linkerFor(b)
+	eLinker := pendingSignalElementMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
 		pendingSignalElementMapper{}.linkerFor(a).SetPrev(e)
@@ -111,11 +158,16 @@ func (l *pendingSignalList) InsertAfter(b, e *pendingSignal) {
 }
 
 // InsertBefore inserts e before a.
+//
+//go:nosplit
 func (l *pendingSignalList) InsertBefore(a, e *pendingSignal) {
-	b := pendingSignalElementMapper{}.linkerFor(a).Prev()
-	pendingSignalElementMapper{}.linkerFor(e).SetNext(a)
-	pendingSignalElementMapper{}.linkerFor(e).SetPrev(b)
-	pendingSignalElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := pendingSignalElementMapper{}.linkerFor(a)
+	eLinker := pendingSignalElementMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
 		pendingSignalElementMapper{}.linkerFor(b).SetNext(e)
@@ -125,21 +177,27 @@ func (l *pendingSignalList) InsertBefore(a, e *pendingSignal) {
 }
 
 // Remove removes e from l.
+//
+//go:nosplit
 func (l *pendingSignalList) Remove(e *pendingSignal) {
-	prev := pendingSignalElementMapper{}.linkerFor(e).Prev()
-	next := pendingSignalElementMapper{}.linkerFor(e).Next()
+	linker := pendingSignalElementMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
 		pendingSignalElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		pendingSignalElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields
@@ -153,21 +211,29 @@ type pendingSignalEntry struct {
 }
 
 // Next returns the entry that follows e in the list.
+//
+//go:nosplit
 func (e *pendingSignalEntry) Next() *pendingSignal {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *pendingSignalEntry) Prev() *pendingSignal {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
+//
+//go:nosplit
 func (e *pendingSignalEntry) SetNext(elem *pendingSignal) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *pendingSignalEntry) SetPrev(elem *pendingSignal) {
 	e.prev = elem
 }

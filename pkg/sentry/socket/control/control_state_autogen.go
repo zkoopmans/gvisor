@@ -3,34 +3,51 @@
 package control
 
 import (
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *RightsFiles) save(m state.Map) {
-	m.SaveValue("", ([]*fs.File)(*x))
+func (c *scmCredentials) StateTypeName() string {
+	return "pkg/sentry/socket/control.scmCredentials"
 }
 
-func (x *RightsFiles) load(m state.Map) {
-	m.LoadValue("", new([]*fs.File), func(y interface{}) { *x = (RightsFiles)(y.([]*fs.File)) })
+func (c *scmCredentials) StateFields() []string {
+	return []string{
+		"t",
+		"kuid",
+		"kgid",
+	}
 }
 
-func (x *scmCredentials) beforeSave() {}
-func (x *scmCredentials) save(m state.Map) {
-	x.beforeSave()
-	m.Save("t", &x.t)
-	m.Save("kuid", &x.kuid)
-	m.Save("kgid", &x.kgid)
+func (c *scmCredentials) beforeSave() {}
+
+// +checklocksignore
+func (c *scmCredentials) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.t)
+	stateSinkObject.Save(1, &c.kuid)
+	stateSinkObject.Save(2, &c.kgid)
 }
 
-func (x *scmCredentials) afterLoad() {}
-func (x *scmCredentials) load(m state.Map) {
-	m.Load("t", &x.t)
-	m.Load("kuid", &x.kuid)
-	m.Load("kgid", &x.kgid)
+func (c *scmCredentials) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *scmCredentials) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.t)
+	stateSourceObject.Load(1, &c.kuid)
+	stateSourceObject.Load(2, &c.kgid)
+}
+
+func (fs *RightsFiles) StateTypeName() string {
+	return "pkg/sentry/socket/control.RightsFiles"
+}
+
+func (fs *RightsFiles) StateFields() []string {
+	return nil
 }
 
 func init() {
-	state.Register("pkg/sentry/socket/control.RightsFiles", (*RightsFiles)(nil), state.Fns{Save: (*RightsFiles).save, Load: (*RightsFiles).load})
-	state.Register("pkg/sentry/socket/control.scmCredentials", (*scmCredentials)(nil), state.Fns{Save: (*scmCredentials).save, Load: (*scmCredentials).load})
+	state.Register((*scmCredentials)(nil))
+	state.Register((*RightsFiles)(nil))
 }

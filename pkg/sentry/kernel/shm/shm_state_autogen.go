@@ -3,72 +3,128 @@
 package shm
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Registry) beforeSave() {}
-func (x *Registry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("userNS", &x.userNS)
-	m.Save("shms", &x.shms)
-	m.Save("keysToShms", &x.keysToShms)
-	m.Save("totalPages", &x.totalPages)
-	m.Save("lastIDUsed", &x.lastIDUsed)
+func (r *Registry) StateTypeName() string {
+	return "pkg/sentry/kernel/shm.Registry"
 }
 
-func (x *Registry) afterLoad() {}
-func (x *Registry) load(m state.Map) {
-	m.Load("userNS", &x.userNS)
-	m.Load("shms", &x.shms)
-	m.Load("keysToShms", &x.keysToShms)
-	m.Load("totalPages", &x.totalPages)
-	m.Load("lastIDUsed", &x.lastIDUsed)
+func (r *Registry) StateFields() []string {
+	return []string{
+		"userNS",
+		"reg",
+		"totalPages",
+	}
 }
 
-func (x *Shm) beforeSave() {}
-func (x *Shm) save(m state.Map) {
-	x.beforeSave()
-	m.Save("AtomicRefCount", &x.AtomicRefCount)
-	m.Save("mfp", &x.mfp)
-	m.Save("registry", &x.registry)
-	m.Save("ID", &x.ID)
-	m.Save("creator", &x.creator)
-	m.Save("size", &x.size)
-	m.Save("effectiveSize", &x.effectiveSize)
-	m.Save("fr", &x.fr)
-	m.Save("key", &x.key)
-	m.Save("perms", &x.perms)
-	m.Save("owner", &x.owner)
-	m.Save("attachTime", &x.attachTime)
-	m.Save("detachTime", &x.detachTime)
-	m.Save("changeTime", &x.changeTime)
-	m.Save("creatorPID", &x.creatorPID)
-	m.Save("lastAttachDetachPID", &x.lastAttachDetachPID)
-	m.Save("pendingDestruction", &x.pendingDestruction)
+func (r *Registry) beforeSave() {}
+
+// +checklocksignore
+func (r *Registry) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.userNS)
+	stateSinkObject.Save(1, &r.reg)
+	stateSinkObject.Save(2, &r.totalPages)
 }
 
-func (x *Shm) afterLoad() {}
-func (x *Shm) load(m state.Map) {
-	m.Load("AtomicRefCount", &x.AtomicRefCount)
-	m.Load("mfp", &x.mfp)
-	m.Load("registry", &x.registry)
-	m.Load("ID", &x.ID)
-	m.Load("creator", &x.creator)
-	m.Load("size", &x.size)
-	m.Load("effectiveSize", &x.effectiveSize)
-	m.Load("fr", &x.fr)
-	m.Load("key", &x.key)
-	m.Load("perms", &x.perms)
-	m.Load("owner", &x.owner)
-	m.Load("attachTime", &x.attachTime)
-	m.Load("detachTime", &x.detachTime)
-	m.Load("changeTime", &x.changeTime)
-	m.Load("creatorPID", &x.creatorPID)
-	m.Load("lastAttachDetachPID", &x.lastAttachDetachPID)
-	m.Load("pendingDestruction", &x.pendingDestruction)
+func (r *Registry) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.userNS)
+	stateSourceObject.Load(1, &r.reg)
+	stateSourceObject.Load(2, &r.totalPages)
+}
+
+func (s *Shm) StateTypeName() string {
+	return "pkg/sentry/kernel/shm.Shm"
+}
+
+func (s *Shm) StateFields() []string {
+	return []string{
+		"ShmRefs",
+		"registry",
+		"devID",
+		"size",
+		"effectiveSize",
+		"fr",
+		"obj",
+		"attachTime",
+		"detachTime",
+		"changeTime",
+		"creatorPID",
+		"lastAttachDetachPID",
+		"pendingDestruction",
+	}
+}
+
+func (s *Shm) beforeSave() {}
+
+// +checklocksignore
+func (s *Shm) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.ShmRefs)
+	stateSinkObject.Save(1, &s.registry)
+	stateSinkObject.Save(2, &s.devID)
+	stateSinkObject.Save(3, &s.size)
+	stateSinkObject.Save(4, &s.effectiveSize)
+	stateSinkObject.Save(5, &s.fr)
+	stateSinkObject.Save(6, &s.obj)
+	stateSinkObject.Save(7, &s.attachTime)
+	stateSinkObject.Save(8, &s.detachTime)
+	stateSinkObject.Save(9, &s.changeTime)
+	stateSinkObject.Save(10, &s.creatorPID)
+	stateSinkObject.Save(11, &s.lastAttachDetachPID)
+	stateSinkObject.Save(12, &s.pendingDestruction)
+}
+
+// +checklocksignore
+func (s *Shm) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.ShmRefs)
+	stateSourceObject.Load(1, &s.registry)
+	stateSourceObject.Load(2, &s.devID)
+	stateSourceObject.Load(3, &s.size)
+	stateSourceObject.Load(4, &s.effectiveSize)
+	stateSourceObject.Load(5, &s.fr)
+	stateSourceObject.Load(6, &s.obj)
+	stateSourceObject.Load(7, &s.attachTime)
+	stateSourceObject.Load(8, &s.detachTime)
+	stateSourceObject.Load(9, &s.changeTime)
+	stateSourceObject.Load(10, &s.creatorPID)
+	stateSourceObject.Load(11, &s.lastAttachDetachPID)
+	stateSourceObject.Load(12, &s.pendingDestruction)
+	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
+}
+
+func (r *ShmRefs) StateTypeName() string {
+	return "pkg/sentry/kernel/shm.ShmRefs"
+}
+
+func (r *ShmRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (r *ShmRefs) beforeSave() {}
+
+// +checklocksignore
+func (r *ShmRefs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
+}
+
+// +checklocksignore
+func (r *ShmRefs) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(func() { r.afterLoad(ctx) })
 }
 
 func init() {
-	state.Register("pkg/sentry/kernel/shm.Registry", (*Registry)(nil), state.Fns{Save: (*Registry).save, Load: (*Registry).load})
-	state.Register("pkg/sentry/kernel/shm.Shm", (*Shm)(nil), state.Fns{Save: (*Shm).save, Load: (*Shm).load})
+	state.Register((*Registry)(nil))
+	state.Register((*Shm)(nil))
+	state.Register((*ShmRefs)(nil))
 }

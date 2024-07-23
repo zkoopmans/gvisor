@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/google/subcommands"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 )
@@ -52,26 +52,26 @@ func (*Kill) Usage() string {
 // SetFlags implements subcommands.Command.SetFlags.
 func (k *Kill) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&k.all, "all", false, "send the specified signal to all processes inside the container")
-	f.IntVar(&k.pid, "pid", 0, "send the specified signal to a specific process")
+	f.IntVar(&k.pid, "pid", 0, "send the specified signal to a specific process. pid is relative to the root PID namespace")
 }
 
 // Execute implements subcommands.Command.Execute.
-func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() == 0 || f.NArg() > 2 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 
 	if k.pid != 0 && k.all {
-		Fatalf("it is invalid to specify both --all and --pid")
+		util.Fatalf("it is invalid to specify both --all and --pid")
 	}
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		util.Fatalf("loading container: %v", err)
 	}
 
 	// The OCI command-line spec says that the signal should be specified
@@ -84,25 +84,25 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 
 	sig, err := parseSignal(signal)
 	if err != nil {
-		Fatalf("%v", err)
+		util.Fatalf("%v", err)
 	}
 
 	if k.pid != 0 {
 		if err := c.SignalProcess(sig, int32(k.pid)); err != nil {
-			Fatalf("failed to signal pid %d: %v", k.pid, err)
+			util.Fatalf("failed to signal pid %d: %v", k.pid, err)
 		}
 	} else {
 		if err := c.SignalContainer(sig, k.all); err != nil {
-			Fatalf("%v", err)
+			util.Fatalf("%v", err)
 		}
 	}
 	return subcommands.ExitSuccess
 }
 
-func parseSignal(s string) (syscall.Signal, error) {
+func parseSignal(s string) (unix.Signal, error) {
 	n, err := strconv.Atoi(s)
 	if err == nil {
-		sig := syscall.Signal(n)
+		sig := unix.Signal(n)
 		for _, msig := range signalMap {
 			if sig == msig {
 				return sig, nil
@@ -116,7 +116,7 @@ func parseSignal(s string) (syscall.Signal, error) {
 	return -1, fmt.Errorf("unknown signal %q", s)
 }
 
-var signalMap = map[string]syscall.Signal{
+var signalMap = map[string]unix.Signal{
 	"ABRT":   unix.SIGABRT,
 	"ALRM":   unix.SIGALRM,
 	"BUS":    unix.SIGBUS,

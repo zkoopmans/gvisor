@@ -14,6 +14,8 @@
 
 package transport
 
+import "context"
+
 // saveAcceptedChan is invoked by stateify.
 func (e *connectionedEndpoint) saveAcceptedChan() []*connectionedEndpoint {
 	// If acceptedChan is nil (i.e. we are not listening) then we will save nil.
@@ -40,7 +42,7 @@ func (e *connectionedEndpoint) saveAcceptedChan() []*connectionedEndpoint {
 }
 
 // loadAcceptedChan is invoked by stateify.
-func (e *connectionedEndpoint) loadAcceptedChan(acceptedSlice []*connectionedEndpoint) {
+func (e *connectionedEndpoint) loadAcceptedChan(_ context.Context, acceptedSlice []*connectionedEndpoint) {
 	// If acceptedSlice is nil, then acceptedChan should also be nil.
 	if acceptedSlice != nil {
 		// Otherwise, create a new channel with the same capacity as acceptedSlice.
@@ -50,4 +52,16 @@ func (e *connectionedEndpoint) loadAcceptedChan(acceptedSlice []*connectionedEnd
 			e.acceptedChan <- ep
 		}
 	}
+}
+
+// beforeSave is invoked by stateify.
+func (e *connectionedEndpoint) beforeSave() {
+	if e.boundSocketFD != nil {
+		panic("Cannot save endpoint with bound host socket")
+	}
+}
+
+// afterLoad is invoked by stateify.
+func (e *connectionedEndpoint) afterLoad(context.Context) {
+	e.ops.InitHandler(e, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
 }

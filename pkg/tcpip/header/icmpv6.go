@@ -18,7 +18,7 @@ import (
 	"encoding/binary"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 )
 
 // ICMPv6 represents an ICMPv6 header stored in a byte array.
@@ -49,13 +49,16 @@ const (
 	// neighbor advertisement packet.
 	ICMPv6NeighborAdvertMinimumSize = ICMPv6HeaderSize + NDPNAMinimumSize
 
-	// ICMPv6NeighborAdvertSize is size of a neighbor advertisement
-	// including the NDP Target Link Layer option for an Ethernet
-	// address.
-	ICMPv6NeighborAdvertSize = ICMPv6HeaderSize + NDPNAMinimumSize + NDPLinkLayerAddressSize
-
-	// ICMPv6EchoMinimumSize is the minimum size of a valid ICMP echo packet.
+	// ICMPv6EchoMinimumSize is the minimum size of a valid echo packet.
 	ICMPv6EchoMinimumSize = 8
+
+	// ICMPv6ErrorHeaderSize is the size of an ICMP error packet header,
+	// as per RFC 4443, Appendix A, item 4 and the errata.
+	//   ... all ICMP error messages shall have exactly
+	//   32 bits of type-specific data, so that receivers can reliably find
+	//   the embedded invoking packet even when they don't recognize the
+	//   ICMP message Type.
+	ICMPv6ErrorHeaderSize = 8
 
 	// ICMPv6DstUnreachableMinimumSize is the minimum size of a valid ICMP
 	// destination unreachable packet.
@@ -65,9 +68,13 @@ const (
 	// packet-too-big packet.
 	ICMPv6PacketTooBigMinimumSize = ICMPv6MinimumSize
 
-	// icmpv6ChecksumOffset is the offset of the checksum field
+	// ICMPv6ChecksumOffset is the offset of the checksum field
 	// in an ICMPv6 message.
-	icmpv6ChecksumOffset = 2
+	ICMPv6ChecksumOffset = 2
+
+	// icmpv6PointerOffset is the offset of the pointer
+	// in an ICMPv6 Parameter problem message.
+	icmpv6PointerOffset = 4
 
 	// icmpv6MTUOffset is the offset of the MTU field in an ICMPv6
 	// PacketTooBig message.
@@ -89,10 +96,10 @@ const (
 	NDPHopLimit = 255
 )
 
-// ICMPv6Type is the ICMP type field described in RFC 4443 and friends.
+// ICMPv6Type is the ICMP type field described in RFC 4443.
 type ICMPv6Type byte
 
-// Typical values of ICMPv6Type defined in RFC 4443.
+// Values for use in the Type field of ICMPv6 packet from RFC 4433.
 const (
 	ICMPv6DstUnreachable ICMPv6Type = 1
 	ICMPv6PacketTooBig   ICMPv6Type = 2
@@ -108,12 +115,65 @@ const (
 	ICMPv6NeighborSolicit ICMPv6Type = 135
 	ICMPv6NeighborAdvert  ICMPv6Type = 136
 	ICMPv6RedirectMsg     ICMPv6Type = 137
+
+	// Multicast Listener Discovery (MLD) messages, see RFC 2710.
+
+	ICMPv6MulticastListenerQuery  ICMPv6Type = 130
+	ICMPv6MulticastListenerReport ICMPv6Type = 131
+	ICMPv6MulticastListenerDone   ICMPv6Type = 132
+
+	// Multicast Listener Discovert Version 2 (MLDv2) messages, see RFC 3810.
+
+	ICMPv6MulticastListenerV2Report ICMPv6Type = 143
 )
 
-// Values for ICMP code as defined in RFC 4443.
+// IsErrorType returns true if the receiver is an ICMP error type.
+func (typ ICMPv6Type) IsErrorType() bool {
+	// Per RFC 4443 section 2.1:
+	//   ICMPv6 messages are grouped into two classes: error messages and
+	//   informational messages.  Error messages are identified as such by a
+	//   zero in the high-order bit of their message Type field values.  Thus,
+	//   error messages have message types from 0 to 127; informational
+	//   messages have message types from 128 to 255.
+	return typ&0x80 == 0
+}
+
+// ICMPv6Code is the ICMP Code field described in RFC 4443.
+type ICMPv6Code byte
+
+// ICMP codes used with Destination Unreachable (Type 1). As per RFC 4443
+// section 3.1.
 const (
-	ICMPv6PortUnreachable = 4
+	ICMPv6NetworkUnreachable ICMPv6Code = 0
+	ICMPv6Prohibited         ICMPv6Code = 1
+	ICMPv6BeyondScope        ICMPv6Code = 2
+	ICMPv6AddressUnreachable ICMPv6Code = 3
+	ICMPv6PortUnreachable    ICMPv6Code = 4
+	ICMPv6Policy             ICMPv6Code = 5
+	ICMPv6RejectRoute        ICMPv6Code = 6
 )
+
+// ICMP codes used with Time Exceeded (Type 3). As per RFC 4443 section 3.3.
+const (
+	ICMPv6HopLimitExceeded  ICMPv6Code = 0
+	ICMPv6ReassemblyTimeout ICMPv6Code = 1
+)
+
+// ICMP codes used with Parameter Problem (Type 4). As per RFC 4443 section 3.4.
+const (
+	// ICMPv6ErroneousHeader indicates an erroneous header field was encountered.
+	ICMPv6ErroneousHeader ICMPv6Code = 0
+
+	// ICMPv6UnknownHeader indicates an unrecognized Next Header type encountered.
+	ICMPv6UnknownHeader ICMPv6Code = 1
+
+	// ICMPv6UnknownOption indicates an unrecognized IPv6 option was encountered.
+	ICMPv6UnknownOption ICMPv6Code = 2
+)
+
+// ICMPv6UnusedCode is the code value used with ICMPv6 messages which don't use
+// the code field. (Types not mentioned above.)
+const ICMPv6UnusedCode ICMPv6Code = 0
 
 // Type is the ICMP type field.
 func (b ICMPv6) Type() ICMPv6Type { return ICMPv6Type(b[0]) }
@@ -122,19 +182,29 @@ func (b ICMPv6) Type() ICMPv6Type { return ICMPv6Type(b[0]) }
 func (b ICMPv6) SetType(t ICMPv6Type) { b[0] = byte(t) }
 
 // Code is the ICMP code field. Its meaning depends on the value of Type.
-func (b ICMPv6) Code() byte { return b[1] }
+func (b ICMPv6) Code() ICMPv6Code { return ICMPv6Code(b[1]) }
 
 // SetCode sets the ICMP code field.
-func (b ICMPv6) SetCode(c byte) { b[1] = c }
+func (b ICMPv6) SetCode(c ICMPv6Code) { b[1] = byte(c) }
+
+// TypeSpecific returns the type specific data field.
+func (b ICMPv6) TypeSpecific() uint32 {
+	return binary.BigEndian.Uint32(b[icmpv6PointerOffset:])
+}
+
+// SetTypeSpecific sets the type specific data field.
+func (b ICMPv6) SetTypeSpecific(val uint32) {
+	binary.BigEndian.PutUint32(b[icmpv6PointerOffset:], val)
+}
 
 // Checksum is the ICMP checksum field.
 func (b ICMPv6) Checksum() uint16 {
-	return binary.BigEndian.Uint16(b[icmpv6ChecksumOffset:])
+	return binary.BigEndian.Uint16(b[ICMPv6ChecksumOffset:])
 }
 
 // SetChecksum sets the ICMP checksum field.
-func (b ICMPv6) SetChecksum(checksum uint16) {
-	binary.BigEndian.PutUint16(b[icmpv6ChecksumOffset:], checksum)
+func (b ICMPv6) SetChecksum(cs uint16) {
+	checksum.Put(b[ICMPv6ChecksumOffset:], cs)
 }
 
 // SourcePort implements Transport.SourcePort.
@@ -175,6 +245,13 @@ func (b ICMPv6) SetIdent(ident uint16) {
 	binary.BigEndian.PutUint16(b[icmpv6IdentOffset:], ident)
 }
 
+// SetIdentWithChecksumUpdate sets the Ident field and updates the checksum.
+func (b ICMPv6) SetIdentWithChecksumUpdate(new uint16) {
+	old := b.Ident()
+	b.SetIdent(new)
+	b.SetChecksum(^checksumUpdate2ByteAlignedUint16(^b.Checksum(), old, new))
+}
+
 // Sequence retrieves the Sequence field from an ICMPv6 message.
 func (b ICMPv6) Sequence() uint16 {
 	return binary.BigEndian.Uint16(b[icmpv6SequenceOffset:])
@@ -185,10 +262,9 @@ func (b ICMPv6) SetSequence(sequence uint16) {
 	binary.BigEndian.PutUint16(b[icmpv6SequenceOffset:], sequence)
 }
 
-// NDPPayload returns the NDP payload buffer. That is, it returns the ICMPv6
-// packet's message body as defined by RFC 4443 section 2.1; the portion of the
-// ICMPv6 buffer after the first ICMPv6HeaderSize bytes.
-func (b ICMPv6) NDPPayload() []byte {
+// MessageBody returns the message body as defined by RFC 4443 section 2.1; the
+// portion of the ICMPv6 buffer after the first ICMPv6HeaderSize bytes.
+func (b ICMPv6) MessageBody() []byte {
 	return b[ICMPv6HeaderSize:]
 }
 
@@ -197,25 +273,32 @@ func (b ICMPv6) Payload() []byte {
 	return b[ICMPv6PayloadOffset:]
 }
 
+// ICMPv6ChecksumParams contains parameters to calculate ICMPv6 checksum.
+type ICMPv6ChecksumParams struct {
+	Header      ICMPv6
+	Src         tcpip.Address
+	Dst         tcpip.Address
+	PayloadCsum uint16
+	PayloadLen  int
+}
+
 // ICMPv6Checksum calculates the ICMP checksum over the provided ICMPv6 header,
 // IPv6 src/dst addresses and the payload.
-func ICMPv6Checksum(h ICMPv6, src, dst tcpip.Address, vv buffer.VectorisedView) uint16 {
-	// Calculate the IPv6 pseudo-header upper-layer checksum.
-	xsum := Checksum([]byte(src), 0)
-	xsum = Checksum([]byte(dst), xsum)
-	var upperLayerLength [4]byte
-	binary.BigEndian.PutUint32(upperLayerLength[:], uint32(len(h)+vv.Size()))
-	xsum = Checksum(upperLayerLength[:], xsum)
-	xsum = Checksum([]byte{0, 0, 0, uint8(ICMPv6ProtocolNumber)}, xsum)
-	for _, v := range vv.Views() {
-		xsum = Checksum(v, xsum)
-	}
+func ICMPv6Checksum(params ICMPv6ChecksumParams) uint16 {
+	h := params.Header
 
-	// h[2:4] is the checksum itself, set it aside to avoid checksumming the checksum.
-	h2, h3 := h[2], h[3]
-	h[2], h[3] = 0, 0
-	xsum = ^Checksum(h, xsum)
-	h[2], h[3] = h2, h3
+	xsum := PseudoHeaderChecksum(ICMPv6ProtocolNumber, params.Src, params.Dst, uint16(len(h)+params.PayloadLen))
+	xsum = checksum.Combine(xsum, params.PayloadCsum)
 
-	return xsum
+	// h[2:4] is the checksum itself, skip it to avoid checksumming the checksum.
+	xsum = checksum.Checksum(h[:2], xsum)
+	xsum = checksum.Checksum(h[4:], xsum)
+
+	return ^xsum
+}
+
+// UpdateChecksumPseudoHeaderAddress updates the checksum to reflect an
+// updated address in the pseudo header.
+func (b ICMPv6) UpdateChecksumPseudoHeaderAddress(old, new tcpip.Address) {
+	b.SetChecksum(^checksumUpdate2ByteAlignedAddress(^b.Checksum(), old, new))
 }

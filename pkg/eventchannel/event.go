@@ -22,10 +22,11 @@ package eventchannel
 import (
 	"encoding/binary"
 	"fmt"
-	"syscall"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	pb "gvisor.dev/gvisor/pkg/eventchannel/eventchannel_go_proto"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -53,9 +54,28 @@ func Emit(msg proto.Message) error {
 	return err
 }
 
+// LogEmit is a helper method that calls DefaultEmitter.Emit.
+// It also logs a warning message when an error occurs.
+func LogEmit(msg proto.Message) error {
+	_, err := DefaultEmitter.Emit(msg)
+	if err != nil {
+		log.Warningf("unable to emit event: %s", err)
+	}
+	return err
+}
+
 // AddEmitter is a helper method that calls DefaultEmitter.AddEmitter.
 func AddEmitter(e Emitter) {
 	DefaultEmitter.AddEmitter(e)
+}
+
+// HaveEmitters indicates if any emitters have been registered to the
+// default emitter.
+func HaveEmitters() bool {
+	DefaultEmitter.mu.Lock()
+	defer DefaultEmitter.mu.Unlock()
+
+	return len(DefaultEmitter.emitters) > 0
 }
 
 // multiEmitter is an Emitter that forwards messages to multiple Emitters.
@@ -118,22 +138,6 @@ func (me *multiEmitter) Close() error {
 	return err
 }
 
-func marshal(msg proto.Message) ([]byte, error) {
-	anypb, err := ptypes.MarshalAny(msg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Wire format is uvarint message length followed by binary proto.
-	bufMsg, err := proto.Marshal(anypb)
-	if err != nil {
-		return nil, err
-	}
-	p := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(p, uint64(len(bufMsg)))
-	return append(p[:n], bufMsg...), nil
-}
-
 // socketEmitter emits proto messages on a socket.
 type socketEmitter struct {
 	socket *unet.Socket
@@ -155,17 +159,27 @@ func SocketEmitter(fd int) (Emitter, error) {
 
 // Emit implements Emitter.Emit.
 func (s *socketEmitter) Emit(msg proto.Message) (bool, error) {
-	p, err := marshal(msg)
+	any, err := anypb.New(msg)
 	if err != nil {
 		return false, err
 	}
+	bufMsg, err := proto.Marshal(any)
+	if err != nil {
+		return false, err
+	}
+
+	// Wire format is uvarint message length followed by binary proto.
+	p := make([]byte, binary.MaxVarintLen64)
+	n := binary.PutUvarint(p, uint64(len(bufMsg)))
+	p = append(p[:n], bufMsg...)
 	for done := 0; done < len(p); {
 		n, err := s.socket.Write(p[done:])
 		if err != nil {
-			return (err == syscall.EPIPE), err
+			return linuxerr.Equals(linuxerr.EPIPE, err), err
 		}
 		done += n
 	}
+
 	return false, nil
 }
 
@@ -189,9 +203,13 @@ func DebugEmitterFrom(inner Emitter) Emitter {
 }
 
 func (d *debugEmitter) Emit(msg proto.Message) (bool, error) {
+	text, err := prototext.Marshal(msg)
+	if err != nil {
+		return false, err
+	}
 	ev := &pb.DebugEvent{
-		Name: proto.MessageName(msg),
-		Text: proto.MarshalTextString(msg),
+		Name: string(msg.ProtoReflect().Descriptor().FullName()),
+		Text: string(text),
 	}
 	return d.inner.Emit(ev)
 }

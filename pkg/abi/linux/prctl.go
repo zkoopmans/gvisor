@@ -144,6 +144,15 @@ const (
 	// PR_MPX_DISABLE_MANAGEMENT disables kernel management of Memory
 	// Protection eXtensions (MPX) bounds tables.
 	PR_MPX_DISABLE_MANAGEMENT = 44
+
+	// The following constants are used to control thread scheduling on cores.
+	PR_SCHED_CORE_SCOPE_THREAD       = 0
+	PR_SCHED_CORE_SCOPE_THREAD_GROUP = 1
+
+	// PR_SET_PTRACER allows a specific process (or any, if PR_SET_PTRACER_ANY is
+	// specified) to ptrace the current task.
+	PR_SET_PTRACER     = 0x59616d61
+	PR_SET_PTRACER_ANY = -1
 )
 
 // From <asm/prctl.h>

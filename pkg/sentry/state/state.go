@@ -19,13 +19,17 @@ import (
 	"fmt"
 	"io"
 
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 var previousMetadata map[string]string
@@ -46,22 +50,39 @@ type SaveOpts struct {
 	// Destination is the save target.
 	Destination io.Writer
 
+	// PagesMetadata is the file into which MemoryFile metadata is stored if
+	// PagesMetadata is non-nil. Otherwise this content is stored in Destination.
+	PagesMetadata *fd.FD
+
+	// PagesFile is the file in which all MemoryFile pages are stored if
+	// PagesFile is non-nil. Otherwise this content is stored in Destination.
+	PagesFile *fd.FD
+
 	// Key is used for state integrity check.
 	Key []byte
 
 	// Metadata is save metadata.
 	Metadata map[string]string
 
+	// MemoryFileSaveOpts is passed to calls to pgalloc.MemoryFile.SaveTo().
+	MemoryFileSaveOpts pgalloc.SaveOpts
+
 	// Callback is called prior to unpause, with any save error.
 	Callback func(err error)
+
+	// Resume indicates if the statefile is used for save-resume.
+	Resume bool
 }
 
 // Save saves the system state.
-func (opts SaveOpts) Save(k *kernel.Kernel, w *watchdog.Watchdog) error {
+func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
-	defer k.Unpause()
-	defer log.Infof("Tasks resumed after save.")
+	k.ReceiveTaskStates()
+	defer func() {
+		k.Unpause()
+		log.Infof("Tasks resumed after save.")
+	}()
 
 	w.Stop()
 	defer w.Start()
@@ -78,12 +99,12 @@ func (opts SaveOpts) Save(k *kernel.Kernel, w *watchdog.Watchdog) error {
 		err = ErrStateFile{err}
 	} else {
 		// Save the kernel.
-		err = k.SaveTo(wc)
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.MemoryFileSaveOpts)
 
 		// ENOSPC is a state file error. This error can only come from
 		// writing the state file, and not from fs.FileOperations.Fsync
 		// because we wrap those in kernel.TaskSet.flushWritesToFiles.
-		if err == syserror.ENOSPC {
+		if linuxerr.Equals(linuxerr.ENOSPC, err) {
 			err = ErrStateFile{err}
 		}
 
@@ -97,15 +118,23 @@ func (opts SaveOpts) Save(k *kernel.Kernel, w *watchdog.Watchdog) error {
 
 // LoadOpts contains load-related options.
 type LoadOpts struct {
-	// Destination is the load source.
+	// Source is the load source.
 	Source io.Reader
+
+	// PagesMetadata is the file into which MemoryFile metadata is stored if
+	// PagesMetadata is non-nil. Otherwise this content is stored in Source.
+	PagesMetadata *fd.FD
+
+	// PagesFile is the file in which all MemoryFile pages are stored if
+	// PagesFile is non-nil. Otherwise this content is stored in Source.
+	PagesFile *fd.FD
 
 	// Key is used for state integrity check.
 	Key []byte
 }
 
 // Load loads the given kernel, setting the provided platform and stack.
-func (opts LoadOpts) Load(k *kernel.Kernel, n inet.Stack, clocks time.Clocks) error {
+func (opts LoadOpts) Load(ctx context.Context, k *kernel.Kernel, timeReady chan struct{}, n inet.Stack, clocks time.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
 	// Open the file.
 	r, m, err := statefile.NewReader(opts.Source, opts.Key)
 	if err != nil {
@@ -115,5 +144,5 @@ func (opts LoadOpts) Load(k *kernel.Kernel, n inet.Stack, clocks time.Clocks) er
 	previousMetadata = m
 
 	// Restore the Kernel object graph.
-	return k.LoadFrom(r, n, clocks)
+	return k.LoadFrom(ctx, r, opts.PagesMetadata, opts.PagesFile, timeReady, n, clocks, vfsOpts)
 }

@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package kernel
 
 import (
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 // ptraceArch implements arch-specific ptrace commands.
-func (t *Task) ptraceArch(target *Task, req int64, addr, data usermem.Addr) error {
-	return syserror.EIO
+func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) error {
+	return linuxerr.EIO
 }

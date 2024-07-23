@@ -17,8 +17,9 @@ package safecopy
 import (
 	"fmt"
 	"runtime"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // maxRegisterSize is the maximum register size used in memcpy and memclr. It
@@ -87,6 +88,18 @@ func compareAndSwapUint32(ptr unsafe.Pointer, old, new uint32) (prev uint32, sig
 //
 //go:noescape
 func loadUint32(ptr unsafe.Pointer) (val uint32, sig int32)
+
+// Return the start address of the functions above.
+//
+// In Go 1.17+, Go references to assembly functions resolve to an ABIInternal
+// wrapper function rather than the function itself. We must reference from
+// assembly to get the ABI0 (i.e., primary) address.
+func addrOfMemcpy() uintptr
+func addrOfMemclr() uintptr
+func addrOfSwapUint32() uintptr
+func addrOfSwapUint64() uintptr
+func addrOfCompareAndSwapUint32() uintptr
+func addrOfLoadUint32() uintptr
 
 // CopyIn copies len(dst) bytes from src to dst. It returns the number of bytes
 // copied and an error if SIGSEGV or SIGBUS is received while reading from src.
@@ -310,52 +323,11 @@ func errorFromFaultSignal(addr uintptr, sig int32) error {
 	switch sig {
 	case 0:
 		return nil
-	case int32(syscall.SIGSEGV):
+	case int32(unix.SIGSEGV):
 		return SegvError{addr}
-	case int32(syscall.SIGBUS):
+	case int32(unix.SIGBUS):
 		return BusError{addr}
 	default:
 		panic(fmt.Sprintf("safecopy got unexpected signal %d at address %#x", sig, addr))
 	}
-}
-
-// ReplaceSignalHandler replaces the existing signal handler for the provided
-// signal with the one that handles faults in safecopy-protected functions.
-//
-// It stores the value of the previously set handler in previous.
-//
-// This function will be called on initialization in order to install safecopy
-// handlers for appropriate signals. These handlers will call the previous
-// handler however, and if this is function is being used externally then the
-// same courtesy is expected.
-func ReplaceSignalHandler(sig syscall.Signal, handler uintptr, previous *uintptr) error {
-	var sa struct {
-		handler  uintptr
-		flags    uint64
-		restorer uintptr
-		mask     uint64
-	}
-	const maskLen = 8
-
-	// Get the existing signal handler information, and save the current
-	// handler. Once we replace it, we will use this pointer to fall back to
-	// it when we receive other signals.
-	if _, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig), 0, uintptr(unsafe.Pointer(&sa)), maskLen, 0, 0); e != 0 {
-		return e
-	}
-
-	// Fail if there isn't a previous handler.
-	if sa.handler == 0 {
-		return fmt.Errorf("previous handler for signal %x isn't set", sig)
-	}
-
-	*previous = sa.handler
-
-	// Install our own handler.
-	sa.handler = handler
-	if _, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig), uintptr(unsafe.Pointer(&sa)), 0, maskLen, 0, 0); e != 0 {
-		return e
-	}
-
-	return nil
 }

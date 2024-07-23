@@ -14,7 +14,9 @@
 
 package linux
 
-import "gvisor.dev/gvisor/pkg/binary"
+import (
+	"gvisor.dev/gvisor/pkg/marshal"
+)
 
 // Address families, from linux/socket.h.
 const (
@@ -83,7 +85,6 @@ const (
 	MSG_MORE             = 0x8000
 	MSG_WAITFORONE       = 0x10000
 	MSG_SENDPAGE_NOTLAST = 0x20000
-	MSG_REINJECT         = 0x8000000
 	MSG_ZEROCOPY         = 0x4000000
 	MSG_FASTOPEN         = 0x20000000
 	MSG_CMSG_CLOEXEC     = 0x40000000
@@ -109,12 +110,12 @@ type SockType int
 // Socket types, from linux/net.h.
 const (
 	SOCK_STREAM    SockType = 1
-	SOCK_DGRAM              = 2
-	SOCK_RAW                = 3
-	SOCK_RDM                = 4
-	SOCK_SEQPACKET          = 5
-	SOCK_DCCP               = 6
-	SOCK_PACKET             = 10
+	SOCK_DGRAM     SockType = 2
+	SOCK_RAW       SockType = 3
+	SOCK_RDM       SockType = 4
+	SOCK_SEQPACKET SockType = 5
+	SOCK_DCCP      SockType = 6
+	SOCK_PACKET    SockType = 10
 )
 
 // SOCK_TYPE_MASK covers all of the above socket types. The remaining bits are
@@ -132,6 +133,15 @@ const (
 	SHUT_RD   = 0
 	SHUT_WR   = 1
 	SHUT_RDWR = 2
+)
+
+// Packet types from <linux/if_packet.h>
+const (
+	PACKET_HOST      = 0 // To us
+	PACKET_BROADCAST = 1 // To all
+	PACKET_MULTICAST = 2 // To group
+	PACKET_OTHERHOST = 3 // To someone else
+	PACKET_OUTGOING  = 4 // Outgoing of any type
 )
 
 // Socket options from socket.h.
@@ -225,29 +235,55 @@ const (
 const SockAddrMax = 128
 
 // InetAddr is struct in_addr, from uapi/linux/in.h.
+//
+// +marshal
 type InetAddr [4]byte
 
+// SizeOfInetAddr is the size of InetAddr.
+var SizeOfInetAddr = uint32((*InetAddr)(nil).SizeBytes())
+
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
+//
+// +marshal
 type SockAddrInet struct {
 	Family uint16
 	Port   uint16
 	Addr   InetAddr
-	Zero   [8]uint8 // pad to sizeof(struct sockaddr).
+	_      [8]uint8 // pad to sizeof(struct sockaddr).
+}
+
+// Inet6MulticastRequest is struct ipv6_mreq, from uapi/linux/in6.h.
+//
+// +marshal
+type Inet6MulticastRequest struct {
+	MulticastAddr  Inet6Addr
+	InterfaceIndex int32
 }
 
 // InetMulticastRequest is struct ip_mreq, from uapi/linux/in.h.
+//
+// +marshal
 type InetMulticastRequest struct {
 	MulticastAddr InetAddr
 	InterfaceAddr InetAddr
 }
 
 // InetMulticastRequestWithNIC is struct ip_mreqn, from uapi/linux/in.h.
+//
+// +marshal
 type InetMulticastRequestWithNIC struct {
 	InetMulticastRequest
 	InterfaceIndex int32
 }
 
+// Inet6Addr is struct in6_addr, from uapi/linux/in6.h.
+//
+// +marshal
+type Inet6Addr [16]byte
+
 // SockAddrInet6 is struct sockaddr_in6, from uapi/linux/in6.h.
+//
+// +marshal
 type SockAddrInet6 struct {
 	Family   uint16
 	Port     uint16
@@ -257,6 +293,8 @@ type SockAddrInet6 struct {
 }
 
 // SockAddrLink is a struct sockaddr_ll, from uapi/linux/if_packet.h.
+//
+// +marshal
 type SockAddrLink struct {
 	Family          uint16
 	Protocol        uint16
@@ -273,6 +311,8 @@ type SockAddrLink struct {
 const UnixPathMax = 108
 
 // SockAddrUnix is struct sockaddr_un, from uapi/linux/un.h.
+//
+// +marshal
 type SockAddrUnix struct {
 	Family uint16
 	Path   [UnixPathMax]int8
@@ -282,6 +322,8 @@ type SockAddrUnix struct {
 // equivalent to struct sockaddr. SockAddr ensures that a well-defined set of
 // types can be used as socket addresses.
 type SockAddr interface {
+	marshal.Marshallable
+
 	// implementsSockAddr exists purely to allow a type to indicate that they
 	// implement this interface. This method is a no-op and shouldn't be called.
 	implementsSockAddr()
@@ -294,6 +336,8 @@ func (s *SockAddrUnix) implementsSockAddr()    {}
 func (s *SockAddrNetlink) implementsSockAddr() {}
 
 // Linger is struct linger, from include/linux/socket.h.
+//
+// +marshal
 type Linger struct {
 	OnOff  int32
 	Linger int32
@@ -305,30 +349,63 @@ const SizeOfLinger = 8
 // TCPInfo is a collection of TCP statistics.
 //
 // From uapi/linux/tcp.h. Newer versions of Linux continue to add new fields to
-// the end of this struct or within existing unusued space, so its size grows
+// the end of this struct or within existing unused space, so its size grows
 // over time. The current iteration is based on linux v4.17. New versions are
 // always backwards compatible.
+//
+// +marshal
 type TCPInfo struct {
-	State       uint8
-	CaState     uint8
+	// State is the state of the connection.
+	State uint8
+
+	// CaState is the congestion control state.
+	CaState uint8
+
+	// Retransmits is the number of retransmissions triggered by RTO.
 	Retransmits uint8
-	Probes      uint8
-	Backoff     uint8
-	Options     uint8
-	// WindowScale is the combination of snd_wscale (first 4 bits) and rcv_wscale (second 4 bits)
+
+	// Probes is the number of unanswered zero window probes.
+	Probes uint8
+
+	// BackOff indicates exponential backoff.
+	Backoff uint8
+
+	// Options indicates the options enabled for the connection.
+	Options uint8
+
+	// WindowScale is the combination of snd_wscale (first 4 bits) and
+	// rcv_wscale (second 4 bits)
 	WindowScale uint8
-	// DeliveryRateAppLimited is a boolean and only the first bit is meaningful.
+
+	// DeliveryRateAppLimited is a boolean and only the first bit is
+	// meaningful.
 	DeliveryRateAppLimited uint8
 
-	RTO    uint32
-	ATO    uint32
+	// RTO is the retransmission timeout.
+	RTO uint32
+
+	// ATO is the acknowledgement timeout interval.
+	ATO uint32
+
+	// SndMss is the send maximum segment size.
 	SndMss uint32
+
+	// RcvMss is the receive maximum segment size.
 	RcvMss uint32
 
+	// Unacked is the number of packets sent but not acknowledged.
 	Unacked uint32
-	Sacked  uint32
-	Lost    uint32
+
+	// Sacked is the number of packets which are selectively acknowledged.
+	Sacked uint32
+
+	// Lost is the number of packets marked as lost.
+	Lost uint32
+
+	// Retrans is the number of retransmitted packets.
 	Retrans uint32
+
+	// Fackets is not used and is always zero.
 	Fackets uint32
 
 	// Times.
@@ -347,41 +424,82 @@ type TCPInfo struct {
 	Advmss      uint32
 	Reordering  uint32
 
-	RcvRTT   uint32
+	// RcvRTT is the receiver round trip time.
+	RcvRTT uint32
+
+	// RcvSpace is the current buffer space available for receiving data.
 	RcvSpace uint32
 
+	// TotalRetrans is the total number of retransmits seen since the start
+	// of the connection.
 	TotalRetrans uint32
 
-	PacingRate    uint64
+	// PacingRate is the pacing rate in bytes per second.
+	PacingRate uint64
+
+	// MaxPacingRate is the maximum pacing rate.
 	MaxPacingRate uint64
+
 	// BytesAcked is RFC4898 tcpEStatsAppHCThruOctetsAcked.
 	BytesAcked uint64
+
 	// BytesReceived is RFC4898 tcpEStatsAppHCThruOctetsReceived.
 	BytesReceived uint64
+
 	// SegsOut is RFC4898 tcpEStatsPerfSegsOut.
 	SegsOut uint32
+
 	// SegsIn is RFC4898 tcpEStatsPerfSegsIn.
 	SegsIn uint32
 
+	// NotSentBytes is the amount of bytes in the write queue that are not
+	// yet sent.
 	NotSentBytes uint32
-	MinRTT       uint32
+
+	// MinRTT is the minimum round trip time seen in the connection.
+	MinRTT uint32
+
 	// DataSegsIn is RFC4898 tcpEStatsDataSegsIn.
 	DataSegsIn uint32
+
 	// DataSegsOut is RFC4898 tcpEStatsDataSegsOut.
 	DataSegsOut uint32
 
+	// DeliveryRate is the most recent delivery rate in bytes per second.
 	DeliveryRate uint64
 
 	// BusyTime is the time in microseconds busy sending data.
 	BusyTime uint64
+
 	// RwndLimited is the time in microseconds limited by receive window.
 	RwndLimited uint64
+
 	// SndBufLimited is the time in microseconds limited by send buffer.
 	SndBufLimited uint64
+
+	// Delivered is the total data packets delivered including retransmits.
+	Delivered uint32
+
+	// DeliveredCE is the total ECE marked data packets delivered including
+	// retransmits.
+	DeliveredCE uint32
+
+	// BytesSent is RFC4898 tcpEStatsPerfHCDataOctetsOut.
+	BytesSent uint64
+
+	// BytesRetrans is RFC4898 tcpEStatsPerfOctetsRetrans.
+	BytesRetrans uint64
+
+	// DSACKDups is RFC4898 tcpEStatsStackDSACKDups.
+	DSACKDups uint32
+
+	// ReordSeen is the number of reordering events seen since the start of
+	// the connection.
+	ReordSeen uint32
 }
 
 // SizeOfTCPInfo is the binary size of a TCPInfo struct.
-var SizeOfTCPInfo = int(binary.Size(TCPInfo{}))
+var SizeOfTCPInfo = (*TCPInfo)(nil).SizeBytes()
 
 // Control message types, from linux/socket.h.
 const (
@@ -392,6 +510,8 @@ const (
 // A ControlMessageHeader is the header for a socket control message.
 //
 // ControlMessageHeader represents struct cmsghdr from linux/socket.h.
+//
+// +marshal
 type ControlMessageHeader struct {
 	Length uint64
 	Level  int32
@@ -400,11 +520,13 @@ type ControlMessageHeader struct {
 
 // SizeOfControlMessageHeader is the binary size of a ControlMessageHeader
 // struct.
-var SizeOfControlMessageHeader = int(binary.Size(ControlMessageHeader{}))
+var SizeOfControlMessageHeader = (*ControlMessageHeader)(nil).SizeBytes()
 
 // A ControlMessageCredentials is an SCM_CREDENTIALS socket control message.
 //
 // ControlMessageCredentials represents struct ucred from linux/socket.h.
+//
+// +marshal
 type ControlMessageCredentials struct {
 	PID int32
 	UID uint32
@@ -414,18 +536,27 @@ type ControlMessageCredentials struct {
 // A ControlMessageIPPacketInfo is IP_PKTINFO socket control message.
 //
 // ControlMessageIPPacketInfo represents struct in_pktinfo from linux/in.h.
+//
+// +marshal
+// +stateify savable
 type ControlMessageIPPacketInfo struct {
 	NIC             int32
 	LocalAddr       InetAddr
 	DestinationAddr InetAddr
 }
 
+// ControlMessageIPv6PacketInfo represents struct in6_pktinfo from linux/ipv6.h.
+//
+// +marshal
+// +stateify savable
+type ControlMessageIPv6PacketInfo struct {
+	Addr Inet6Addr
+	NIC  uint32
+}
+
 // SizeOfControlMessageCredentials is the binary size of a
 // ControlMessageCredentials struct.
-var SizeOfControlMessageCredentials = int(binary.Size(ControlMessageCredentials{}))
-
-// A ControlMessageRights is an SCM_RIGHTS socket control message.
-type ControlMessageRights []int32
+var SizeOfControlMessageCredentials = (*ControlMessageCredentials)(nil).SizeBytes()
 
 // SizeOfControlMessageRight is the size of a single element in
 // ControlMessageRights.
@@ -437,12 +568,22 @@ const SizeOfControlMessageInq = 4
 // SizeOfControlMessageTOS is the size of an IP_TOS control message.
 const SizeOfControlMessageTOS = 1
 
+// SizeOfControlMessageTTL is the size of an IP_TTL control message.
+const SizeOfControlMessageTTL = 4
+
 // SizeOfControlMessageTClass is the size of an IPV6_TCLASS control message.
 const SizeOfControlMessageTClass = 4
 
-// SizeOfControlMessageIPPacketInfo is the size of an IP_PKTINFO
-// control message.
+// SizeOfControlMessageHopLimit is the size of an IPV6_HOPLIMIT control message.
+const SizeOfControlMessageHopLimit = 4
+
+// SizeOfControlMessageIPPacketInfo is the size of an IP_PKTINFO control
+// message.
 const SizeOfControlMessageIPPacketInfo = 12
+
+// SizeOfControlMessageIPv6PacketInfo is the size of a
+// ControlMessageIPv6PacketInfo.
+const SizeOfControlMessageIPv6PacketInfo = 20
 
 // SCM_MAX_FD is the maximum number of FDs accepted in a single sendmsg call.
 // From net/scm.h.
@@ -454,3 +595,14 @@ const SCM_MAX_FD = 253
 // socket option for querying whether a socket is in a listening
 // state.
 const SO_ACCEPTCON = 1 << 16
+
+// ICMP6Filter represents struct icmp6_filter from linux/icmpv6.h.
+//
+// +marshal
+// +stateify savable
+type ICMP6Filter struct {
+	Filter [8]uint32
+}
+
+// SizeOfICMP6Filter is the size of ICMP6Filter struct.
+var SizeOfICMP6Filter = uint32((*ICMP6Filter)(nil).SizeBytes())

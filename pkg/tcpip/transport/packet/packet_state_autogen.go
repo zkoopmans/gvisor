@@ -3,86 +3,167 @@
 package packet
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
-func (x *packet) beforeSave() {}
-func (x *packet) save(m state.Map) {
-	x.beforeSave()
-	var data buffer.VectorisedView = x.saveData()
-	m.SaveValue("data", data)
-	m.Save("packetEntry", &x.packetEntry)
-	m.Save("timestampNS", &x.timestampNS)
-	m.Save("senderAddr", &x.senderAddr)
+func (p *packet) StateTypeName() string {
+	return "pkg/tcpip/transport/packet.packet"
 }
 
-func (x *packet) afterLoad() {}
-func (x *packet) load(m state.Map) {
-	m.Load("packetEntry", &x.packetEntry)
-	m.Load("timestampNS", &x.timestampNS)
-	m.Load("senderAddr", &x.senderAddr)
-	m.LoadValue("data", new(buffer.VectorisedView), func(y interface{}) { x.loadData(y.(buffer.VectorisedView)) })
+func (p *packet) StateFields() []string {
+	return []string{
+		"packetEntry",
+		"data",
+		"receivedAt",
+		"senderAddr",
+		"packetInfo",
+	}
 }
 
-func (x *endpoint) save(m state.Map) {
-	x.beforeSave()
-	var rcvBufSizeMax int = x.saveRcvBufSizeMax()
-	m.SaveValue("rcvBufSizeMax", rcvBufSizeMax)
-	m.Save("TransportEndpointInfo", &x.TransportEndpointInfo)
-	m.Save("netProto", &x.netProto)
-	m.Save("waiterQueue", &x.waiterQueue)
-	m.Save("cooked", &x.cooked)
-	m.Save("rcvList", &x.rcvList)
-	m.Save("rcvBufSize", &x.rcvBufSize)
-	m.Save("rcvClosed", &x.rcvClosed)
-	m.Save("sndBufSize", &x.sndBufSize)
-	m.Save("closed", &x.closed)
+func (p *packet) beforeSave() {}
+
+// +checklocksignore
+func (p *packet) StateSave(stateSinkObject state.Sink) {
+	p.beforeSave()
+	var receivedAtValue int64
+	receivedAtValue = p.saveReceivedAt()
+	stateSinkObject.SaveValue(2, receivedAtValue)
+	stateSinkObject.Save(0, &p.packetEntry)
+	stateSinkObject.Save(1, &p.data)
+	stateSinkObject.Save(3, &p.senderAddr)
+	stateSinkObject.Save(4, &p.packetInfo)
 }
 
-func (x *endpoint) load(m state.Map) {
-	m.Load("TransportEndpointInfo", &x.TransportEndpointInfo)
-	m.Load("netProto", &x.netProto)
-	m.Load("waiterQueue", &x.waiterQueue)
-	m.Load("cooked", &x.cooked)
-	m.Load("rcvList", &x.rcvList)
-	m.Load("rcvBufSize", &x.rcvBufSize)
-	m.Load("rcvClosed", &x.rcvClosed)
-	m.Load("sndBufSize", &x.sndBufSize)
-	m.Load("closed", &x.closed)
-	m.LoadValue("rcvBufSizeMax", new(int), func(y interface{}) { x.loadRcvBufSizeMax(y.(int)) })
-	m.AfterLoad(x.afterLoad)
+func (p *packet) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (p *packet) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &p.packetEntry)
+	stateSourceObject.Load(1, &p.data)
+	stateSourceObject.Load(3, &p.senderAddr)
+	stateSourceObject.Load(4, &p.packetInfo)
+	stateSourceObject.LoadValue(2, new(int64), func(y any) { p.loadReceivedAt(ctx, y.(int64)) })
 }
 
-func (x *packetList) beforeSave() {}
-func (x *packetList) save(m state.Map) {
-	x.beforeSave()
-	m.Save("head", &x.head)
-	m.Save("tail", &x.tail)
+func (ep *endpoint) StateTypeName() string {
+	return "pkg/tcpip/transport/packet.endpoint"
 }
 
-func (x *packetList) afterLoad() {}
-func (x *packetList) load(m state.Map) {
-	m.Load("head", &x.head)
-	m.Load("tail", &x.tail)
+func (ep *endpoint) StateFields() []string {
+	return []string{
+		"DefaultSocketOptionsHandler",
+		"waiterQueue",
+		"cooked",
+		"ops",
+		"stats",
+		"rcvList",
+		"rcvBufSize",
+		"rcvClosed",
+		"rcvDisabled",
+		"closed",
+		"boundNetProto",
+		"boundNIC",
+		"lastError",
+	}
 }
 
-func (x *packetEntry) beforeSave() {}
-func (x *packetEntry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("next", &x.next)
-	m.Save("prev", &x.prev)
+// +checklocksignore
+func (ep *endpoint) StateSave(stateSinkObject state.Sink) {
+	ep.beforeSave()
+	stateSinkObject.Save(0, &ep.DefaultSocketOptionsHandler)
+	stateSinkObject.Save(1, &ep.waiterQueue)
+	stateSinkObject.Save(2, &ep.cooked)
+	stateSinkObject.Save(3, &ep.ops)
+	stateSinkObject.Save(4, &ep.stats)
+	stateSinkObject.Save(5, &ep.rcvList)
+	stateSinkObject.Save(6, &ep.rcvBufSize)
+	stateSinkObject.Save(7, &ep.rcvClosed)
+	stateSinkObject.Save(8, &ep.rcvDisabled)
+	stateSinkObject.Save(9, &ep.closed)
+	stateSinkObject.Save(10, &ep.boundNetProto)
+	stateSinkObject.Save(11, &ep.boundNIC)
+	stateSinkObject.Save(12, &ep.lastError)
 }
 
-func (x *packetEntry) afterLoad() {}
-func (x *packetEntry) load(m state.Map) {
-	m.Load("next", &x.next)
-	m.Load("prev", &x.prev)
+// +checklocksignore
+func (ep *endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &ep.DefaultSocketOptionsHandler)
+	stateSourceObject.Load(1, &ep.waiterQueue)
+	stateSourceObject.Load(2, &ep.cooked)
+	stateSourceObject.Load(3, &ep.ops)
+	stateSourceObject.Load(4, &ep.stats)
+	stateSourceObject.Load(5, &ep.rcvList)
+	stateSourceObject.Load(6, &ep.rcvBufSize)
+	stateSourceObject.Load(7, &ep.rcvClosed)
+	stateSourceObject.Load(8, &ep.rcvDisabled)
+	stateSourceObject.Load(9, &ep.closed)
+	stateSourceObject.Load(10, &ep.boundNetProto)
+	stateSourceObject.Load(11, &ep.boundNIC)
+	stateSourceObject.Load(12, &ep.lastError)
+	stateSourceObject.AfterLoad(func() { ep.afterLoad(ctx) })
+}
+
+func (l *packetList) StateTypeName() string {
+	return "pkg/tcpip/transport/packet.packetList"
+}
+
+func (l *packetList) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
+}
+
+func (l *packetList) beforeSave() {}
+
+// +checklocksignore
+func (l *packetList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
+}
+
+func (l *packetList) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *packetList) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *packetEntry) StateTypeName() string {
+	return "pkg/tcpip/transport/packet.packetEntry"
+}
+
+func (e *packetEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *packetEntry) beforeSave() {}
+
+// +checklocksignore
+func (e *packetEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *packetEntry) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *packetEntry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func init() {
-	state.Register("pkg/tcpip/transport/packet.packet", (*packet)(nil), state.Fns{Save: (*packet).save, Load: (*packet).load})
-	state.Register("pkg/tcpip/transport/packet.endpoint", (*endpoint)(nil), state.Fns{Save: (*endpoint).save, Load: (*endpoint).load})
-	state.Register("pkg/tcpip/transport/packet.packetList", (*packetList)(nil), state.Fns{Save: (*packetList).save, Load: (*packetList).load})
-	state.Register("pkg/tcpip/transport/packet.packetEntry", (*packetEntry)(nil), state.Fns{Save: (*packetEntry).save, Load: (*packetEntry).load})
+	state.Register((*packet)(nil))
+	state.Register((*endpoint)(nil))
+	state.Register((*packetList)(nil))
+	state.Register((*packetEntry)(nil))
 }

@@ -12,21 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
 // +build linux
 
 package fdbased
 
 import (
-	"reflect"
 	"unsafe"
 )
 
 const virtioNetHdrSize = int(unsafe.Sizeof(virtioNetHdr{}))
-
-func vnetHdrToByteSlice(hdr *virtioNetHdr) (slice []byte) {
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
-	sh.Data = uintptr(unsafe.Pointer(hdr))
-	sh.Len = virtioNetHdrSize
-	sh.Cap = virtioNetHdrSize
-	return
-}

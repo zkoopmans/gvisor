@@ -24,52 +24,43 @@ package context
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/amutex"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-type contextID int
+// Blocker represents an object with control flow hooks.
+//
+// These may be used to perform blocking operations, sleep or otherwise
+// wait, since there may be asynchronous events that require processing.
+type Blocker interface {
+	// Interrupt interrupts any Block operations.
+	Interrupt()
 
-// Globally accessible values from a context. These keys are defined in the
-// context package to resolve dependency cycles by not requiring the caller to
-// import packages usually required to get these information.
-const (
-	// CtxThreadGroupID is the current thread group ID when a context represents
-	// a task context. The value is represented as an int32.
-	CtxThreadGroupID contextID = iota
-)
+	// Interrupted notes whether this context is Interrupted.
+	Interrupted() bool
 
-// ThreadGroupIDFromContext returns the current thread group ID when ctx
-// represents a task context.
-func ThreadGroupIDFromContext(ctx Context) (tgid int32, ok bool) {
-	if tgid := ctx.Value(CtxThreadGroupID); tgid != nil {
-		return tgid.(int32), true
-	}
-	return 0, false
-}
+	// BlockOn blocks until one of the previously registered events occurs,
+	// or some external interrupt (cancellation).
+	//
+	// The return value should indicate whether the wake-up occurred as a
+	// result of the requested event (versus an external interrupt).
+	BlockOn(waiter.Waitable, waiter.EventMask) bool
 
-// A Context represents a thread of execution (hereafter "goroutine" to reflect
-// Go idiosyncrasy). It carries state associated with the goroutine across API
-// boundaries.
-//
-// While Context exists for essentially the same reasons as Go's standard
-// context.Context, the standard type represents the state of an operation
-// rather than that of a goroutine. This is a critical distinction:
-//
-// - Unlike context.Context, which "may be passed to functions running in
-// different goroutines", it is *not safe* to use the same Context in multiple
-// concurrent goroutines.
-//
-// - It is *not safe* to retain a Context passed to a function beyond the scope
-// of that function call.
-//
-// In both cases, values extracted from the Context should be used instead.
-type Context interface {
-	log.Logger
-	amutex.Sleeper
-	context.Context
+	// Block blocks until an event is received from C, or some external
+	// interrupt. It returns nil if an event is received from C and an err if t
+	// is interrupted.
+	Block(C <-chan struct{}) error
+
+	// BlockWithTimeoutOn blocks until either the conditions of Block are
+	// satisfied, or the timeout is hit. Note that deadlines are not supported
+	// since the notion of "with respect to what clock" is not resolved.
+	//
+	// The return value is per BlockOn.
+	BlockWithTimeoutOn(waiter.Waitable, waiter.EventMask, time.Duration) (time.Duration, bool)
 
 	// UninterruptibleSleepStart indicates the beginning of an uninterruptible
 	// sleep state (equivalent to Linux's TASK_UNINTERRUPTIBLE). If deactivate
@@ -85,57 +76,153 @@ type Context interface {
 	UninterruptibleSleepFinish(activate bool)
 }
 
-// NoopSleeper is a noop implementation of amutex.Sleeper and UninterruptibleSleep
-// methods for anonymous embedding in other types that do not implement sleeps.
-type NoopSleeper struct {
-	amutex.NoopSleeper
+// NoTask is an implementation of Blocker that does not block.
+type NoTask struct {
+	cancel chan struct{}
 }
 
-// UninterruptibleSleepStart does nothing.
-func (NoopSleeper) UninterruptibleSleepStart(bool) {}
-
-// UninterruptibleSleepFinish does nothing.
-func (NoopSleeper) UninterruptibleSleepFinish(bool) {}
-
-// Deadline returns zero values, meaning no deadline.
-func (NoopSleeper) Deadline() (time.Time, bool) {
-	return time.Time{}, false
+// Interrupt implements Blocker.Interrupt.
+func (nt *NoTask) Interrupt() {
+	select {
+	case nt.cancel <- struct{}{}:
+	default:
+	}
 }
 
-// Done returns nil.
-func (NoopSleeper) Done() <-chan struct{} {
-	return nil
+// Interrupted implements Blocker.Interrupted.
+func (nt *NoTask) Interrupted() bool {
+	return nt.cancel != nil && len(nt.cancel) > 0
 }
 
-// Err returns nil.
-func (NoopSleeper) Err() error {
-	return nil
+// Block implements Blocker.Block.
+func (nt *NoTask) Block(C <-chan struct{}) error {
+	if nt.cancel == nil {
+		nt.cancel = make(chan struct{}, 1)
+	}
+	select {
+	case <-nt.cancel:
+		return errors.New("interrupted system call") // Interrupted.
+	case <-C:
+		return nil
+	}
+}
+
+// BlockOn implements Blocker.BlockOn.
+func (nt *NoTask) BlockOn(w waiter.Waitable, mask waiter.EventMask) bool {
+	if nt.cancel == nil {
+		nt.cancel = make(chan struct{}, 1)
+	}
+	e, ch := waiter.NewChannelEntry(mask)
+	w.EventRegister(&e)
+	defer w.EventUnregister(&e)
+	select {
+	case <-nt.cancel:
+		return false // Interrupted.
+	case _, ok := <-ch:
+		return ok
+	}
+}
+
+// BlockWithTimeoutOn implements Blocker.BlockWithTimeoutOn.
+func (nt *NoTask) BlockWithTimeoutOn(w waiter.Waitable, mask waiter.EventMask, duration time.Duration) (time.Duration, bool) {
+	if nt.cancel == nil {
+		nt.cancel = make(chan struct{}, 1)
+	}
+	e, ch := waiter.NewChannelEntry(mask)
+	w.EventRegister(&e)
+	defer w.EventUnregister(&e)
+	start := time.Now() // In system time.
+	t := time.AfterFunc(duration, func() { ch <- struct{}{} })
+	select {
+	case <-nt.cancel:
+		return time.Since(start), false // Interrupted.
+	case _, ok := <-ch:
+		if ok && t.Stop() {
+			// Timer never fired.
+			return time.Since(start), ok
+		}
+		// Timer fired, remain is zero.
+		return time.Duration(0), ok
+	}
+}
+
+// UninterruptibleSleepStart implmenents Blocker.UninterruptedSleepStart.
+func (*NoTask) UninterruptibleSleepStart(bool) {}
+
+// UninterruptibleSleepFinish implmenents Blocker.UninterruptibleSleepFinish.
+func (*NoTask) UninterruptibleSleepFinish(bool) {}
+
+// Context represents a thread of execution (hereafter "goroutine" to reflect
+// Go idiosyncrasy). It carries state associated with the goroutine across API
+// boundaries.
+//
+// While Context exists for essentially the same reasons as Go's standard
+// context.Context, the standard type represents the state of an operation
+// rather than that of a goroutine. This is a critical distinction:
+//
+//   - Unlike context.Context, which "may be passed to functions running in
+//     different goroutines", it is *not safe* to use the same Context in multiple
+//     concurrent goroutines.
+//
+//   - It is *not safe* to retain a Context passed to a function beyond the scope
+//     of that function call.
+//
+// In both cases, values extracted from the Context should be used instead.
+type Context interface {
+	context.Context
+	log.Logger
+	Blocker
 }
 
 // logContext implements basic logging.
 type logContext struct {
+	NoTask
 	log.Logger
-	NoopSleeper
-}
-
-// Value implements Context.Value.
-func (logContext) Value(key interface{}) interface{} {
-	return nil
+	context.Context
 }
 
 // bgContext is the context returned by context.Background.
-var bgContext = &logContext{Logger: log.Log()}
+var bgContext Context
+var bgOnce sync.Once
 
 // Background returns an empty context using the default logger.
-//
-// Users should be wary of using a Background context. Please tag any use with
-// FIXME(b/38173783) and a note to remove this use.
-//
 // Generally, one should use the Task as their context when available, or avoid
 // having to use a context in places where a Task is unavailable.
 //
 // Using a Background context for tests is fine, as long as no values are
 // needed from the context in the tested code paths.
+//
+// The global log.SetTarget() must be called before context.Background()
 func Background() Context {
+	bgOnce.Do(func() {
+		bgContext = &logContext{
+			Context: context.Background(),
+			Logger:  log.Log(),
+		}
+	})
 	return bgContext
+}
+
+// WithValue returns a copy of parent in which the value associated with key is
+// val.
+func WithValue(parent Context, key, val any) Context {
+	return &withValue{
+		Context: parent,
+		key:     key,
+		val:     val,
+	}
+}
+
+type withValue struct {
+	Context
+	key any
+	val any
+}
+
+// Value implements Context.Value.
+func (ctx *withValue) Value(key any) any {
+	if key == ctx.key {
+		return ctx.val
+	}
+	return ctx.Context.Value(key)
 }

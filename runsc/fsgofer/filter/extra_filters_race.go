@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build race
 // +build race
 
 package filter
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
@@ -26,17 +26,19 @@ import (
 // instrumentationFilters returns additional filters for syscalls used by TSAN.
 func instrumentationFilters() seccomp.SyscallRules {
 	log.Warningf("*** SECCOMP WARNING: TSAN is enabled: syscall filters less restrictive!")
-	return seccomp.SyscallRules{
-		syscall.SYS_BRK:             {},
-		syscall.SYS_CLONE:           {},
-		syscall.SYS_FUTEX:           {},
-		syscall.SYS_MADVISE:         {},
-		syscall.SYS_MMAP:            {},
-		syscall.SYS_MUNLOCK:         {},
-		syscall.SYS_NANOSLEEP:       {},
-		syscall.SYS_OPEN:            {},
-		syscall.SYS_SET_ROBUST_LIST: {},
-		// Used within glibc's malloc.
-		syscall.SYS_TIME: {},
-	}
+	return archInstrumentationFilters(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_BRK:               seccomp.MatchAll{},
+		unix.SYS_CLOCK_NANOSLEEP:   seccomp.MatchAll{},
+		unix.SYS_CLONE:             seccomp.MatchAll{},
+		unix.SYS_CLONE3:            seccomp.MatchAll{},
+		unix.SYS_FUTEX:             seccomp.MatchAll{},
+		unix.SYS_MADVISE:           seccomp.MatchAll{},
+		unix.SYS_MMAP:              seccomp.MatchAll{},
+		unix.SYS_MUNLOCK:           seccomp.MatchAll{},
+		unix.SYS_NANOSLEEP:         seccomp.MatchAll{},
+		unix.SYS_OPENAT:            seccomp.MatchAll{},
+		unix.SYS_RSEQ:              seccomp.MatchAll{},
+		unix.SYS_SET_ROBUST_LIST:   seccomp.MatchAll{},
+		unix.SYS_SCHED_GETAFFINITY: seccomp.MatchAll{},
+	}))
 }

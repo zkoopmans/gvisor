@@ -18,16 +18,15 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ucspb "gvisor.dev/gvisor/pkg/sentry/kernel/uncaught_signal_go_proto"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -86,7 +85,7 @@ var defaultActions = map[linux.Signal]SignalAction{
 }
 
 // computeAction figures out what to do given a signal number
-// and an arch.SignalAct. SIGSTOP always results in a SignalActionStop,
+// and an linux.SigAction. SIGSTOP always results in a SignalActionStop,
 // and SIGKILL always results in a SignalActionTerm.
 // Signal 0 is always ignored as many programs use it for various internal functions
 // and don't expect it to do anything.
@@ -97,7 +96,7 @@ var defaultActions = map[linux.Signal]SignalAction{
 // 0, the default action is taken;
 // 1, the signal is ignored;
 // anything else, the function returns SignalActionHandler.
-func computeAction(sig linux.Signal, act arch.SignalAct) SignalAction {
+func computeAction(sig linux.Signal, act linux.SigAction) SignalAction {
 	switch sig {
 	case linux.SIGSTOP:
 		return SignalActionStop
@@ -108,9 +107,9 @@ func computeAction(sig linux.Signal, act arch.SignalAct) SignalAction {
 	}
 
 	switch act.Handler {
-	case arch.SignalActDefault:
+	case linux.SIG_DFL:
 		return defaultActions[sig]
-	case arch.SignalActIgnore:
+	case linux.SIG_IGN:
 		return SignalActionIgnore
 	default:
 		return SignalActionHandler
@@ -127,7 +126,7 @@ var StopSignals = linux.MakeSignalSet(linux.SIGSTOP, linux.SIGTSTP, linux.SIGTTI
 // If there are no pending unmasked signals, dequeueSignalLocked returns nil.
 //
 // Preconditions: t.tg.signalHandlers.mu must be locked.
-func (t *Task) dequeueSignalLocked(mask linux.SignalSet) *arch.SignalInfo {
+func (t *Task) dequeueSignalLocked(mask linux.SignalSet) *linux.SignalInfo {
 	if info := t.pendingSignals.dequeue(mask); info != nil {
 		return info
 	}
@@ -155,11 +154,12 @@ func (t *Task) PendingSignals() linux.SignalSet {
 }
 
 // deliverSignal delivers the given signal and returns the following run state.
-func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunState {
-	sigact := computeAction(linux.Signal(info.Signo), act)
+func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRunState {
+	sig := linux.Signal(info.Signo)
+	sigact := computeAction(sig, act)
 
 	if t.haveSyscallReturn {
-		if sre, ok := SyscallRestartErrnoFromReturn(t.Arch().Return()); ok {
+		if sre, ok := linuxerr.SyscallRestartErrorFromReturn(t.Arch().Return()); ok {
 			// Signals that are ignored, cause a thread group stop, or
 			// terminate the thread group do not interact with interrupted
 			// syscalls; in Linux terms, they are never returned to the signal
@@ -168,15 +168,15 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 			// signal that is actually handled (by userspace).
 			if sigact == SignalActionHandler {
 				switch {
-				case sre == ERESTARTNOHAND:
+				case sre == linuxerr.ERESTARTNOHAND:
 					fallthrough
-				case sre == ERESTART_RESTARTBLOCK:
+				case sre == linuxerr.ERESTART_RESTARTBLOCK:
 					fallthrough
-				case (sre == ERESTARTSYS && !act.IsRestart()):
-					t.Debugf("Not restarting syscall %d after errno %d: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
-					t.Arch().SetReturn(uintptr(-t.ExtractErrno(syserror.EINTR, -1)))
+				case (sre == linuxerr.ERESTARTSYS && act.Flags&linux.SA_RESTART == 0):
+					t.Debugf("Not restarting syscall %d after error %v: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
+					t.Arch().SetReturn(uintptr(-ExtractErrno(linuxerr.EINTR, -1)))
 				default:
-					t.Debugf("Restarting syscall %d after errno %d: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
+					t.Debugf("Restarting syscall %d: interrupted by signal %d", t.Arch().SyscallNo(), info.Signo)
 					t.Arch().RestartSyscall()
 				}
 			}
@@ -186,7 +186,6 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 	switch sigact {
 	case SignalActionTerm, SignalActionCore:
 		// "Default action is to terminate the process." - signal(7)
-		t.Debugf("Signal %d: terminating thread group", info.Signo)
 
 		// Emit an event channel messages related to this uncaught signal.
 		ucs := &ucspb.UncaughtSignal{
@@ -197,14 +196,15 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 		}
 
 		// Attach an fault address if appropriate.
-		switch linux.Signal(info.Signo) {
+		switch sig {
 		case linux.SIGSEGV, linux.SIGFPE, linux.SIGILL, linux.SIGTRAP, linux.SIGBUS:
 			ucs.FaultAddr = info.Addr()
 		}
 
+		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, ucs.FaultAddr)
 		eventchannel.Emit(ucs)
 
-		t.PrepareGroupExit(ExitStatus{Signo: int(info.Signo)})
+		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
 		return (*runExit)(nil)
 
 	case SignalActionStop:
@@ -224,53 +224,72 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 
 			// Send a forced SIGSEGV. If the signal that couldn't be delivered
 			// was a SIGSEGV, force the handler to SIG_DFL.
-			t.forceSignal(linux.SIGSEGV, linux.Signal(info.Signo) == linux.SIGSEGV /* unconditional */)
+			t.forceSignal(linux.SIGSEGV, sig == linux.SIGSEGV /* unconditional */)
 			t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		}
 
 	default:
-		panic(fmt.Sprintf("Unknown signal action %+v, %d?", info, computeAction(linux.Signal(info.Signo), act)))
+		panic(fmt.Sprintf("Unknown signal action %+v, %d?", info, computeAction(sig, act)))
 	}
 	return (*runInterrupt)(nil)
 }
 
 // deliverSignalToHandler changes the task's userspace state to enter the given
 // user-configured handler for the given signal.
-func (t *Task) deliverSignalToHandler(info *arch.SignalInfo, act arch.SignalAct) error {
+func (t *Task) deliverSignalToHandler(info *linux.SignalInfo, act linux.SigAction) error {
 	// Signal delivery to an application handler interrupts restartable
 	// sequences.
 	t.rseqInterrupt()
 
 	// Are executing on the main stack,
 	// or the provided alternate stack?
-	sp := usermem.Addr(t.Arch().Stack())
+	sp := hostarch.Addr(t.Arch().Stack())
 
 	// N.B. This is a *copy* of the alternate stack that the user's signal
 	// handler expects to see in its ucontext (even if it's not in use).
 	alt := t.signalStack
-	if act.IsOnStack() && alt.IsEnabled() {
-		alt.SetOnStack()
+	if act.Flags&linux.SA_ONSTACK != 0 && alt.IsEnabled() {
+		alt.Flags |= linux.SS_ONSTACK
 		if !alt.Contains(sp) {
-			sp = usermem.Addr(alt.Top())
+			sp = hostarch.Addr(alt.Top())
 		}
 	}
 
+	mm := t.MemoryManager()
 	// Set up the signal handler. If we have a saved signal mask, the signal
 	// handler should run with the current mask, but sigreturn should restore
 	// the saved one.
-	st := &arch.Stack{t.Arch(), t.MemoryManager(), sp}
-	mask := t.signalMask
+	st := &arch.Stack{
+		Arch:   t.Arch(),
+		IO:     mm,
+		Bottom: sp,
+	}
+	mask := linux.SignalSet(t.signalMask.Load())
 	if t.haveSavedSignalMask {
 		mask = t.savedSignalMask
 	}
-	if err := t.Arch().SignalSetup(st, &act, info, &alt, mask); err != nil {
+
+	// Set up the restorer.
+	// x86-64 should always uses SA_RESTORER, but this flag is optional on other platforms.
+	// Please see the linux code as reference:
+	// linux/arch/x86/kernel/signal.c:__setup_rt_frame()
+	// If SA_RESTORER is not configured, we can use the sigreturn trampolines
+	// the vdso provides instead.
+	// Please see the linux code as reference:
+	// linux/arch/arm64/kernel/signal.c:setup_return()
+	if act.Flags&linux.SA_RESTORER == 0 {
+		act.Restorer = mm.VDSOSigReturn()
+	}
+
+	if err := t.Arch().SignalSetup(st, &act, info, &alt, mask, t.k.featureSet); err != nil {
 		return err
 	}
+	t.p.FullStateChanged()
 	t.haveSavedSignalMask = false
 
 	// Add our signal mask.
-	newMask := t.signalMask | act.Mask
-	if !act.IsNoDefer() {
+	newMask := linux.SignalSet(t.signalMask.Load()) | act.Mask
+	if act.Flags&linux.SA_NODEFER == 0 {
 		newMask |= linux.SignalSetOf(linux.Signal(info.Signo))
 	}
 	t.SetSignalMask(newMask)
@@ -284,8 +303,12 @@ var ctrlResume = &SyscallControl{ignoreReturn: true}
 // rt is true).
 func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 	st := t.Stack()
-	sigset, alt, err := t.Arch().SignalRestore(st, rt)
+	sigset, alt, err := t.Arch().SignalRestore(st, rt, t.k.featureSet)
 	if err != nil {
+		// sigreturn syscalls never return errors.
+		t.Debugf("failed to restore from a signal frame: %v", err)
+		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
+		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		return nil, err
 	}
 
@@ -297,15 +320,17 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 
 	// Restore our signal mask. SIGKILL and SIGSTOP should not be blocked.
 	t.SetSignalMask(sigset &^ UnblockableSignals)
+	t.p.FullStateChanged()
 
 	return ctrlResume, nil
 }
 
 // Sigtimedwait implements the semantics of sigtimedwait(2).
 //
-// Preconditions: The caller must be running on the task goroutine. t.exitState
-// < TaskExitZombie.
-func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*arch.SignalInfo, error) {
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t.exitState < TaskExitZombie.
+func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*linux.SignalInfo, error) {
 	// set is the set of signals we're interested in; invert it to get the set
 	// of signals to block.
 	mask := ^(set &^ UnblockableSignals)
@@ -317,14 +342,14 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*arch.S
 	}
 
 	if timeout == 0 {
-		return nil, syserror.EAGAIN
+		return nil, linuxerr.EAGAIN
 	}
 
 	// Unblock signals we're waiting for. Remember the original signal mask so
 	// that Task.sendSignalTimerLocked doesn't discard ignored signals that
 	// we're temporarily unblocking.
-	t.realSignalMask = t.signalMask
-	t.setSignalMaskLocked(t.signalMask & mask)
+	t.realSignalMask = linux.SignalSet(t.signalMask.RacyLoad())
+	t.setSignalMaskLocked(t.realSignalMask & mask)
 
 	// Wait for a timeout or new signal.
 	t.tg.signalHandlers.mu.Unlock()
@@ -338,8 +363,8 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*arch.S
 	if info := t.dequeueSignalLocked(mask); info != nil {
 		return info, nil
 	}
-	if err == syserror.ETIMEDOUT {
-		return nil, syserror.EAGAIN
+	if err == linuxerr.ETIMEDOUT {
+		return nil, linuxerr.EAGAIN
 	}
 	return nil, err
 }
@@ -348,11 +373,10 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*arch.S
 //
 // The following errors may be returned:
 //
-//	syserror.ESRCH - The task has exited.
-//	syserror.EINVAL - The signal is not valid.
-//	syserror.EAGAIN - THe signal is realtime, and cannot be queued.
-//
-func (t *Task) SendSignal(info *arch.SignalInfo) error {
+//	linuxerr.ESRCH - The task has exited.
+//	linuxerr.EINVAL - The signal is not valid.
+//	linuxerr.EAGAIN - THe signal is realtime, and cannot be queued.
+func (t *Task) SendSignal(info *linux.SignalInfo) error {
 	t.tg.pidns.owner.mu.RLock()
 	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
@@ -361,7 +385,7 @@ func (t *Task) SendSignal(info *arch.SignalInfo) error {
 }
 
 // SendGroupSignal sends the given signal to t's thread group.
-func (t *Task) SendGroupSignal(info *arch.SignalInfo) error {
+func (t *Task) SendGroupSignal(info *linux.SignalInfo) error {
 	t.tg.pidns.owner.mu.RLock()
 	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
@@ -371,7 +395,7 @@ func (t *Task) SendGroupSignal(info *arch.SignalInfo) error {
 
 // SendSignal sends the given signal to tg, using tg's leader to determine if
 // the signal is blocked.
-func (tg *ThreadGroup) SendSignal(info *arch.SignalInfo) error {
+func (tg *ThreadGroup) SendSignal(info *linux.SignalInfo) error {
 	tg.pidns.owner.mu.RLock()
 	defer tg.pidns.owner.mu.RUnlock()
 	tg.signalHandlers.mu.Lock()
@@ -379,20 +403,20 @@ func (tg *ThreadGroup) SendSignal(info *arch.SignalInfo) error {
 	return tg.leader.sendSignalLocked(info, true /* group */)
 }
 
-func (t *Task) sendSignalLocked(info *arch.SignalInfo, group bool) error {
+func (t *Task) sendSignalLocked(info *linux.SignalInfo, group bool) error {
 	return t.sendSignalTimerLocked(info, group, nil)
 }
 
-func (t *Task) sendSignalTimerLocked(info *arch.SignalInfo, group bool, timer *IntervalTimer) error {
+func (t *Task) sendSignalTimerLocked(info *linux.SignalInfo, group bool, timer *IntervalTimer) error {
 	if t.exitState == TaskExitDead {
-		return syserror.ESRCH
+		return linuxerr.ESRCH
 	}
 	sig := linux.Signal(info.Signo)
 	if sig == 0 {
 		return nil
 	}
 	if !sig.IsValid() {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	// Signal side effects apply even if the signal is ultimately discarded.
@@ -415,7 +439,7 @@ func (t *Task) sendSignalTimerLocked(info *arch.SignalInfo, group bool, timer *I
 	// Linux's kernel/signal.c:__send_signal() => prepare_signal() =>
 	// sig_ignored().
 	ignored := computeAction(sig, t.tg.signalHandlers.actions[sig]) == SignalActionIgnore
-	if sigset := linux.SignalSetOf(sig); sigset&t.signalMask == 0 && sigset&t.realSignalMask == 0 && ignored && !t.hasTracer() {
+	if sigset := linux.SignalSetOf(sig); sigset&linux.SignalSet(t.signalMask.RacyLoad()) == 0 && sigset&t.realSignalMask == 0 && ignored && !t.hasTracer() {
 		t.Debugf("Discarding ignored signal %d", sig)
 		if timer != nil {
 			timer.signalRejectedLocked()
@@ -429,7 +453,7 @@ func (t *Task) sendSignalTimerLocked(info *arch.SignalInfo, group bool, timer *I
 	}
 	if !q.enqueue(info, timer) {
 		if sig.IsRealtime() {
-			return syserror.EAGAIN
+			return linuxerr.EAGAIN
 		}
 		t.Debugf("Discarding duplicate signal %d", sig)
 		if timer != nil {
@@ -484,7 +508,7 @@ func (tg *ThreadGroup) applySignalSideEffectsLocked(sig linux.Signal) {
 		// ignores tg.execing.
 		if !tg.exiting {
 			tg.exiting = true
-			tg.exitStatus = ExitStatus{Signo: int(linux.SIGKILL)}
+			tg.exitStatus = linux.WaitStatusTerminationSignal(linux.SIGKILL)
 		}
 		for t := tg.tasks.Front(); t != nil; t = t.Next() {
 			t.killLocked()
@@ -501,22 +525,20 @@ func (t *Task) canReceiveSignalLocked(sig linux.Signal) bool {
 	// Notify that the signal is queued.
 	t.signalQueue.Notify(waiter.EventMask(linux.MakeSignalSet(sig)))
 
-	// - Do not choose tasks that are blocking the signal.
-	if linux.SignalSetOf(sig)&t.signalMask != 0 {
+	//	- Do not choose tasks that are blocking the signal.
+	if linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0 {
 		return false
 	}
-	// - No need to check Task.exitState, as the exit path sets every bit in the
-	// signal mask when it transitions from TaskExitNone to TaskExitInitiated.
-	// - No special case for SIGKILL: SIGKILL already interrupted all tasks in the
-	// task group via applySignalSideEffects => killLocked.
-	// - Do not choose stopped tasks, which cannot handle signals.
+	//	- No need to check Task.exitState, as the exit path sets every bit in the
+	//		signal mask when it transitions from TaskExitNone to TaskExitInitiated.
+	//	- No special case for SIGKILL: SIGKILL already interrupted all tasks in the
+	//		task group via applySignalSideEffects => killLocked.
+	//	- Do not choose stopped tasks, which cannot handle signals.
 	if t.stop != nil {
 		return false
 	}
-	// - TODO(b/38173783): No special case for when t is also the sending task,
-	// because the identity of the sender is unknown.
-	// - Do not choose tasks that have already been interrupted, as they may be
-	// busy handling another signal.
+	//	- Do not choose tasks that have already been interrupted, as they may be
+	//		busy handling another signal.
 	if len(t.interruptChan) != 0 {
 		return false
 	}
@@ -551,27 +573,28 @@ func (t *Task) forceSignal(sig linux.Signal, unconditional bool) {
 }
 
 func (t *Task) forceSignalLocked(sig linux.Signal, unconditional bool) {
-	blocked := linux.SignalSetOf(sig)&t.signalMask != 0
+	blocked := linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0
 	act := t.tg.signalHandlers.actions[sig]
-	ignored := act.Handler == arch.SignalActIgnore
+	ignored := act.Handler == linux.SIG_IGN
 	if blocked || ignored || unconditional {
-		act.Handler = arch.SignalActDefault
+		act.Handler = linux.SIG_DFL
 		t.tg.signalHandlers.actions[sig] = act
 		if blocked {
-			t.setSignalMaskLocked(t.signalMask &^ linux.SignalSetOf(sig))
+			t.setSignalMaskLocked(linux.SignalSet(t.signalMask.RacyLoad()) &^ linux.SignalSetOf(sig))
 		}
 	}
 }
 
 // SignalMask returns a copy of t's signal mask.
 func (t *Task) SignalMask() linux.SignalSet {
-	return linux.SignalSet(atomic.LoadUint64((*uint64)(&t.signalMask)))
+	return linux.SignalSet(t.signalMask.Load())
 }
 
 // SetSignalMask sets t's signal mask.
 //
-// Preconditions: SetSignalMask can only be called by the task goroutine.
-// t.exitState < TaskExitZombie.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t.exitState < TaskExitZombie.
 func (t *Task) SetSignalMask(mask linux.SignalSet) {
 	// By precondition, t prevents t.tg from completing an execve and mutating
 	// t.tg.signalHandlers, so we can skip the TaskSet mutex.
@@ -582,8 +605,8 @@ func (t *Task) SetSignalMask(mask linux.SignalSet) {
 
 // Preconditions: The signal mutex must be locked.
 func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
-	oldMask := t.signalMask
-	atomic.StoreUint64((*uint64)(&t.signalMask), uint64(mask))
+	oldMask := linux.SignalSet(t.signalMask.RacyLoad())
+	t.signalMask.Store(uint64(mask))
 
 	// If the new mask blocks any signals that were not blocked by the old
 	// mask, and at least one such signal is pending in tg.pendingSignals, and
@@ -599,9 +622,6 @@ func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
 				return
 			}
 		})
-		// We have to re-issue the interrupt consumed by t.interrupted() since
-		// it might have been for a different reason.
-		t.interruptSelf()
 	}
 
 	// Conversely, if the new mask unblocks any signals that were blocked by
@@ -617,24 +637,54 @@ func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
 // SetSavedSignalMask sets the saved signal mask (see Task.savedSignalMask's
 // comment).
 //
-// Preconditions: SetSavedSignalMask can only be called by the task goroutine.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 	t.savedSignalMask = mask
 	t.haveSavedSignalMask = true
 }
 
 // SignalStack returns the task-private signal stack.
-func (t *Task) SignalStack() arch.SignalStack {
+//
+// By precondition, a full state has to be pulled.
+func (t *Task) SignalStack() linux.SignalStack {
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
-		alt.Flags |= arch.SignalStackFlagOnStack
+		alt.Flags |= linux.SS_ONSTACK
 	}
 	return alt
 }
 
+// SigaltStack implements the sigaltstack syscall.
+func (t *Task) SigaltStack(setaddr hostarch.Addr, oldaddr hostarch.Addr) (*SyscallControl, error) {
+	if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+		return CtrlDoExit, linuxerr.EFAULT
+	}
+
+	alt := t.SignalStack()
+	if oldaddr != 0 {
+		if _, err := alt.CopyOut(t, oldaddr); err != nil {
+			return nil, err
+		}
+	}
+	if setaddr != 0 {
+		if _, err := alt.CopyIn(t, setaddr); err != nil {
+			return nil, err
+		}
+		// The signal stack cannot be changed if the task is currently
+		// on the stack. This is enforced at the lowest level because
+		// these semantics apply to changing the signal stack via a
+		// ucontext during a signal handler.
+		if !t.SetSignalStack(alt) {
+			return nil, linuxerr.EPERM
+		}
+	}
+	return nil, nil
+}
+
 // onSignalStack returns true if the task is executing on the given signal stack.
-func (t *Task) onSignalStack(alt arch.SignalStack) bool {
-	sp := usermem.Addr(t.Arch().Stack())
+func (t *Task) onSignalStack(alt linux.SignalStack) bool {
+	sp := hostarch.Addr(t.Arch().Stack())
 	return alt.Contains(sp)
 }
 
@@ -643,30 +693,30 @@ func (t *Task) onSignalStack(alt arch.SignalStack) bool {
 // This value may not be changed if the task is currently executing on the
 // signal stack, i.e. if t.onSignalStack returns true. In this case, this
 // function will return false. Otherwise, true is returned.
-func (t *Task) SetSignalStack(alt arch.SignalStack) bool {
+func (t *Task) SetSignalStack(alt linux.SignalStack) bool {
 	// Check that we're not executing on the stack.
 	if t.onSignalStack(t.signalStack) {
 		return false
 	}
 
-	if alt.Flags&arch.SignalStackFlagDisable != 0 {
+	if alt.Flags&linux.SS_DISABLE != 0 {
 		// Don't record anything beyond the flags.
-		t.signalStack = arch.SignalStack{
-			Flags: arch.SignalStackFlagDisable,
+		t.signalStack = linux.SignalStack{
+			Flags: linux.SS_DISABLE,
 		}
 	} else {
 		// Mask out irrelevant parts: only disable matters.
-		alt.Flags &= arch.SignalStackFlagDisable
+		alt.Flags &= linux.SS_DISABLE
 		t.signalStack = alt
 	}
 	return true
 }
 
-// SetSignalAct atomically sets the thread group's signal action for signal sig
+// SetSigAction atomically sets the thread group's signal action for signal sig
 // to *actptr (if actptr is not nil) and returns the old signal action.
-func (tg *ThreadGroup) SetSignalAct(sig linux.Signal, actptr *arch.SignalAct) (arch.SignalAct, error) {
+func (tg *ThreadGroup) SetSigAction(sig linux.Signal, actptr *linux.SigAction) (linux.SigAction, error) {
 	if !sig.IsValid() {
-		return arch.SignalAct{}, syserror.EINVAL
+		return linux.SigAction{}, linuxerr.EINVAL
 	}
 
 	tg.pidns.owner.mu.RLock()
@@ -677,7 +727,7 @@ func (tg *ThreadGroup) SetSignalAct(sig linux.Signal, actptr *arch.SignalAct) (a
 	oldact := sh.actions[sig]
 	if actptr != nil {
 		if sig == linux.SIGKILL || sig == linux.SIGSTOP {
-			return oldact, syserror.EINVAL
+			return oldact, linuxerr.EINVAL
 		}
 
 		act := *actptr
@@ -700,48 +750,6 @@ func (tg *ThreadGroup) SetSignalAct(sig linux.Signal, actptr *arch.SignalAct) (a
 	return oldact, nil
 }
 
-// CopyOutSignalAct converts the given SignalAct into an architecture-specific
-// type and then copies it out to task memory.
-func (t *Task) CopyOutSignalAct(addr usermem.Addr, s *arch.SignalAct) error {
-	n := t.Arch().NewSignalAct()
-	n.SerializeFrom(s)
-	_, err := t.CopyOut(addr, n)
-	return err
-}
-
-// CopyInSignalAct copies an architecture-specific sigaction type from task
-// memory and then converts it into a SignalAct.
-func (t *Task) CopyInSignalAct(addr usermem.Addr) (arch.SignalAct, error) {
-	n := t.Arch().NewSignalAct()
-	var s arch.SignalAct
-	if _, err := t.CopyIn(addr, n); err != nil {
-		return s, err
-	}
-	n.DeserializeTo(&s)
-	return s, nil
-}
-
-// CopyOutSignalStack converts the given SignalStack into an
-// architecture-specific type and then copies it out to task memory.
-func (t *Task) CopyOutSignalStack(addr usermem.Addr, s *arch.SignalStack) error {
-	n := t.Arch().NewSignalStack()
-	n.SerializeFrom(s)
-	_, err := t.CopyOut(addr, n)
-	return err
-}
-
-// CopyInSignalStack copies an architecture-specific stack_t from task memory
-// and then converts it into a SignalStack.
-func (t *Task) CopyInSignalStack(addr usermem.Addr) (arch.SignalStack, error) {
-	n := t.Arch().NewSignalStack()
-	var s arch.SignalStack
-	if _, err := t.CopyIn(addr, n); err != nil {
-		return s, err
-	}
-	n.DeserializeTo(&s)
-	return s, nil
-}
-
 // groupStop is a TaskStop placed on tasks that have received a stop signal
 // (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU). (The term "group-stop" originates from
 // the ptrace man page.)
@@ -756,7 +764,7 @@ func (*groupStop) Killable() bool { return true }
 // previously-dequeued stop signal.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) initiateGroupStop(info *arch.SignalInfo) {
+func (t *Task) initiateGroupStop(info *linux.SignalInfo) {
 	t.tg.pidns.owner.mu.RLock()
 	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
@@ -891,13 +899,13 @@ func (t *Task) signalStop(target *Task, code int32, status int32) {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
 	act, ok := t.tg.signalHandlers.actions[linux.SIGCHLD]
-	if !ok || (act.Handler != arch.SignalActIgnore && act.Flags&arch.SignalFlagNoCldStop == 0) {
-		sigchld := &arch.SignalInfo{
+	if !ok || (act.Handler != linux.SIG_IGN && act.Flags&linux.SA_NOCLDSTOP == 0) {
+		sigchld := &linux.SignalInfo{
 			Signo: int32(linux.SIGCHLD),
 			Code:  code,
 		}
-		sigchld.SetPid(int32(t.tg.pidns.tids[target]))
-		sigchld.SetUid(int32(target.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+		sigchld.SetPID(int32(t.tg.pidns.tids[target]))
+		sigchld.SetUID(int32(target.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 		sigchld.SetStatus(status)
 		// TODO(b/72102453): Set utime, stime.
 		t.sendSignalLocked(sigchld, true /* group */)
@@ -910,10 +918,10 @@ func (t *Task) signalStop(target *Task, code int32, status int32) {
 type runInterrupt struct{}
 
 func (*runInterrupt) execute(t *Task) taskRunState {
-	// Interrupts are de-duplicated (if t is interrupted twice before
-	// t.interrupted() is called, t.interrupted() will only return true once),
-	// so early exits from this function must re-enter the runInterrupt state
-	// to check for more interrupt-signaled conditions.
+	// Interrupts are de-duplicated (t.unsetInterrupted() will undo the effect
+	// of all previous calls to t.interrupted() regardless of how many such
+	// calls there have been), so early exits from this function must re-enter
+	// the runInterrupt state to check for more interrupt-signaled conditions.
 
 	t.tg.signalHandlers.mu.Lock()
 
@@ -937,14 +945,14 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 			// notified its tracer accordingly. But it's consistent with
 			// Linux...
 			if intr {
-				tracer.signalStop(t.tg.leader, arch.CLD_STOPPED, int32(sig))
+				tracer.signalStop(t.tg.leader, linux.CLD_STOPPED, int32(sig))
 				if !notifyParent {
 					tracer.tg.eventQueue.Notify(EventGroupContinue | EventTraceeStop | EventChildGroupStop)
 				} else {
 					tracer.tg.eventQueue.Notify(EventGroupContinue | EventTraceeStop)
 				}
 			} else {
-				tracer.signalStop(t.tg.leader, arch.CLD_CONTINUED, int32(sig))
+				tracer.signalStop(t.tg.leader, linux.CLD_CONTINUED, int32(sig))
 				tracer.tg.eventQueue.Notify(EventGroupContinue)
 			}
 		}
@@ -956,10 +964,10 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 			// SIGCHLD is a standard signal, so the latter would always be
 			// dropped. Hence sending only the former is equivalent.
 			if intr {
-				t.tg.leader.parent.signalStop(t.tg.leader, arch.CLD_STOPPED, int32(sig))
+				t.tg.leader.parent.signalStop(t.tg.leader, linux.CLD_STOPPED, int32(sig))
 				t.tg.leader.parent.tg.eventQueue.Notify(EventGroupContinue | EventChildGroupStop)
 			} else {
-				t.tg.leader.parent.signalStop(t.tg.leader, arch.CLD_CONTINUED, int32(sig))
+				t.tg.leader.parent.signalStop(t.tg.leader, linux.CLD_CONTINUED, int32(sig))
 				t.tg.leader.parent.tg.eventQueue.Notify(EventGroupContinue)
 			}
 		}
@@ -1000,18 +1008,18 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 				// without requiring an extra PTRACE_GETSIGINFO call." -
 				// "Group-stop", ptrace(2)
 				t.ptraceCode = int32(sig) | linux.PTRACE_EVENT_STOP<<8
-				t.ptraceSiginfo = &arch.SignalInfo{
+				t.ptraceSiginfo = &linux.SignalInfo{
 					Signo: int32(sig),
 					Code:  t.ptraceCode,
 				}
-				t.ptraceSiginfo.SetPid(int32(t.tg.pidns.tids[t]))
-				t.ptraceSiginfo.SetUid(int32(t.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+				t.ptraceSiginfo.SetPID(int32(t.tg.pidns.tids[t]))
+				t.ptraceSiginfo.SetUID(int32(t.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 			} else {
 				t.ptraceCode = int32(sig)
 				t.ptraceSiginfo = nil
 			}
 			if t.beginPtraceStopLocked() {
-				tracer.signalStop(t, arch.CLD_STOPPED, int32(sig))
+				tracer.signalStop(t, linux.CLD_STOPPED, int32(sig))
 				// For consistency with Linux, if the parent and tracer are in the
 				// same thread group, deduplicate notification signals.
 				if notifyParent && tracer.tg == t.tg.leader.parent.tg {
@@ -1029,7 +1037,7 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 			t.tg.signalHandlers.mu.Unlock()
 		}
 		if notifyParent {
-			t.tg.leader.parent.signalStop(t.tg.leader, arch.CLD_STOPPED, int32(sig))
+			t.tg.leader.parent.signalStop(t.tg.leader, linux.CLD_STOPPED, int32(sig))
 			t.tg.leader.parent.tg.eventQueue.Notify(EventChildGroupStop)
 		}
 		t.tg.pidns.owner.mu.RUnlock()
@@ -1038,7 +1046,12 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 	}
 
 	// Are there signals pending?
-	if info := t.dequeueSignalLocked(t.signalMask); info != nil {
+	if info := t.dequeueSignalLocked(linux.SignalSet(t.signalMask.RacyLoad())); info != nil {
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+			return (*runExit)(nil)
+		}
+
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the
 			// signal mutex; initiateGroupStop will check for races with
@@ -1057,6 +1070,7 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 		return t.deliverSignal(info, act)
 	}
 
+	t.unsetInterrupted()
 	t.tg.signalHandlers.mu.Unlock()
 	return (*runApp)(nil)
 }
@@ -1080,7 +1094,7 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 	if sig != linux.Signal(info.Signo) {
 		info.Signo = int32(sig)
 		info.Errno = 0
-		info.Code = arch.SignalInfoUser
+		info.Code = linux.SI_USER
 		// pid isn't a valid field for all signal numbers, but Linux
 		// doesn't care (kernel/signal.c:ptrace_signal()).
 		//
@@ -1093,17 +1107,17 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 		if parent == nil {
 			// Tracer has detached and t was created by Kernel.CreateProcess().
 			// Pretend the parent is in an ancestor PID + user namespace.
-			info.SetPid(0)
-			info.SetUid(int32(auth.OverflowUID))
+			info.SetPID(0)
+			info.SetUID(int32(auth.OverflowUID))
 		} else {
-			info.SetPid(int32(t.tg.pidns.tids[parent]))
-			info.SetUid(int32(parent.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+			info.SetPID(int32(t.tg.pidns.tids[parent]))
+			info.SetUID(int32(parent.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 		}
 	}
 	t.tg.signalHandlers.mu.Lock()
 	t.tg.pidns.owner.mu.Unlock()
 	// If the signal is masked, re-queue it.
-	if linux.SignalSetOf(sig)&t.signalMask != 0 {
+	if linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0 {
 		t.sendSignalLocked(info, false /* group */)
 		t.tg.signalHandlers.mu.Unlock()
 		return (*runInterrupt)(nil)
@@ -1114,9 +1128,9 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 }
 
 // SignalRegister registers a waiter for pending signals.
-func (t *Task) SignalRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (t *Task) SignalRegister(e *waiter.Entry) {
 	t.tg.signalHandlers.mu.Lock()
-	t.signalQueue.EventRegister(e, mask)
+	t.signalQueue.EventRegister(e)
 	t.tg.signalHandlers.mu.Unlock()
 }
 

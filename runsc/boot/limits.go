@@ -16,36 +16,16 @@ package boot
 
 import (
 	"fmt"
-	"syscall"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-// Mapping from linux resource names to limits.LimitType.
-var fromLinuxResource = map[string]limits.LimitType{
-	"RLIMIT_AS":         limits.AS,
-	"RLIMIT_CORE":       limits.Core,
-	"RLIMIT_CPU":        limits.CPU,
-	"RLIMIT_DATA":       limits.Data,
-	"RLIMIT_FSIZE":      limits.FileSize,
-	"RLIMIT_LOCKS":      limits.Locks,
-	"RLIMIT_MEMLOCK":    limits.MemoryLocked,
-	"RLIMIT_MSGQUEUE":   limits.MessageQueueBytes,
-	"RLIMIT_NICE":       limits.Nice,
-	"RLIMIT_NOFILE":     limits.NumberOfFiles,
-	"RLIMIT_NPROC":      limits.ProcessCount,
-	"RLIMIT_RSS":        limits.Rss,
-	"RLIMIT_RTPRIO":     limits.RealTimePriority,
-	"RLIMIT_RTTIME":     limits.Rttime,
-	"RLIMIT_SIGPENDING": limits.SignalsPending,
-	"RLIMIT_STACK":      limits.Stack,
-}
-
 func findName(lt limits.LimitType) string {
-	for k, v := range fromLinuxResource {
+	for k, v := range limits.FromLinuxResourceName {
 		if v == lt {
 			return k
 		}
@@ -104,9 +84,9 @@ func (d *defs) initDefaults() error {
 
 	// Read host limits that directly affect the sandbox and adjust the defaults
 	// based on them.
-	for _, res := range []int{syscall.RLIMIT_FSIZE, syscall.RLIMIT_NOFILE} {
-		var hl syscall.Rlimit
-		if err := syscall.Getrlimit(res, &hl); err != nil {
+	for _, res := range []int{unix.RLIMIT_FSIZE, unix.RLIMIT_NOFILE} {
+		var hl unix.Rlimit
+		if err := unix.Getrlimit(res, &hl); err != nil {
 			return err
 		}
 
@@ -133,15 +113,19 @@ func (d *defs) initDefaults() error {
 	return nil
 }
 
-func createLimitSet(spec *specs.Spec) (*limits.LimitSet, error) {
+func createLimitSet(spec *specs.Spec, enableTPUProxy bool) (*limits.LimitSet, error) {
 	ls, err := defaults.get()
 	if err != nil {
 		return nil, err
 	}
-
+	// Set RLIMIT_MEMLOCK's default value to unlimited when TPUProxy is enabled.
+	// The value will be overwritten if the exact rlimit is provided.
+	if enableTPUProxy {
+		ls.SetUnchecked(limits.MemoryLocked, limits.Limit{Cur: limits.Infinity, Max: limits.Infinity})
+	}
 	// Then apply overwrites on top of defaults.
 	for _, rl := range spec.Process.Rlimits {
-		lt, ok := fromLinuxResource[rl.Type]
+		lt, ok := limits.FromLinuxResourceName[rl.Type]
 		if !ok {
 			return nil, fmt.Errorf("unknown resource %q", rl.Type)
 		}

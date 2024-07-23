@@ -3,55 +3,97 @@
 package loader
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *VDSO) beforeSave() {}
-func (x *VDSO) save(m state.Map) {
-	x.beforeSave()
-	var phdrs []elfProgHeader = x.savePhdrs()
-	m.SaveValue("phdrs", phdrs)
-	m.Save("ParamPage", &x.ParamPage)
-	m.Save("vdso", &x.vdso)
-	m.Save("os", &x.os)
-	m.Save("arch", &x.arch)
+func (v *VDSO) StateTypeName() string {
+	return "pkg/sentry/loader.VDSO"
 }
 
-func (x *VDSO) afterLoad() {}
-func (x *VDSO) load(m state.Map) {
-	m.Load("ParamPage", &x.ParamPage)
-	m.Load("vdso", &x.vdso)
-	m.Load("os", &x.os)
-	m.Load("arch", &x.arch)
-	m.LoadValue("phdrs", new([]elfProgHeader), func(y interface{}) { x.loadPhdrs(y.([]elfProgHeader)) })
+func (v *VDSO) StateFields() []string {
+	return []string{
+		"ParamPage",
+		"vdso",
+		"os",
+		"arch",
+		"phdrs",
+	}
 }
 
-func (x *elfProgHeader) beforeSave() {}
-func (x *elfProgHeader) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Type", &x.Type)
-	m.Save("Flags", &x.Flags)
-	m.Save("Off", &x.Off)
-	m.Save("Vaddr", &x.Vaddr)
-	m.Save("Paddr", &x.Paddr)
-	m.Save("Filesz", &x.Filesz)
-	m.Save("Memsz", &x.Memsz)
-	m.Save("Align", &x.Align)
+func (v *VDSO) beforeSave() {}
+
+// +checklocksignore
+func (v *VDSO) StateSave(stateSinkObject state.Sink) {
+	v.beforeSave()
+	var phdrsValue []elfProgHeader
+	phdrsValue = v.savePhdrs()
+	stateSinkObject.SaveValue(4, phdrsValue)
+	stateSinkObject.Save(0, &v.ParamPage)
+	stateSinkObject.Save(1, &v.vdso)
+	stateSinkObject.Save(2, &v.os)
+	stateSinkObject.Save(3, &v.arch)
 }
 
-func (x *elfProgHeader) afterLoad() {}
-func (x *elfProgHeader) load(m state.Map) {
-	m.Load("Type", &x.Type)
-	m.Load("Flags", &x.Flags)
-	m.Load("Off", &x.Off)
-	m.Load("Vaddr", &x.Vaddr)
-	m.Load("Paddr", &x.Paddr)
-	m.Load("Filesz", &x.Filesz)
-	m.Load("Memsz", &x.Memsz)
-	m.Load("Align", &x.Align)
+func (v *VDSO) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (v *VDSO) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &v.ParamPage)
+	stateSourceObject.Load(1, &v.vdso)
+	stateSourceObject.Load(2, &v.os)
+	stateSourceObject.Load(3, &v.arch)
+	stateSourceObject.LoadValue(4, new([]elfProgHeader), func(y any) { v.loadPhdrs(ctx, y.([]elfProgHeader)) })
+}
+
+func (e *elfProgHeader) StateTypeName() string {
+	return "pkg/sentry/loader.elfProgHeader"
+}
+
+func (e *elfProgHeader) StateFields() []string {
+	return []string{
+		"Type",
+		"Flags",
+		"Off",
+		"Vaddr",
+		"Paddr",
+		"Filesz",
+		"Memsz",
+		"Align",
+	}
+}
+
+func (e *elfProgHeader) beforeSave() {}
+
+// +checklocksignore
+func (e *elfProgHeader) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.Type)
+	stateSinkObject.Save(1, &e.Flags)
+	stateSinkObject.Save(2, &e.Off)
+	stateSinkObject.Save(3, &e.Vaddr)
+	stateSinkObject.Save(4, &e.Paddr)
+	stateSinkObject.Save(5, &e.Filesz)
+	stateSinkObject.Save(6, &e.Memsz)
+	stateSinkObject.Save(7, &e.Align)
+}
+
+func (e *elfProgHeader) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *elfProgHeader) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.Type)
+	stateSourceObject.Load(1, &e.Flags)
+	stateSourceObject.Load(2, &e.Off)
+	stateSourceObject.Load(3, &e.Vaddr)
+	stateSourceObject.Load(4, &e.Paddr)
+	stateSourceObject.Load(5, &e.Filesz)
+	stateSourceObject.Load(6, &e.Memsz)
+	stateSourceObject.Load(7, &e.Align)
 }
 
 func init() {
-	state.Register("pkg/sentry/loader.VDSO", (*VDSO)(nil), state.Fns{Save: (*VDSO).save, Load: (*VDSO).load})
-	state.Register("pkg/sentry/loader.elfProgHeader", (*elfProgHeader)(nil), state.Fns{Save: (*elfProgHeader).save, Load: (*elfProgHeader).load})
+	state.Register((*VDSO)(nil))
+	state.Register((*elfProgHeader)(nil))
 }

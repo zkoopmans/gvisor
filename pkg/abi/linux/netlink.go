@@ -40,6 +40,8 @@ const (
 )
 
 // SockAddrNetlink is struct sockaddr_nl, from uapi/linux/netlink.h.
+//
+// +marshal
 type SockAddrNetlink struct {
 	Family uint16
 	_      uint16
@@ -51,6 +53,8 @@ type SockAddrNetlink struct {
 const SockAddrNetlinkSize = 12
 
 // NetlinkMessageHeader is struct nlmsghdr, from uapi/linux/netlink.h.
+//
+// +marshal
 type NetlinkMessageHeader struct {
 	Length uint32
 	Type   uint16
@@ -97,6 +101,8 @@ const NLMSG_ALIGNTO = 4
 // NetlinkAttrHeader is the header of a netlink attribute, followed by payload.
 //
 // This is struct nlattr, from uapi/linux/netlink.h.
+//
+// +marshal
 type NetlinkAttrHeader struct {
 	Length uint16
 	Type   uint16
@@ -124,6 +130,8 @@ const (
 )
 
 // NetlinkErrorMessage is struct nlmsgerr, from uapi/linux/netlink.h.
+//
+// +marshal
 type NetlinkErrorMessage struct {
 	Error  int32
 	Header NetlinkMessageHeader

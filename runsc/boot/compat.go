@@ -17,13 +17,12 @@ package boot
 import (
 	"fmt"
 	"os"
-	"syscall"
 
-	"github.com/golang/protobuf/proto"
+	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/log"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
-	ucspb "gvisor.dev/gvisor/pkg/sentry/kernel/uncaught_signal_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	spb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -53,7 +52,7 @@ type compatEmitter struct {
 func newCompatEmitter(logFD int) (*compatEmitter, error) {
 	nameMap, ok := getSyscallNameMap()
 	if !ok {
-		return nil, fmt.Errorf("Linux syscall table not found")
+		return nil, fmt.Errorf("syscall table not found")
 	}
 
 	c := &compatEmitter{
@@ -65,7 +64,7 @@ func newCompatEmitter(logFD int) (*compatEmitter, error) {
 
 	if logFD > 0 {
 		f := os.NewFile(uintptr(logFD), "user log file")
-		target := &log.MultiEmitter{c.sink, &log.K8sJSONEmitter{log.Writer{Next: f}}}
+		target := &log.MultiEmitter{c.sink, log.K8sJSONEmitter{&log.Writer{Next: f}}}
 		c.sink = &log.BasicLogger{Level: log.Info, Emitter: target}
 	}
 	return c, nil
@@ -76,8 +75,6 @@ func (c *compatEmitter) Emit(msg proto.Message) (bool, error) {
 	switch m := msg.(type) {
 	case *spb.UnimplementedSyscall:
 		c.emitUnimplementedSyscall(m)
-	case *ucspb.UncaughtSignal:
-		c.emitUncaughtSignal(m)
 	}
 
 	return false, nil
@@ -93,19 +90,19 @@ func (c *compatEmitter) emitUnimplementedSyscall(us *spb.UnimplementedSyscall) {
 	tr := c.trackers[sysnr]
 	if tr == nil {
 		switch sysnr {
-		case syscall.SYS_PRCTL:
+		case unix.SYS_PRCTL:
 			// args: cmd, ...
 			tr = newArgsTracker(0)
 
-		case syscall.SYS_IOCTL, syscall.SYS_EPOLL_CTL, syscall.SYS_SHMCTL, syscall.SYS_FUTEX, syscall.SYS_FALLOCATE:
+		case unix.SYS_IOCTL, unix.SYS_EPOLL_CTL, unix.SYS_SHMCTL, unix.SYS_FUTEX, unix.SYS_FALLOCATE:
 			// args: fd/addr, cmd, ...
 			tr = newArgsTracker(1)
 
-		case syscall.SYS_GETSOCKOPT, syscall.SYS_SETSOCKOPT:
+		case unix.SYS_GETSOCKOPT, unix.SYS_SETSOCKOPT:
 			// args: fd, level, name, ...
 			tr = newArgsTracker(1, 2)
 
-		case syscall.SYS_SEMCTL:
+		case unix.SYS_SEMCTL:
 			// args: semid, semnum, cmd, ...
 			tr = newArgsTracker(2)
 
@@ -119,16 +116,15 @@ func (c *compatEmitter) emitUnimplementedSyscall(us *spb.UnimplementedSyscall) {
 	}
 
 	if tr.shouldReport(regs) {
-		c.sink.Infof("Unsupported syscall: %s, regs: %+v", c.nameMap.Name(uintptr(sysnr)), regs)
+		name := c.nameMap.Name(uintptr(sysnr))
+		c.sink.Infof("Unsupported syscall %s(%#x,%#x,%#x,%#x,%#x,%#x). It is "+
+			"likely that you can safely ignore this message and that this is not "+
+			"the cause of any error. Please, refer to %s/%s for more information.",
+			name, argVal(0, regs), argVal(1, regs), argVal(2, regs), argVal(3, regs),
+			argVal(4, regs), argVal(5, regs), syscallLink, name)
+
 		tr.onReported(regs)
 	}
-}
-
-func (c *compatEmitter) emitUncaughtSignal(msg *ucspb.UncaughtSignal) {
-	sig := syscall.Signal(msg.SignalNumber)
-	c.sink.Infof(
-		"Uncaught signal: %q (%d), PID: %d, TID: %d, fault addr: %#x",
-		sig, msg.SignalNumber, msg.Pid, msg.Tid, msg.FaultAddr)
 }
 
 // Close implements eventchannel.Emitter.

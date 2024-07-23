@@ -16,19 +16,20 @@ package safemem
 
 import (
 	"fmt"
-	"reflect"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/safecopy"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // A Block is a range of contiguous bytes, similar to []byte but with the
 // following differences:
 //
-// - The memory represented by a Block may require the use of safecopy to
-// access.
+//   - The memory represented by a Block may require the use of safecopy to
+//     access.
 //
-// - Block does not carry a capacity and cannot be expanded.
+//   - Block does not carry a capacity and cannot be expanded.
 //
 // Blocks are immutable and may be copied by value. The zero value of Block
 // represents an empty range, analogous to a nil []byte.
@@ -68,29 +69,29 @@ func blockFromSlice(slice []byte, needSafecopy bool) Block {
 	}
 }
 
-// BlockFromSafePointer returns a Block equivalent to [ptr, ptr+len), which is
+// BlockFromSafePointer returns a Block equivalent to [ptr, ptr+length), which is
 // safe to access without safecopy.
 //
-// Preconditions: ptr+len does not overflow.
-func BlockFromSafePointer(ptr unsafe.Pointer, len int) Block {
-	return blockFromPointer(ptr, len, false)
+// Preconditions: ptr+length does not overflow.
+func BlockFromSafePointer(ptr unsafe.Pointer, length int) Block {
+	return blockFromPointer(ptr, length, false)
 }
 
 // BlockFromUnsafePointer returns a Block equivalent to [ptr, ptr+len), which
 // is not safe to access without safecopy.
 //
 // Preconditions: ptr+len does not overflow.
-func BlockFromUnsafePointer(ptr unsafe.Pointer, len int) Block {
-	return blockFromPointer(ptr, len, true)
+func BlockFromUnsafePointer(ptr unsafe.Pointer, length int) Block {
+	return blockFromPointer(ptr, length, true)
 }
 
-func blockFromPointer(ptr unsafe.Pointer, len int, needSafecopy bool) Block {
-	if uptr := uintptr(ptr); uptr+uintptr(len) < uptr {
-		panic(fmt.Sprintf("ptr %#x + len %#x overflows", ptr, len))
+func blockFromPointer(ptr unsafe.Pointer, length int, needSafecopy bool) Block {
+	if uptr := uintptr(ptr); uptr+uintptr(length) < uptr {
+		panic(fmt.Sprintf("ptr %#x + len %#x overflows", uptr, length))
 	}
 	return Block{
 		start:        ptr,
-		length:       len,
+		length:       length,
 		needSafecopy: needSafecopy,
 	}
 }
@@ -148,12 +149,7 @@ func (b Block) TakeFirst64(n uint64) Block {
 
 // ToSlice returns a []byte equivalent to b.
 func (b Block) ToSlice() []byte {
-	var bs []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
-	hdr.Data = uintptr(b.start)
-	hdr.Len = b.length
-	hdr.Cap = b.length
-	return bs
+	return gohacks.Slice((*byte)(b.start), b.length)
 }
 
 // Addr returns b's start address as a uintptr. It returns uintptr instead of
@@ -224,8 +220,17 @@ func Copy(dst, src Block) (int, error) {
 func Zero(dst Block) (int, error) {
 	if !dst.needSafecopy {
 		bs := dst.ToSlice()
-		for i := range bs {
-			bs[i] = 0
+		if !sync.RaceEnabled {
+			clear(bs)
+		} else {
+			bsLen := len(bs)
+			if bsLen == 0 {
+				return 0, nil
+			}
+			bs[0] = 0
+			for i := 1; i < bsLen; i *= 2 {
+				copy(bs[i:], bs[:i])
+			}
 		}
 		return len(bs), nil
 	}

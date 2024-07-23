@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "funcdata.h"
 #include "textflag.h"
 
 // Documentation is available in parameters.go.
 //
 // func muldiv64(value, multiplier, divisor uint64) (uint64, bool)
 TEXT ·muldiv64(SB),NOSPLIT,$40-33
+    GO_ARGS
+    NO_LOCAL_POINTERS
     MOVD    value+0(FP), R0
     MOVD    multiplier+8(FP), R1
     MOVD    divisor+16(FP), R2
@@ -33,12 +36,12 @@ TEXT ·muldiv64(SB),NOSPLIT,$40-33
     MOVD    R2, 24(RSP)
     CALL    ·divWW(SB)
     MOVD    32(RSP), R0
-    MOVD    R0, result+24(FP)
+    MOVD    R0, ret+24(FP)
     MOVD    $1, R0
-    MOVB    R0, ok+32(FP)
+    MOVB    R0, ret1+32(FP)
     RET
 
 overflow:
-    MOVD    ZR, result+24(FP)
-    MOVB    ZR, ok+32(FP)
+    MOVD    ZR, ret+24(FP)
+    MOVB    ZR, ret1+32(FP)
     RET

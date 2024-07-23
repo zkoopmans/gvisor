@@ -12,71 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
 // +build linux
 
 package flipcall
 
 import (
-	"encoding/json"
 	"fmt"
 	"runtime"
-	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
-func (ep *Endpoint) futexConnect(req *ctrlHandshakeRequest) (ctrlHandshakeResponse, error) {
-	var resp ctrlHandshakeResponse
-
-	// Write the handshake request.
-	w := ep.NewWriter()
-	if err := json.NewEncoder(w).Encode(req); err != nil {
-		return resp, fmt.Errorf("error writing handshake request: %v", err)
+func (ep *Endpoint) futexSetPeerActive() error {
+	if ep.connState().CompareAndSwap(ep.activeState, ep.inactiveState) {
+		return nil
 	}
-	*ep.dataLen() = w.Len()
-
-	// Exchange control with the server.
-	if err := ep.futexSwitchToPeer(); err != nil {
-		return resp, err
+	switch cs := ep.connState().Load(); cs {
+	case csShutdown:
+		return ShutdownError{}
+	default:
+		return fmt.Errorf("unexpected connection state before FUTEX_WAKE: %v", cs)
 	}
-	if err := ep.futexSwitchFromPeer(); err != nil {
-		return resp, err
-	}
-
-	// Read the handshake response.
-	respLen := atomic.LoadUint32(ep.dataLen())
-	if respLen > ep.dataCap {
-		return resp, fmt.Errorf("invalid handshake response length %d (maximum %d)", respLen, ep.dataCap)
-	}
-	if err := json.NewDecoder(ep.NewReader(respLen)).Decode(&resp); err != nil {
-		return resp, fmt.Errorf("error reading handshake response: %v", err)
-	}
-
-	return resp, nil
 }
 
-func (ep *Endpoint) futexSwitchToPeer() error {
-	// Update connection state to indicate that the peer should be active.
-	if !atomic.CompareAndSwapUint32(ep.connState(), ep.activeState, ep.inactiveState) {
-		switch cs := atomic.LoadUint32(ep.connState()); cs {
-		case csShutdown:
-			return ShutdownError{}
-		default:
-			return fmt.Errorf("unexpected connection state before FUTEX_WAKE: %v", cs)
-		}
-	}
-
-	// Wake the peer's Endpoint.futexSwitchFromPeer().
+func (ep *Endpoint) futexWakePeer() error {
 	if err := ep.futexWakeConnState(1); err != nil {
 		return fmt.Errorf("failed to FUTEX_WAKE peer Endpoint: %v", err)
 	}
 	return nil
 }
 
-func (ep *Endpoint) futexSwitchFromPeer() error {
+func (ep *Endpoint) futexWaitUntilActive() error {
 	for {
-		switch cs := atomic.LoadUint32(ep.connState()); cs {
+		switch cs := ep.connState().Load(); cs {
 		case ep.activeState:
 			return nil
 		case ep.inactiveState:
@@ -96,22 +66,22 @@ func (ep *Endpoint) futexSwitchFromPeer() error {
 }
 
 func (ep *Endpoint) futexWakeConnState(numThreads int32) error {
-	if _, _, e := syscall.RawSyscall(syscall.SYS_FUTEX, ep.packet, linux.FUTEX_WAKE, uintptr(numThreads)); e != 0 {
+	if _, _, e := unix.RawSyscall(unix.SYS_FUTEX, ep.packet, linux.FUTEX_WAKE, uintptr(numThreads)); e != 0 {
 		return e
 	}
 	return nil
 }
 
 func (ep *Endpoint) futexWaitConnState(curState uint32) error {
-	_, _, e := syscall.Syscall6(syscall.SYS_FUTEX, ep.packet, linux.FUTEX_WAIT, uintptr(curState), 0, 0, 0)
-	if e != 0 && e != syscall.EAGAIN && e != syscall.EINTR {
+	_, _, e := unix.Syscall6(unix.SYS_FUTEX, ep.packet, linux.FUTEX_WAIT, uintptr(curState), 0, 0, 0)
+	if e != 0 && e != unix.EAGAIN && e != unix.EINTR {
 		return e
 	}
 	return nil
 }
 
 func yieldThread() {
-	syscall.Syscall(syscall.SYS_SCHED_YIELD, 0, 0, 0)
+	unix.Syscall(unix.SYS_SCHED_YIELD, 0, 0, 0)
 	// The thread we're trying to yield to may be waiting for a Go runtime P.
 	// runtime.Gosched() will hand off ours if necessary.
 	runtime.Gosched()

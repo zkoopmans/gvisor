@@ -22,9 +22,10 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
-	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Arch describes an architecture.
@@ -49,20 +50,22 @@ func (a Arch) String() string {
 	}
 }
 
-// FloatingPointData is a generic type, and will always be passed as a pointer.
-// We rely on the individual arch implementations to meet all the necessary
-// requirements. For example, on x86 the region must be 16-byte aligned and 512
-// bytes in size.
-type FloatingPointData byte
-
-// Context provides architecture-dependent information for a specific thread.
+// contextInterface provides architecture-dependent information for a thread.
+// This is currently not referenced, because there exists only one concrete
+// implementation of this interface (*Context64), which we reference directly
+// wherever this interface could otherwise be used in order to avoid the
+// overhead involved in calling functions on interfaces in Go.
+// This interface is still useful in order to see the entire
+// architecture-dependent call surface it must support, as this is difficult
+// to follow across the rest of this module due to the conditional compilation
+// of the files that make it up.
 //
 // NOTE(b/34169503): Currently we use uintptr here to refer to a generic native
 // register value. While this will work for the foreseeable future, it isn't
 // strictly correct. We may want to create some abstraction that makes this
 // more clear or enables us to store values of arbitrary widths. This is
 // particularly true for RegisterMap().
-type Context interface {
+type contextInterface interface {
 	// Arch returns the architecture for this Context.
 	Arch() Arch
 
@@ -72,21 +75,24 @@ type Context interface {
 	// with return values of varying sizes (for example ARCH_GETFS). This
 	// is a simple utility function to convert to the native size in these
 	// cases, and then we can CopyOut.
-	Native(val uintptr) interface{}
+	Native(val uintptr) marshal.Marshallable
 
 	// Value converts a native type back to a generic value.
 	// Once a value has been converted to native via the above call -- it
 	// can be converted back here.
-	Value(val interface{}) uintptr
+	Value(val marshal.Marshallable) uintptr
 
 	// Width returns the number of bytes for a native value.
 	Width() uint
 
 	// Fork creates a clone of the context.
-	Fork() Context
+	Fork() *Context64
 
 	// SyscallNo returns the syscall number.
 	SyscallNo() uintptr
+
+	// SyscallSaveOrig save original register value.
+	SyscallSaveOrig()
 
 	// SyscallArgs returns the syscall arguments in an array.
 	SyscallArgs() SyscallArguments
@@ -135,21 +141,13 @@ type Context interface {
 	// RegisterMap returns a map of all registers.
 	RegisterMap() (map[string]uintptr, error)
 
-	// NewSignalAct returns a new object that is equivalent to struct sigaction
-	// in the guest architecture.
-	NewSignalAct() NativeSignalAct
-
-	// NewSignalStack returns a new object that is equivalent to stack_t in the
-	// guest architecture.
-	NewSignalStack() NativeSignalStack
-
 	// SignalSetup modifies the context in preparation for handling the
 	// given signal.
 	//
 	// st is the stack where the signal handler frame should be
 	// constructed.
 	//
-	// act is the SignalAct that specifies how this signal is being
+	// act is the SigAction that specifies how this signal is being
 	// handled.
 	//
 	// info is the SignalInfo of the signal being delivered.
@@ -158,7 +156,9 @@ type Context interface {
 	// stack is not going to be used).
 	//
 	// sigset is the signal mask before entering the signal handler.
-	SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt *SignalStack, sigset linux.SignalSet) error
+	//
+	// featureSet is the application CPU feature set.
+	SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error
 
 	// SignalRestore restores context after returning from a signal
 	// handler.
@@ -167,11 +167,11 @@ type Context interface {
 	//
 	// rt is true if SignalRestore is being entered from rt_sigreturn and
 	// false if SignalRestore is being entered from sigreturn.
+	//
+	// featureSet is the application CPU feature set.
+	//
 	// SignalRestore returns the thread's new signal mask.
-	SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalStack, error)
-
-	// CPUIDEmulate emulates a CPUID instruction according to current register state.
-	CPUIDEmulate(l log.Logger)
+	SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSet) (linux.SignalSet, linux.SignalStack, error)
 
 	// SingleStep returns true if single stepping is enabled.
 	SingleStep() bool
@@ -183,26 +183,23 @@ type Context interface {
 	ClearSingleStep()
 
 	// FloatingPointData will be passed to underlying save routines.
-	FloatingPointData() *FloatingPointData
+	FloatingPointData() *fpu.State
 
 	// NewMmapLayout returns a layout for a new MM, where MinAddr for the
 	// returned layout must be no lower than min, and MaxAddr for the returned
 	// layout must be no higher than max. Repeated calls to NewMmapLayout may
 	// return different layouts.
-	NewMmapLayout(min, max usermem.Addr, limits *limits.LimitSet) (MmapLayout, error)
+	NewMmapLayout(min, max hostarch.Addr, limits *limits.LimitSet) (MmapLayout, error)
 
 	// PIELoadAddress returns a preferred load address for a
 	// position-independent executable within l.
-	PIELoadAddress(l MmapLayout) usermem.Addr
-
-	// FeatureSet returns the FeatureSet in use in this context.
-	FeatureSet() *cpuid.FeatureSet
+	PIELoadAddress(l MmapLayout) hostarch.Addr
 
 	// Hack around our package dependences being too broken to support the
 	// equivalent of arch_ptrace():
 
 	// PtracePeekUser implements ptrace(PTRACE_PEEKUSR).
-	PtracePeekUser(addr uintptr) (interface{}, error)
+	PtracePeekUser(addr uintptr) (marshal.Marshallable, error)
 
 	// PtracePokeUser implements ptrace(PTRACE_POKEUSR).
 	PtracePokeUser(addr, data uintptr) error
@@ -217,27 +214,17 @@ type Context interface {
 	// number of bytes read.
 	PtraceSetRegs(src io.Reader) (int, error)
 
-	// PtraceGetFPRegs implements ptrace(PTRACE_GETFPREGS) by writing the
-	// floating-point registers represented by this Context to addr in dst and
-	// returning the number of bytes written.
-	PtraceGetFPRegs(dst io.Writer) (int, error)
-
-	// PtraceSetFPRegs implements ptrace(PTRACE_SETFPREGS) by reading
-	// floating-point registers from src into this Context and returning the
-	// number of bytes read.
-	PtraceSetFPRegs(src io.Reader) (int, error)
-
 	// PtraceGetRegSet implements ptrace(PTRACE_GETREGSET) by writing the
 	// register set given by architecture-defined value regset from this
 	// Context to dst and returning the number of bytes written, which must be
 	// less than or equal to maxlen.
-	PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int) (int, error)
+	PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int, fs cpuid.FeatureSet) (int, error)
 
 	// PtraceSetRegSet implements ptrace(PTRACE_SETREGSET) by reading the
 	// register set given by architecture-defined value regset from src and
 	// returning the number of bytes read, which must be less than or equal to
 	// maxlen.
-	PtraceSetRegSet(regset uintptr, src io.Reader, maxlen int) (int, error)
+	PtraceSetRegSet(regset uintptr, src io.Reader, maxlen int, fs cpuid.FeatureSet) (int, error)
 
 	// FullRestore returns 'true' if all CPU registers must be restored
 	// when switching to the untrusted application. Typically a task enters
@@ -248,6 +235,9 @@ type Context interface {
 	// must be disabled and all registers restored.
 	FullRestore() bool
 }
+
+// Compile-time assertion that Context64 implements contextInterface.
+var _ = (contextInterface)((*Context64)(nil))
 
 // MmapDirection is a search direction for mmaps.
 type MmapDirection int
@@ -268,18 +258,18 @@ const (
 // +stateify savable
 type MmapLayout struct {
 	// MinAddr is the lowest mappable address.
-	MinAddr usermem.Addr
+	MinAddr hostarch.Addr
 
 	// MaxAddr is the highest mappable address.
-	MaxAddr usermem.Addr
+	MaxAddr hostarch.Addr
 
 	// BottomUpBase is the lowest address that may be returned for a
 	// MmapBottomUp mmap.
-	BottomUpBase usermem.Addr
+	BottomUpBase hostarch.Addr
 
 	// TopDownBase is the highest address that may be returned for a
 	// MmapTopDown mmap.
-	TopDownBase usermem.Addr
+	TopDownBase hostarch.Addr
 
 	// DefaultDirection is the direction for most non-fixed mmaps in this
 	// layout.
@@ -327,9 +317,9 @@ type SyscallArgument struct {
 // SyscallArguments represents the set of arguments passed to a syscall.
 type SyscallArguments [6]SyscallArgument
 
-// Pointer returns the usermem.Addr representation of a pointer argument.
-func (a SyscallArgument) Pointer() usermem.Addr {
-	return usermem.Addr(a.Value)
+// Pointer returns the hostarch.Addr representation of a pointer argument.
+func (a SyscallArgument) Pointer() hostarch.Addr {
+	return hostarch.Addr(a.Value)
 }
 
 // Int returns the int32 representation of a 32-bit signed integer argument.

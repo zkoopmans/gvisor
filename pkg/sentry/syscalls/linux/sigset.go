@@ -16,52 +16,52 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // copyInSigSet copies in a sigset_t, checks its size, and ensures that KILL and
 // STOP are clear.
-func copyInSigSet(t *kernel.Task, sigSetAddr usermem.Addr, size uint) (linux.SignalSet, error) {
+func copyInSigSet(t *kernel.Task, sigSetAddr hostarch.Addr, size uint) (linux.SignalSet, error) {
 	if size != linux.SignalSetSize {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	b := t.CopyScratchBuffer(8)
 	if _, err := t.CopyInBytes(sigSetAddr, b); err != nil {
 		return 0, err
 	}
-	mask := usermem.ByteOrder.Uint64(b[:])
+	mask := hostarch.ByteOrder.Uint64(b[:])
 	return linux.SignalSet(mask) &^ kernel.UnblockableSignals, nil
 }
 
 // copyOutSigSet copies out a sigset_t.
-func copyOutSigSet(t *kernel.Task, sigSetAddr usermem.Addr, mask linux.SignalSet) error {
+func copyOutSigSet(t *kernel.Task, sigSetAddr hostarch.Addr, mask linux.SignalSet) error {
 	b := t.CopyScratchBuffer(8)
-	usermem.ByteOrder.PutUint64(b, uint64(mask))
+	hostarch.ByteOrder.PutUint64(b, uint64(mask))
 	_, err := t.CopyOutBytes(sigSetAddr, b)
 	return err
 }
 
 // copyInSigSetWithSize copies in a structure as below
 //
-//   struct {
-//       sigset_t* sigset_addr;
-//       size_t sizeof_sigset;
-//   };
+//	struct {
+//	    sigset_t* sigset_addr;
+//	    size_t sizeof_sigset;
+//	};
 //
 // and returns sigset_addr and size.
-func copyInSigSetWithSize(t *kernel.Task, addr usermem.Addr) (usermem.Addr, uint, error) {
+func copyInSigSetWithSize(t *kernel.Task, addr hostarch.Addr) (hostarch.Addr, uint, error) {
 	switch t.Arch().Width() {
 	case 8:
 		in := t.CopyScratchBuffer(16)
 		if _, err := t.CopyInBytes(addr, in); err != nil {
 			return 0, 0, err
 		}
-		maskAddr := usermem.Addr(usermem.ByteOrder.Uint64(in[0:]))
-		maskSize := uint(usermem.ByteOrder.Uint64(in[8:]))
+		maskAddr := hostarch.Addr(hostarch.ByteOrder.Uint64(in[0:]))
+		maskSize := uint(hostarch.ByteOrder.Uint64(in[8:]))
 		return maskAddr, maskSize, nil
 	default:
-		return 0, 0, syserror.ENOSYS
+		return 0, 0, linuxerr.ENOSYS
 	}
 }

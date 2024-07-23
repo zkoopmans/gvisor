@@ -15,12 +15,14 @@
 package kernel
 
 import (
-	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"context"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
 // +stateify savable
 type savedPendingSignal struct {
-	si    *arch.SignalInfo
+	si    *linux.SignalInfo
 	timer *IntervalTimer
 }
 
@@ -39,7 +41,7 @@ func (p *pendingSignals) saveSignals() []savedPendingSignal {
 }
 
 // loadSignals is invoked by stateify.
-func (p *pendingSignals) loadSignals(pending []savedPendingSignal) {
+func (p *pendingSignals) loadSignals(_ context.Context, pending []savedPendingSignal) {
 	for _, sps := range pending {
 		p.enqueue(sps.si, sps.timer)
 	}

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !false
+// +build !false
+
 package kernel
 
 // SpecialOpts contains non-standard options for the kernel.

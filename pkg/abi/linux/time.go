@@ -93,6 +93,8 @@ const (
 const maxSecInDuration = math.MaxInt64 / int64(time.Second)
 
 // TimeT represents time_t in <time.h>. It represents time in seconds.
+//
+// +marshal
 type TimeT int64
 
 // NsecToTimeT translates nanoseconds to TimeT (seconds).
@@ -102,7 +104,7 @@ func NsecToTimeT(nsec int64) TimeT {
 
 // Timespec represents struct timespec in <time.h>.
 //
-// +marshal
+// +marshal slice:TimespecSlice
 type Timespec struct {
 	Sec  int64
 	Nsec int64
@@ -157,6 +159,8 @@ func DurationToTimespec(dur time.Duration) Timespec {
 const SizeOfTimeval = 16
 
 // Timeval represents struct timeval in <time.h>.
+//
+// +marshal slice:TimevalSlice
 type Timeval struct {
 	Sec  int64
 	Usec int64
@@ -194,22 +198,29 @@ func DurationToTimeval(dur time.Duration) Timeval {
 }
 
 // Itimerspec represents struct itimerspec in <time.h>.
+//
+// +marshal
 type Itimerspec struct {
 	Interval Timespec
 	Value    Timespec
 }
 
 // ItimerVal mimics the following struct in <sys/time.h>
-//   struct itimerval {
-//     struct timeval it_interval; /* next value */
-//     struct timeval it_value;    /* current value */
-//   };
+//
+//	struct itimerval {
+//	  struct timeval it_interval; /* next value */
+//	  struct timeval it_value;    /* current value */
+//	};
+//
+// +marshal
 type ItimerVal struct {
 	Interval Timeval
 	Value    Timeval
 }
 
 // ClockT represents type clock_t.
+//
+// +marshal
 type ClockT int64
 
 // ClockTFromDuration converts time.Duration to clock_t.
@@ -218,6 +229,8 @@ func ClockTFromDuration(d time.Duration) ClockT {
 }
 
 // Tms represents struct tms, used by times(2).
+//
+// +marshal
 type Tms struct {
 	UTime  ClockT
 	STime  ClockT
@@ -227,9 +240,13 @@ type Tms struct {
 
 // TimerID represents type timer_t, which identifies a POSIX per-process
 // interval timer.
+//
+// +marshal
 type TimerID int32
 
 // StatxTimestamp represents struct statx_timestamp.
+//
+// +marshal
 type StatxTimestamp struct {
 	Sec  int64
 	Nsec uint32
@@ -257,7 +274,14 @@ func NsecToStatxTimestamp(nsec int64) (ts StatxTimestamp) {
 	}
 }
 
+// ToTime returns the Go time.Time representation.
+func (sxts StatxTimestamp) ToTime() time.Time {
+	return time.Unix(sxts.Sec, int64(sxts.Nsec))
+}
+
 // Utime represents struct utimbuf used by utimes(2).
+//
+// +marshal
 type Utime struct {
 	Actime  int64
 	Modtime int64

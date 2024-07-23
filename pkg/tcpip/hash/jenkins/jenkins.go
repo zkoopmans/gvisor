@@ -16,7 +16,6 @@
 // functions created by by Bob Jenkins.
 //
 // See https://en.wikipedia.org/wiki/Jenkins_hash_function#cite_note-dobbsx-1
-//
 package jenkins
 
 import (
@@ -42,26 +41,26 @@ func (s *Sum32) Reset() { *s = 0 }
 
 // Sum32 returns the hash value
 func (s *Sum32) Sum32() uint32 {
-	hash := *s
+	sCopy := *s
 
-	hash += (hash << 3)
-	hash ^= hash >> 11
-	hash += hash << 15
+	sCopy += sCopy << 3
+	sCopy ^= sCopy >> 11
+	sCopy += sCopy << 15
 
-	return uint32(hash)
+	return uint32(sCopy)
 }
 
 // Write adds more data to the running hash.
 //
 // It never returns an error.
 func (s *Sum32) Write(data []byte) (int, error) {
-	hash := *s
+	sCopy := *s
 	for _, b := range data {
-		hash += Sum32(b)
-		hash += hash << 10
-		hash ^= hash >> 6
+		sCopy += Sum32(b)
+		sCopy += sCopy << 10
+		sCopy ^= sCopy >> 6
 	}
-	*s = hash
+	*s = sCopy
 	return len(data), nil
 }
 

@@ -12,25 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package kvm
 
 import (
 	"gvisor.dev/gvisor/pkg/cpuid"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
+	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
-
-// userMemoryRegion is a region of physical memory.
-//
-// This mirrors kvm_memory_region.
-type userMemoryRegion struct {
-	slot          uint32
-	flags         uint32
-	guestPhysAddr uint64
-	memorySize    uint64
-	userspaceAddr uint64
-}
 
 // userRegs represents KVM user registers.
 //
@@ -169,27 +160,6 @@ type modelControlRegisters struct {
 	entries [16]modelControlRegister
 }
 
-// runData is the run structure. This may be mapped for synchronous register
-// access (although that doesn't appear to be supported by my kernel at least).
-//
-// This mirrors kvm_run.
-type runData struct {
-	requestInterruptWindow uint8
-	_                      [7]uint8
-
-	exitReason                 uint32
-	readyForInterruptInjection uint8
-	ifFlag                     uint8
-	_                          [2]uint8
-
-	cr8      uint64
-	apicBase uint64
-
-	// This is the union data for exits. Interpretation depends entirely on
-	// the exitReason above (see vCPU code for more information).
-	data [32]uint64
-}
-
 // cpuidEntry is a single CPUID entry.
 //
 // This mirrors kvm_cpuid_entry2.
@@ -213,10 +183,67 @@ type cpuidEntries struct {
 	entries [_KVM_NR_CPUID_ENTRIES]cpuidEntry
 }
 
+// Query implements cpuid.Function.Query.
+func (c *cpuidEntries) Query(in cpuid.In) (out cpuid.Out) {
+	for i := 0; i < int(c.nr); i++ {
+		if c.entries[i].function == in.Eax && c.entries[i].index == in.Ecx {
+			out.Eax = c.entries[i].eax
+			out.Ebx = c.entries[i].ebx
+			out.Ecx = c.entries[i].ecx
+			out.Edx = c.entries[i].edx
+			return
+		}
+	}
+	return
+}
+
+// Set implements cpuid.ChangeableSet.Set.
+func (c *cpuidEntries) Set(in cpuid.In, out cpuid.Out) {
+	i := 0
+	for ; i < int(c.nr); i++ {
+		if c.entries[i].function == in.Eax && c.entries[i].index == in.Ecx {
+			break
+		}
+	}
+	if i == _KVM_NR_CPUID_ENTRIES {
+		panic("exceeded KVM_NR_CPUID_ENTRIES")
+	}
+
+	c.entries[i].eax = out.Eax
+	c.entries[i].ebx = out.Ebx
+	c.entries[i].ecx = out.Ecx
+	c.entries[i].edx = out.Edx
+	if i == int(c.nr) {
+		c.nr++
+	}
+}
+
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
+	fpu.InitHostState()
+	bitsForScaling = getBitsForScaling()
+	if err := updateSystemValues(int(fd)); err != nil {
+		return err
+	}
+	fs := cpuid.FeatureSet{
+		Function: &cpuidSupported,
+	}
+	// Calculate whether guestPCID is supported.
+	hasGuestPCID = fs.HasFeature(cpuid.X86FeaturePCID)
+	// Create a static feature set from the KVM entries. Then, we
+	// explicitly set OSXSAVE, since this does not come in the feature
+	// entries, but can be provided when the relevant CR4 bit is set.
+	s := &cpuidSupported
+	if cpuid.HostFeatureSet().UseXsave() {
+		cpuid.X86FeatureOSXSAVE.Set(s)
+	}
+	// Explicitly disable nested virtualization. Since we don't provide
+	// any virtualization APIs, there is no need to enable this feature.
+	cpuid.X86FeatureVMX.Unset(s)
+	cpuid.X86FeatureSVM.Unset(s)
+	ring0.Init(cpuid.FeatureSet{
+		Function: s,
+	})
 	physicalInit()
-	err := updateSystemValues(int(fd))
-	ring0.Init(cpuid.HostFeatureSet())
-	return err
+	return nil
 }

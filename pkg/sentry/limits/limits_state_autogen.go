@@ -3,34 +3,65 @@
 package limits
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Limit) beforeSave() {}
-func (x *Limit) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Cur", &x.Cur)
-	m.Save("Max", &x.Max)
+func (l *Limit) StateTypeName() string {
+	return "pkg/sentry/limits.Limit"
 }
 
-func (x *Limit) afterLoad() {}
-func (x *Limit) load(m state.Map) {
-	m.Load("Cur", &x.Cur)
-	m.Load("Max", &x.Max)
+func (l *Limit) StateFields() []string {
+	return []string{
+		"Cur",
+		"Max",
+	}
 }
 
-func (x *LimitSet) beforeSave() {}
-func (x *LimitSet) save(m state.Map) {
-	x.beforeSave()
-	m.Save("data", &x.data)
+func (l *Limit) beforeSave() {}
+
+// +checklocksignore
+func (l *Limit) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.Cur)
+	stateSinkObject.Save(1, &l.Max)
 }
 
-func (x *LimitSet) afterLoad() {}
-func (x *LimitSet) load(m state.Map) {
-	m.Load("data", &x.data)
+func (l *Limit) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *Limit) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.Cur)
+	stateSourceObject.Load(1, &l.Max)
+}
+
+func (l *LimitSet) StateTypeName() string {
+	return "pkg/sentry/limits.LimitSet"
+}
+
+func (l *LimitSet) StateFields() []string {
+	return []string{
+		"data",
+	}
+}
+
+func (l *LimitSet) beforeSave() {}
+
+// +checklocksignore
+func (l *LimitSet) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.data)
+}
+
+func (l *LimitSet) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *LimitSet) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.data)
 }
 
 func init() {
-	state.Register("pkg/sentry/limits.Limit", (*Limit)(nil), state.Fns{Save: (*Limit).save, Load: (*Limit).load})
-	state.Register("pkg/sentry/limits.LimitSet", (*LimitSet)(nil), state.Fns{Save: (*LimitSet).save, Load: (*LimitSet).load})
+	state.Register((*Limit)(nil))
+	state.Register((*LimitSet)(nil))
 }

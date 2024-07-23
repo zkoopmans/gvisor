@@ -46,7 +46,7 @@
 // DI - The signal number.
 // SI - Pointer to siginfo_t structure.
 // DX - Pointer to ucontext structure.
-TEXT ·signalHandler(SB),NOSPLIT,$0
+TEXT ·signalHandler(SB),NOSPLIT|NOFRAME,$0
 	// Check if the signal is from the kernel.
 	MOVQ $0x0, CX
 	CMPL CX, SI_CODE(SI)
@@ -110,6 +110,14 @@ not_casuint32:
 	JMP handle_fault
 
 not_loaduint32:
+	CMPQ CX, ·checkXstateBegin(SB)
+	JB not_checkXstate
+	CMPQ CX, ·checkXstateEnd(SB)
+	JAE not_checkXstate
+
+	LEAQ handleCheckXstateFault(SB), CX
+	JMP handle_fault
+not_checkXstate:
 original_handler:
 	// Jump to the previous signal handler, which is likely the golang one.
 	XORQ CX, CX
@@ -130,4 +138,10 @@ handle_fault:
 	// Store the signal number in EDI.
 	MOVL DI, REG_RDI(DX)
 
+	RET
+
+// func addrOfSignalHandler() uintptr
+TEXT ·addrOfSignalHandler(SB), $0-8
+	MOVQ	$·signalHandler(SB), AX
+	MOVQ	AX, ret+0(FP)
 	RET

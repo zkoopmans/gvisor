@@ -3,38 +3,100 @@
 package memmap
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *MappableRange) beforeSave() {}
-func (x *MappableRange) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
+func (fr *FileRange) StateTypeName() string {
+	return "pkg/sentry/memmap.FileRange"
 }
 
-func (x *MappableRange) afterLoad() {}
-func (x *MappableRange) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
+func (fr *FileRange) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+	}
 }
 
-func (x *MappingOfRange) beforeSave() {}
-func (x *MappingOfRange) save(m state.Map) {
-	x.beforeSave()
-	m.Save("MappingSpace", &x.MappingSpace)
-	m.Save("AddrRange", &x.AddrRange)
-	m.Save("Writable", &x.Writable)
+func (fr *FileRange) beforeSave() {}
+
+// +checklocksignore
+func (fr *FileRange) StateSave(stateSinkObject state.Sink) {
+	fr.beforeSave()
+	stateSinkObject.Save(0, &fr.Start)
+	stateSinkObject.Save(1, &fr.End)
 }
 
-func (x *MappingOfRange) afterLoad() {}
-func (x *MappingOfRange) load(m state.Map) {
-	m.Load("MappingSpace", &x.MappingSpace)
-	m.Load("AddrRange", &x.AddrRange)
-	m.Load("Writable", &x.Writable)
+func (fr *FileRange) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (fr *FileRange) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fr.Start)
+	stateSourceObject.Load(1, &fr.End)
+}
+
+func (mr *MappableRange) StateTypeName() string {
+	return "pkg/sentry/memmap.MappableRange"
+}
+
+func (mr *MappableRange) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+	}
+}
+
+func (mr *MappableRange) beforeSave() {}
+
+// +checklocksignore
+func (mr *MappableRange) StateSave(stateSinkObject state.Sink) {
+	mr.beforeSave()
+	stateSinkObject.Save(0, &mr.Start)
+	stateSinkObject.Save(1, &mr.End)
+}
+
+func (mr *MappableRange) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (mr *MappableRange) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &mr.Start)
+	stateSourceObject.Load(1, &mr.End)
+}
+
+func (r *MappingOfRange) StateTypeName() string {
+	return "pkg/sentry/memmap.MappingOfRange"
+}
+
+func (r *MappingOfRange) StateFields() []string {
+	return []string{
+		"MappingSpace",
+		"AddrRange",
+		"Writable",
+	}
+}
+
+func (r *MappingOfRange) beforeSave() {}
+
+// +checklocksignore
+func (r *MappingOfRange) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.MappingSpace)
+	stateSinkObject.Save(1, &r.AddrRange)
+	stateSinkObject.Save(2, &r.Writable)
+}
+
+func (r *MappingOfRange) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (r *MappingOfRange) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.MappingSpace)
+	stateSourceObject.Load(1, &r.AddrRange)
+	stateSourceObject.Load(2, &r.Writable)
 }
 
 func init() {
-	state.Register("pkg/sentry/memmap.MappableRange", (*MappableRange)(nil), state.Fns{Save: (*MappableRange).save, Load: (*MappableRange).load})
-	state.Register("pkg/sentry/memmap.MappingOfRange", (*MappingOfRange)(nil), state.Fns{Save: (*MappingOfRange).save, Load: (*MappingOfRange).load})
+	state.Register((*FileRange)(nil))
+	state.Register((*MappableRange)(nil))
+	state.Register((*MappingOfRange)(nil))
 }

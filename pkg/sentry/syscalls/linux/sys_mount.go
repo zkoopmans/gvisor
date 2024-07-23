@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,46 +16,26 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Mount implements Linux syscall mount(2).
-func Mount(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	sourceAddr := args[0].Pointer()
 	targetAddr := args[1].Pointer()
 	typeAddr := args[2].Pointer()
 	flags := args[3].Uint64()
 	dataAddr := args[4].Pointer()
 
-	fsType, err := t.CopyInString(typeAddr, usermem.PageSize)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	sourcePath, _, err := copyInPath(t, sourceAddr, true /* allowEmpty */)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	targetPath, _, err := copyInPath(t, targetAddr, false /* allowEmpty */)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	data := ""
-	if dataAddr != 0 {
-		// In Linux, a full page is always copied in regardless of null
-		// character placement, and the address is passed to each file system.
-		// Most file systems always treat this data as a string, though, and so
-		// do all of the ones we implement.
-		data, err = t.CopyInString(dataAddr, usermem.PageSize)
-		if err != nil {
-			return 0, nil, err
-		}
+	// Must have CAP_SYS_ADMIN in the current mount namespace's associated user
+	// namespace.
+	creds := t.Credentials()
+	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().Owner) {
+		return 0, nil, linuxerr.EPERM
 	}
 
 	// Ignore magic value that was required before Linux 2.4.
@@ -63,92 +43,126 @@ func Mount(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		flags = flags &^ linux.MS_MGC_MSK
 	}
 
-	// Must have CAP_SYS_ADMIN in the mount namespace's associated user
-	// namespace.
-	if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().UserNamespace()) {
-		return 0, nil, syserror.EPERM
-	}
-
-	const unsupportedOps = linux.MS_REMOUNT | linux.MS_BIND |
-		linux.MS_SHARED | linux.MS_PRIVATE | linux.MS_SLAVE |
-		linux.MS_UNBINDABLE | linux.MS_MOVE
-
-	// Silently allow MS_NOSUID, since we don't implement set-id bits
-	// anyway.
-	const unsupportedFlags = linux.MS_NODEV |
-		linux.MS_NODIRATIME | linux.MS_STRICTATIME
+	// Silently allow MS_NOSUID, since we don't implement set-id bits anyway.
+	const unsupported = linux.MS_UNBINDABLE | linux.MS_MOVE | linux.MS_NODIRATIME
 
 	// Linux just allows passing any flags to mount(2) - it won't fail when
 	// unknown or unsupported flags are passed. Since we don't implement
 	// everything, we fail explicitly on flags that are unimplemented.
-	if flags&(unsupportedOps|unsupportedFlags) != 0 {
-		return 0, nil, syserror.EINVAL
+	if flags&(unsupported) != 0 {
+		return 0, nil, linuxerr.EINVAL
 	}
 
-	rsys, ok := fs.FindFilesystem(fsType)
-	if !ok {
-		return 0, nil, syserror.ENODEV
-	}
-	if !rsys.AllowUserMount() {
-		return 0, nil, syserror.EPERM
-	}
-
-	var superFlags fs.MountSourceFlags
-	if flags&linux.MS_NOATIME == linux.MS_NOATIME {
-		superFlags.NoAtime = true
-	}
-	if flags&linux.MS_RDONLY == linux.MS_RDONLY {
-		superFlags.ReadOnly = true
-	}
-	if flags&linux.MS_NOEXEC == linux.MS_NOEXEC {
-		superFlags.NoExec = true
-	}
-
-	rootInode, err := rsys.Mount(t, sourcePath, superFlags, data, nil)
+	// For null-terminated strings related to mount(2), Linux copies in at most
+	// a page worth of data. See fs/namespace.c:copy_mount_string().
+	targetPath, err := copyInPath(t, targetAddr)
 	if err != nil {
-		return 0, nil, syserror.EINVAL
-	}
-
-	if err := fileOpOn(t, linux.AT_FDCWD, targetPath, true /* resolve */, func(root *fs.Dirent, d *fs.Dirent, _ uint) error {
-		// Mount will take a reference on rootInode if successful.
-		return t.MountNamespace().Mount(t, d, rootInode)
-	}); err != nil {
-		// Something went wrong. Drop our ref on rootInode before
-		// returning the error.
-		rootInode.DecRef()
 		return 0, nil, err
 	}
+	target, err := getTaskPathOperation(t, linux.AT_FDCWD, targetPath, disallowEmptyPath, followFinalSymlink)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer target.Release(t)
+	var opts vfs.MountOptions
+	if flags&(linux.MS_NOATIME|linux.MS_STRICTATIME) == linux.MS_NOATIME {
+		opts.Flags.NoATime = true
+	}
+	if flags&linux.MS_NOEXEC == linux.MS_NOEXEC {
+		opts.Flags.NoExec = true
+	}
+	if flags&linux.MS_NODEV == linux.MS_NODEV {
+		opts.Flags.NoDev = true
+	}
+	if flags&linux.MS_NOSUID == linux.MS_NOSUID {
+		opts.Flags.NoSUID = true
+	}
+	if flags&linux.MS_RDONLY == linux.MS_RDONLY {
+		opts.ReadOnly = true
+	}
+	data := ""
+	if dataAddr != 0 {
+		// In Linux, a full page is always copied in regardless of null
+		// character placement, and the address is passed to each file system.
+		// Most file systems always treat this data as a string, though, and so
+		// do all of the ones we implement.
+		data, err = t.CopyInString(dataAddr, hostarch.PageSize)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	opts.GetFilesystemOptions.Data = data
+	switch {
+	case flags&linux.MS_REMOUNT != 0:
+		// When MS_REMOUNT is specified, the flags and data should match the values used in the original mount() call,
+		// except for those parameters that are being changed.
+		//
+		// The src and filesystem type are ignored for MS_REMOUNT.
+		return 0, nil, t.Kernel().VFS().RemountAt(t, creds, &target.pop, &opts)
+	case flags&linux.MS_BIND != 0:
+		sourcePath, err := copyInPath(t, sourceAddr)
+		if err != nil {
+			return 0, nil, err
+		}
+		var sourceTpop taskPathOperation
+		sourceTpop, err = getTaskPathOperation(t, linux.AT_FDCWD, sourcePath, disallowEmptyPath, followFinalSymlink)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer sourceTpop.Release(t)
+		return 0, nil, t.Kernel().VFS().BindAt(t, creds, &sourceTpop.pop, &target.pop, flags&linux.MS_REC != 0)
+	case flags&(linux.MS_SHARED|linux.MS_PRIVATE|linux.MS_SLAVE|linux.MS_UNBINDABLE) != 0:
+		return 0, nil, t.Kernel().VFS().SetMountPropagationAt(t, creds, &target.pop, uint32(flags))
+	}
 
-	return 0, nil, nil
+	// Only copy in source, fstype, and data if we are doing a normal mount.
+	var source string
+	if sourceAddr != 0 {
+		source, err = t.CopyInString(sourceAddr, hostarch.PageSize)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	fsType, err := t.CopyInString(typeAddr, hostarch.PageSize)
+	if err != nil {
+		return 0, nil, err
+	}
+	_, err = t.Kernel().VFS().MountAt(t, creds, source, &target.pop, fsType, &opts)
+	return 0, nil, err
 }
 
 // Umount2 implements Linux syscall umount2(2).
-func Umount2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Umount2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	flags := args[1].Int()
-
-	const unsupported = linux.MNT_FORCE | linux.MNT_EXPIRE
-	if flags&unsupported != 0 {
-		return 0, nil, syserror.EINVAL
-	}
-
-	path, _, err := copyInPath(t, addr, false /* allowEmpty */)
-	if err != nil {
-		return 0, nil, err
-	}
 
 	// Must have CAP_SYS_ADMIN in the mount namespace's associated user
 	// namespace.
 	//
 	// Currently, this is always the init task's user namespace.
-	if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().UserNamespace()) {
-		return 0, nil, syserror.EPERM
+	creds := t.Credentials()
+	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().Owner) {
+		return 0, nil, linuxerr.EPERM
 	}
 
-	resolve := flags&linux.UMOUNT_NOFOLLOW != linux.UMOUNT_NOFOLLOW
-	detachOnly := flags&linux.MNT_DETACH == linux.MNT_DETACH
+	const unsupported = linux.MNT_FORCE | linux.MNT_EXPIRE
+	if flags&unsupported != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
 
-	return 0, nil, fileOpOn(t, linux.AT_FDCWD, path, resolve, func(root *fs.Dirent, d *fs.Dirent, _ uint) error {
-		return t.MountNamespace().Unmount(t, d, detachOnly)
-	})
+	path, err := copyInPath(t, addr)
+	if err != nil {
+		return 0, nil, err
+	}
+	tpop, err := getTaskPathOperation(t, linux.AT_FDCWD, path, disallowEmptyPath, shouldFollowFinalSymlink(flags&linux.UMOUNT_NOFOLLOW == 0))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tpop.Release(t)
+
+	opts := vfs.UmountOptions{
+		Flags: uint32(flags &^ linux.UMOUNT_NOFOLLOW),
+	}
+
+	return 0, nil, t.Kernel().VFS().UmountAt(t, creds, &tpop.pop, &opts)
 }

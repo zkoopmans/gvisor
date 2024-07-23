@@ -12,25 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // ptraceArch implements arch-specific ptrace commands.
-func (t *Task) ptraceArch(target *Task, req int64, addr, data usermem.Addr) error {
+func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) error {
 	switch req {
 	case linux.PTRACE_PEEKUSR: // aka PTRACE_PEEKUSER
 		n, err := target.Arch().PtracePeekUser(uintptr(addr))
 		if err != nil {
 			return err
 		}
-		_, err = t.CopyOut(data, n)
+		_, err = n.CopyOut(t, data)
 		return err
 
 	case linux.PTRACE_POKEUSR: // aka PTRACE_POKEUSER
@@ -51,14 +53,15 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data usermem.Addr) erro
 		return err
 
 	case linux.PTRACE_GETFPREGS:
-		_, err := target.Arch().PtraceGetFPRegs(&usermem.IOReadWriter{
+		s := target.Arch().FloatingPointData()
+		_, err := target.Arch().FloatingPointData().PtraceGetFPRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
 			Addr: data,
 			Opts: usermem.IOOpts{
 				AddressSpaceActive: true,
 			},
-		})
+		}, len(*s))
 		return err
 
 	case linux.PTRACE_SETREGS:
@@ -70,20 +73,27 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data usermem.Addr) erro
 				AddressSpaceActive: true,
 			},
 		})
+		if err == nil {
+			target.p.FullStateChanged()
+		}
 		return err
 
 	case linux.PTRACE_SETFPREGS:
-		_, err := target.Arch().PtraceSetFPRegs(&usermem.IOReadWriter{
+		s := target.Arch().FloatingPointData()
+		_, err := s.PtraceSetFPRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
 			Addr: data,
 			Opts: usermem.IOOpts{
 				AddressSpaceActive: true,
 			},
-		})
+		}, len(*s))
+		if err == nil {
+			target.p.FullStateChanged()
+		}
 		return err
 
 	default:
-		return syserror.EIO
+		return linuxerr.EIO
 	}
 }

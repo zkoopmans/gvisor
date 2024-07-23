@@ -17,9 +17,10 @@ package p9
 import (
 	"io"
 	"runtime/debug"
-	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fdchannel"
 	"gvisor.dev/gvisor/pkg/flipcall"
@@ -32,6 +33,8 @@ import (
 type Server struct {
 	// attacher provides the attach function.
 	attacher Attacher
+
+	options AttacherOptions
 
 	// pathTree is the full set of paths opened on this server.
 	//
@@ -47,10 +50,15 @@ type Server struct {
 	renameMu sync.RWMutex
 }
 
-// NewServer returns a new server.
+// NewServer returns a new server. attacher may be nil.
 func NewServer(attacher Attacher) *Server {
+	opts := AttacherOptions{}
+	if attacher != nil {
+		opts = attacher.ServerOptions()
+	}
 	return &Server{
 		attacher: attacher,
+		options:  opts,
 		pathTree: newPathNode(),
 	}
 }
@@ -59,12 +67,6 @@ func NewServer(attacher Attacher) *Server {
 type connState struct {
 	// server is the backing server.
 	server *Server
-
-	// sendMu is the send lock.
-	sendMu sync.Mutex
-
-	// conn is the connection.
-	conn *unet.Socket
 
 	// fids is the set of active FIDs.
 	//
@@ -81,24 +83,37 @@ type connState struct {
 
 	// messageSize is the maximum message size. The server does not
 	// do automatic splitting of messages.
-	messageSize uint32
+	messageSize atomicbitops.Uint32
 
 	// version is the agreed upon version X of 9P2000.L.Google.X.
 	// version 0 implies 9P2000.L.
-	version uint32
+	version atomicbitops.Uint32
 
-	// -- below relates to the legacy handler --
+	// reqGate counts requests that are still being handled.
+	reqGate sync.Gate
 
-	// recvOkay indicates that a receive may start.
-	recvOkay chan bool
+	//	-- below relates to the legacy handler --
 
-	// recvDone is signalled when a message is received.
-	recvDone chan error
+	// recvMu serializes receiving from conn.
+	recvMu sync.Mutex
 
-	// sendDone is signalled when a send is finished.
-	sendDone chan error
+	// recvIdle is the number of goroutines in handleRequests() attempting to
+	// lock recvMu so that they can receive from conn.
+	recvIdle atomicbitops.Int32
 
-	// -- below relates to the flipcall handler --
+	// If recvShutdown is true, at least one goroutine has observed a
+	// connection error while receiving from conn, and all goroutines in
+	// handleRequests() should exit immediately. recvShutdown is protected by
+	// recvMu.
+	recvShutdown bool
+
+	// sendMu serializes sending to conn.
+	sendMu sync.Mutex
+
+	// conn is the connection used by the legacy transport.
+	conn *unet.Socket
+
+	//	-- below relates to the flipcall handler --
 
 	// channelMu protects below.
 	channelMu sync.Mutex
@@ -121,17 +136,16 @@ type fidRef struct {
 	// file is the associated File.
 	file File
 
-	// refs is an active refence count.
+	// refs is an active reference count.
 	//
 	// The node above will be closed only when refs reaches zero.
-	refs int64
-
-	// openedMu protects opened and openFlags.
-	openedMu sync.Mutex
+	refs atomicbitops.Int64
 
 	// opened indicates whether this has been opened already.
 	//
 	// This is updated in handlers.go.
+	//
+	// opened is protected by pathNode.opMu or renameMu (for write).
 	opened bool
 
 	// mode is the fidRef's mode from the walk. Only the type bits are
@@ -143,6 +157,8 @@ type fidRef struct {
 	// openFlags is the mode used in the open.
 	//
 	// This is updated in handlers.go.
+	//
+	// openFlags is protected by pathNode.opMu or renameMu (for write).
 	openFlags OpenFlags
 
 	// pathNode is the current pathNode for this FID.
@@ -162,28 +178,16 @@ type fidRef struct {
 	// isRoot should be used to check for root over looking at parent
 	// directly.
 	parent *fidRef
-
-	// deleted indicates that the backing file has been deleted. We stop
-	// many operations at the API level if they are incompatible with a
-	// file that has already been unlinked.
-	deleted uint32
-}
-
-// OpenFlags returns the flags the file was opened with and true iff the fid was opened previously.
-func (f *fidRef) OpenFlags() (OpenFlags, bool) {
-	f.openedMu.Lock()
-	defer f.openedMu.Unlock()
-	return f.openFlags, f.opened
 }
 
 // IncRef increases the references on a fid.
 func (f *fidRef) IncRef() {
-	atomic.AddInt64(&f.refs, 1)
+	f.refs.Add(1)
 }
 
 // DecRef should be called when you're finished with a fid.
 func (f *fidRef) DecRef() {
-	if atomic.AddInt64(&f.refs, -1) == 0 {
+	if f.refs.Add(-1) == 0 {
 		f.file.Close()
 
 		// Drop the parent reference.
@@ -200,9 +204,26 @@ func (f *fidRef) DecRef() {
 	}
 }
 
+// TryIncRef returns true if a new reference is taken on the fid, and false if
+// the fid has been destroyed.
+func (f *fidRef) TryIncRef() bool {
+	for {
+		r := f.refs.Load()
+		if r <= 0 {
+			return false
+		}
+		if f.refs.CompareAndSwap(r, r+1) {
+			return true
+		}
+	}
+}
+
 // isDeleted returns true if this fidRef has been deleted.
+//
+// Precondition: this must be called via safelyRead, safelyWrite or
+// safelyGlobal.
 func (f *fidRef) isDeleted() bool {
-	return atomic.LoadUint32(&f.deleted) != 0
+	return f.pathNode.deleted.Load() != 0
 }
 
 // isRoot indicates whether this is a root fid.
@@ -222,10 +243,7 @@ func (f *fidRef) maybeParent() *fidRef {
 //
 // Precondition: this must be called via safelyWrite or safelyGlobal.
 func notifyDelete(pn *pathNode) {
-	// Call on all local references.
-	pn.forEachChildRef(func(ref *fidRef, _ string) {
-		atomic.StoreUint32(&ref.deleted, 1)
-	})
+	pn.deleted.Store(1)
 
 	// Call on all subtrees.
 	pn.forEachChildNode(func(pn *pathNode) {
@@ -237,11 +255,7 @@ func notifyDelete(pn *pathNode) {
 //
 // Precondition: this must be called via safelyWrite or safelyGlobal.
 func (f *fidRef) markChildDeleted(name string) {
-	origPathNode := f.pathNode.removeWithName(name, func(ref *fidRef) {
-		atomic.StoreUint32(&ref.deleted, 1)
-	})
-
-	if origPathNode != nil {
+	if origPathNode := f.pathNode.removeWithName(name, nil); origPathNode != nil {
 		// Mark all children as deleted.
 		notifyDelete(origPathNode)
 	}
@@ -479,36 +493,60 @@ func (cs *connState) lookupChannel(id uint32) *channel {
 
 // handle handles a single message.
 func (cs *connState) handle(m message) (r message) {
+	if !cs.reqGate.Enter() {
+		// connState.stop() has been called; the connection is shutting down.
+		r = newErrFromLinuxerr(linuxerr.ECONNRESET)
+		return
+	}
 	defer func() {
+		cs.reqGate.Leave()
 		if r == nil {
 			// Don't allow a panic to propagate.
-			recover()
+			err := recover()
 
 			// Include a useful log message.
-			log.Warningf("panic in handler: %s", debug.Stack())
+			log.Warningf("panic in handler: %v\n%s", err, debug.Stack())
 
-			// Wrap in an EFAULT error; we don't really have a
+			// Wrap in an EREMOTEIO error; we don't really have a
 			// better way to describe this kind of error. It will
 			// usually manifest as a result of the test framework.
-			r = newErr(syscall.EFAULT)
+			r = newErrFromLinuxerr(linuxerr.EREMOTEIO)
 		}
 	}()
 	if handler, ok := m.(handler); ok {
 		// Call the message handler.
 		r = handler.handle(cs)
+		// TODO(b/34162363):This is only here to make sure the server works with
+		// only linuxerr Errors, as the handlers work with both client and server.
+		// It will be removed a followup, when all the unix.Errno errors are
+		// replaced with linuxerr.
+		if rlError, ok := r.(*Rlerror); ok {
+			e := linuxerr.ErrorFromUnix(unix.Errno(rlError.Error))
+			r = newErrFromLinuxerr(e)
+		}
 	} else {
 		// Produce an ENOSYS error.
-		r = newErr(syscall.ENOSYS)
+		r = newErrFromLinuxerr(linuxerr.ENOSYS)
 	}
 	return
 }
 
-// handleRequest handles a single request.
-//
-// The recvDone channel is signaled when recv is done (with a error if
-// necessary). The sendDone channel is signaled with the result of the send.
-func (cs *connState) handleRequest() {
-	messageSize := atomic.LoadUint32(&cs.messageSize)
+// handleRequest handles a single request. It returns true if the caller should
+// continue handling requests and false if it should terminate.
+func (cs *connState) handleRequest() bool {
+	// Obtain the right to receive a message from cs.conn.
+	cs.recvIdle.Add(1)
+	cs.recvMu.Lock()
+	cs.recvIdle.Add(-1)
+
+	if cs.recvShutdown {
+		// Another goroutine already detected a connection problem; exit
+		// immediately.
+		cs.recvMu.Unlock()
+		return false
+	}
+
+	messageSize := cs.messageSize.Load()
 	if messageSize == 0 {
 		// Default or not yet negotiated.
 		messageSize = maximumLength
@@ -518,30 +556,36 @@ func (cs *connState) handleRequest() {
 	tag, m, err := recv(cs.conn, messageSize, msgRegistry.get)
 	if errSocket, ok := err.(ErrSocket); ok {
 		// Connection problem; stop serving.
-		cs.recvDone <- errSocket.error
-		return
+		log.Debugf("p9.recv: %v", errSocket.error)
+		cs.recvShutdown = true
+		cs.recvMu.Unlock()
+		return false
 	}
 
-	// Signal receive is done.
-	cs.recvDone <- nil
+	// Ensure that another goroutine is available to receive from cs.conn.
+	if cs.recvIdle.Load() == 0 {
+		go cs.handleRequests() // S/R-SAFE: Irrelevant.
+	}
+	cs.recvMu.Unlock()
 
 	// Deal with other errors.
 	if err != nil && err != io.EOF {
 		// If it's not a connection error, but some other protocol error,
 		// we can send a response immediately.
 		cs.sendMu.Lock()
-		err := send(cs.conn, tag, newErr(err))
+		err := send(cs.conn, tag, newErrFromLinuxerr(err))
 		cs.sendMu.Unlock()
-		cs.sendDone <- err
-		return
+		if err != nil {
+			log.Debugf("p9.send: %v", err)
+		}
+		return true
 	}
 
 	// Try to start the tag.
 	if !cs.StartTag(tag) {
 		// Nothing we can do at this point; client is bogus.
 		log.Debugf("no valid tag [%05d]", tag)
-		cs.sendDone <- ErrNoValidMessage
-		return
+		return true
 	}
 
 	// Handle the message.
@@ -555,23 +599,30 @@ func (cs *connState) handleRequest() {
 	cs.sendMu.Lock()
 	err = send(cs.conn, tag, r)
 	cs.sendMu.Unlock()
-	cs.sendDone <- err
+	if err != nil {
+		log.Debugf("p9.send: %v", err)
+	}
 
 	// Return the message to the cache.
 	msgRegistry.put(m)
+
+	return true
 }
 
 func (cs *connState) handleRequests() {
-	for range cs.recvOkay {
-		cs.handleRequest()
+	for {
+		if !cs.handleRequest() {
+			return
+		}
 	}
 }
 
 func (cs *connState) stop() {
-	// Close all channels.
-	close(cs.recvOkay)
-	close(cs.recvDone)
-	close(cs.sendDone)
+	// Stop new requests from proceeding, and wait for completion of all
+	// inflight requests. This is mostly so that if a request is stuck, the
+	// sandbox supervisor has the opportunity to kill us with SIGABRT to get a
+	// stack dump of the offending handler.
+	cs.reqGate.Close()
 
 	// Free the channels.
 	cs.channelMu.Lock()
@@ -590,6 +641,9 @@ func (cs *connState) stop() {
 		cs.channelAlloc.Destroy()
 	}
 
+	// Ensure the connection is closed.
+	cs.conn.Close()
+
 	// Close all remaining fids.
 	for fid, fidRef := range cs.fids {
 		delete(cs.fids, fid)
@@ -599,74 +653,23 @@ func (cs *connState) stop() {
 		// handlers running via the wait for Pending => 0 below.
 		fidRef.DecRef()
 	}
-
-	// Ensure the connection is closed.
-	cs.conn.Close()
-}
-
-// service services requests concurrently.
-func (cs *connState) service() error {
-	// Pending is the number of handlers that have finished receiving but
-	// not finished processing requests. These must be waiting on properly
-	// below. See the next comment for an explanation of the loop.
-	pending := 0
-
-	// Start the first request handler.
-	go cs.handleRequests() // S/R-SAFE: Irrelevant.
-	cs.recvOkay <- true
-
-	// We loop and make sure there's always one goroutine waiting for a new
-	// request. We process all the data for a single request in one
-	// goroutine however, to ensure the best turnaround time possible.
-	for {
-		select {
-		case err := <-cs.recvDone:
-			if err != nil {
-				// Wait for pending handlers.
-				for i := 0; i < pending; i++ {
-					<-cs.sendDone
-				}
-				return nil
-			}
-
-			// This handler is now pending.
-			pending++
-
-			// Kick the next receiver, or start a new handler
-			// if no receiver is currently waiting.
-			select {
-			case cs.recvOkay <- true:
-			default:
-				go cs.handleRequests() // S/R-SAFE: Irrelevant.
-				cs.recvOkay <- true
-			}
-
-		case <-cs.sendDone:
-			// This handler is finished.
-			pending--
-
-			// Error sending a response? Nothing can be done.
-			//
-			// We don't terminate on a send error though, since
-			// we still have a pending receive. The error would
-			// have been logged above, we just ignore it here.
-		}
-	}
 }
 
 // Handle handles a single connection.
 func (s *Server) Handle(conn *unet.Socket) error {
 	cs := &connState{
-		server:   s,
-		conn:     conn,
-		fids:     make(map[FID]*fidRef),
-		tags:     make(map[Tag]chan struct{}),
-		recvOkay: make(chan bool),
-		recvDone: make(chan error, 10),
-		sendDone: make(chan error, 10),
+		server: s,
+		fids:   make(map[FID]*fidRef),
+		tags:   make(map[Tag]chan struct{}),
+		conn:   conn,
 	}
 	defer cs.stop()
-	return cs.service()
+
+	// Serve requests from conn in the current goroutine; handleRequests() will
+	// create more goroutines as needed.
+	cs.handleRequests()
+
+	return nil
 }
 
 // Serve handles requests from the bound socket.

@@ -12,14 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package arch
 
 const restartSyscallNr = uintptr(128)
 
+// SyscallSaveOrig save the value of the register R0 which is clobbered in
+// syscall handler(doSyscall()).
+//
+// In linux, at the entry of the syscall handler(el0_svc_common()), value of R0
+// is saved to the pt_regs.orig_x0 in kernel code. But currently, the orig_x0
+// was not accessible to the userspace application, so we have to do the same
+// operation in the sentry code to save the R0 value into the App context.
+func (c *Context64) SyscallSaveOrig() {
+	c.OrigR0 = c.Regs.Regs[0]
+}
+
 // SyscallNo returns the syscall number according to the 64-bit convention.
-func (c *context64) SyscallNo() uintptr {
+func (c *Context64) SyscallNo() uintptr {
 	return uintptr(c.Regs.Regs[8])
 }
 
@@ -38,9 +50,9 @@ func (c *context64) SyscallNo() uintptr {
 // R19...R28: callee-saved registers.
 // R29: the frame pointer.
 // R30: the link register.
-func (c *context64) SyscallArgs() SyscallArguments {
+func (c *Context64) SyscallArgs() SyscallArguments {
 	return SyscallArguments{
-		SyscallArgument{Value: uintptr(c.Regs.Regs[0])},
+		SyscallArgument{Value: uintptr(c.OrigR0)},
 		SyscallArgument{Value: uintptr(c.Regs.Regs[1])},
 		SyscallArgument{Value: uintptr(c.Regs.Regs[2])},
 		SyscallArgument{Value: uintptr(c.Regs.Regs[3])},
@@ -50,13 +62,21 @@ func (c *context64) SyscallArgs() SyscallArguments {
 }
 
 // RestartSyscall implements Context.RestartSyscall.
-func (c *context64) RestartSyscall() {
+// Prepare for system call restart, OrigR0 will be restored to R0.
+// Please see the linux code as reference:
+// arch/arm64/kernel/signal.c:do_signal()
+func (c *Context64) RestartSyscall() {
 	c.Regs.Pc -= SyscallWidth
-	c.Regs.Regs[8] = uint64(restartSyscallNr)
+	// R0 will be backed up into OrigR0 when entering doSyscall().
+	// Please see the linux code as reference:
+	// arch/arm64/kernel/syscall.c:el0_svc_common().
+	// Here we restore it back.
+	c.Regs.Regs[0] = uint64(c.OrigR0)
 }
 
 // RestartSyscallWithRestartBlock implements Context.RestartSyscallWithRestartBlock.
-func (c *context64) RestartSyscallWithRestartBlock() {
+func (c *Context64) RestartSyscallWithRestartBlock() {
 	c.Regs.Pc -= SyscallWidth
+	c.Regs.Regs[0] = uint64(c.OrigR0)
 	c.Regs.Regs[8] = uint64(restartSyscallNr)
 }

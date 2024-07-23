@@ -15,102 +15,70 @@
 package udp
 
 import (
+	"context"
+	"fmt"
+	"time"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport"
 )
 
-// saveData saves udpPacket.data field.
-func (u *udpPacket) saveData() buffer.VectorisedView {
-	// We cannot save u.data directly as u.data.views may alias to u.views,
-	// which is not allowed by state framework (in-struct pointer).
-	return u.data.Clone(nil)
+// saveReceivedAt is invoked by stateify.
+func (p *udpPacket) saveReceivedAt() int64 {
+	return p.receivedAt.UnixNano()
 }
 
-// loadData loads udpPacket.data field.
-func (u *udpPacket) loadData(data buffer.VectorisedView) {
-	// NOTE: We cannot do the u.data = data.Clone(u.views[:]) optimization
-	// here because data.views is not guaranteed to be loaded by now. Plus,
-	// data.views will be allocated anyway so there really is little point
-	// of utilizing u.views for data.views.
-	u.data = data
+// loadReceivedAt is invoked by stateify.
+func (p *udpPacket) loadReceivedAt(_ context.Context, nsec int64) {
+	p.receivedAt = time.Unix(0, nsec)
+}
+
+// afterLoad is invoked by stateify.
+func (e *endpoint) afterLoad(ctx context.Context) {
+	stack.RestoreStackFromContext(ctx).RegisterRestoredEndpoint(e)
 }
 
 // beforeSave is invoked by stateify.
 func (e *endpoint) beforeSave() {
-	// Stop incoming packets from being handled (and mutate endpoint state).
-	// The lock will be released after savercvBufSizeMax(), which would have
-	// saved e.rcvBufSizeMax and set it to 0 to continue blocking incoming
-	// packets.
-	e.rcvMu.Lock()
+	e.freeze()
+	e.stack.RegisterResumableEndpoint(e)
 }
 
-// saveRcvBufSizeMax is invoked by stateify.
-func (e *endpoint) saveRcvBufSizeMax() int {
-	max := e.rcvBufSizeMax
-	// Make sure no new packets will be handled regardless of the lock.
-	e.rcvBufSizeMax = 0
-	// Release the lock acquired in beforeSave() so regular endpoint closing
-	// logic can proceed after save.
-	e.rcvMu.Unlock()
-	return max
-}
+// Restore implements tcpip.RestoredEndpoint.Restore.
+func (e *endpoint) Restore(s *stack.Stack) {
+	e.thaw()
 
-// loadRcvBufSizeMax is invoked by stateify.
-func (e *endpoint) loadRcvBufSizeMax(max int) {
-	e.rcvBufSizeMax = max
-}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-// afterLoad is invoked by stateify.
-func (e *endpoint) afterLoad() {
-	stack.StackFromEnv.RegisterRestoredEndpoint(e)
-}
+	e.net.Resume(s)
 
-// Resume implements tcpip.ResumableEndpoint.Resume.
-func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
+	e.ops.InitHandler(e, e.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
 
-	for _, m := range e.multicastMemberships {
-		if err := e.stack.JoinGroup(e.NetProto, m.nicID, m.multicastAddr); err != nil {
-			panic(err)
-		}
-	}
-
-	if e.state != StateBound && e.state != StateConnected {
-		return
-	}
-
-	netProto := e.effectiveNetProtos[0]
-	// Connect() and bindLocked() both assert
-	//
-	//     netProto == header.IPv6ProtocolNumber
-	//
-	// before creating a multi-entry effectiveNetProtos.
-	if len(e.effectiveNetProtos) > 1 {
-		netProto = header.IPv6ProtocolNumber
-	}
-
-	var err *tcpip.Error
-	if e.state == StateConnected {
-		e.route, err = e.stack.FindRoute(e.RegisterNICID, e.ID.LocalAddress, e.ID.RemoteAddress, netProto, e.multicastLoop)
+	switch state := e.net.State(); state {
+	case transport.DatagramEndpointStateInitial, transport.DatagramEndpointStateClosed:
+	case transport.DatagramEndpointStateBound, transport.DatagramEndpointStateConnected:
+		// Our saved state had a port, but we don't actually have a
+		// reservation. We need to remove the port from our state, but still
+		// pass it to the reservation machinery.
+		var err tcpip.Error
+		id := e.net.Info().ID
+		id.LocalPort = e.localPort
+		id.RemotePort = e.remotePort
+		id, e.boundBindToDevice, err = e.registerWithStack(e.effectiveNetProtos, id)
 		if err != nil {
 			panic(err)
 		}
-	} else if len(e.ID.LocalAddress) != 0 && !isBroadcastOrMulticast(e.ID.LocalAddress) { // stateBound
-		// A local unicast address is specified, verify that it's valid.
-		if e.stack.CheckLocalAddress(e.RegisterNICID, netProto, e.ID.LocalAddress) == 0 {
-			panic(tcpip.ErrBadLocalAddress)
-		}
+		e.localPort = id.LocalPort
+		e.remotePort = id.RemotePort
+	default:
+		panic(fmt.Sprintf("unhandled state = %s", state))
 	}
+}
 
-	// Our saved state had a port, but we don't actually have a
-	// reservation. We need to remove the port from our state, but still
-	// pass it to the reservation machinery.
-	id := e.ID
-	e.ID.LocalPort = 0
-	e.ID, e.boundBindToDevice, err = e.registerWithStack(e.RegisterNICID, e.effectiveNetProtos, id)
-	if err != nil {
-		panic(err)
-	}
+// Resume implements tcpip.ResumableEndpoint.Resume.
+func (e *endpoint) Resume() {
+	e.thaw()
 }

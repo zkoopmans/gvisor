@@ -18,8 +18,9 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -43,8 +44,8 @@ type OldRSeqCriticalRegion struct {
 	// application handler while its instruction pointer is in CriticalSection,
 	// set the instruction pointer to Restart and application register r10 (on
 	// amd64) to the former instruction pointer.
-	CriticalSection usermem.AddrRange
-	Restart         usermem.Addr
+	CriticalSection hostarch.AddrRange
+	Restart         hostarch.Addr
 }
 
 // RSeqAvailable returns true if t supports (old and new) restartable sequences.
@@ -55,26 +56,26 @@ func (t *Task) RSeqAvailable() bool {
 // SetRSeq registers addr as this thread's rseq structure.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) SetRSeq(addr usermem.Addr, length, signature uint32) error {
+func (t *Task) SetRSeq(addr hostarch.Addr, length, signature uint32) error {
 	if t.rseqAddr != 0 {
 		if t.rseqAddr != addr {
-			return syserror.EINVAL
+			return linuxerr.EINVAL
 		}
 		if t.rseqSignature != signature {
-			return syserror.EINVAL
+			return linuxerr.EINVAL
 		}
-		return syserror.EBUSY
+		return linuxerr.EBUSY
 	}
 
 	// rseq must be aligned and correctly sized.
 	if addr&(linux.AlignOfRSeq-1) != 0 {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if length != linux.SizeOfRSeq {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if _, ok := t.MemoryManager().CheckIORange(addr, linux.SizeOfRSeq); !ok {
-		return syserror.EFAULT
+		return linuxerr.EFAULT
 	}
 
 	t.rseqAddr = addr
@@ -91,7 +92,7 @@ func (t *Task) SetRSeq(addr usermem.Addr, length, signature uint32) error {
 		t.Debugf("Failed to copy CPU to %#x for rseq: %v", t.rseqAddr, err)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
 		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
-		return syserror.EFAULT
+		return linuxerr.EFAULT
 	}
 
 	return nil
@@ -100,18 +101,18 @@ func (t *Task) SetRSeq(addr usermem.Addr, length, signature uint32) error {
 // ClearRSeq unregisters addr as this thread's rseq structure.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) ClearRSeq(addr usermem.Addr, length, signature uint32) error {
+func (t *Task) ClearRSeq(addr hostarch.Addr, length, signature uint32) error {
 	if t.rseqAddr == 0 {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if t.rseqAddr != addr {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if length != linux.SizeOfRSeq {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if t.rseqSignature != signature {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	if err := t.rseqClearCPU(); err != nil {
@@ -132,7 +133,7 @@ func (t *Task) ClearRSeq(addr usermem.Addr, length, signature uint32) error {
 // OldRSeqCriticalRegion returns a copy of t's thread group's current
 // old restartable sequence.
 func (t *Task) OldRSeqCriticalRegion() OldRSeqCriticalRegion {
-	return *t.tg.oldRSeqCritical.Load().(*OldRSeqCriticalRegion)
+	return *t.tg.oldRSeqCritical.Load()
 }
 
 // SetOldRSeqCriticalRegion replaces t's thread group's old restartable
@@ -151,10 +152,10 @@ func (t *Task) SetOldRSeqCriticalRegion(r OldRSeqCriticalRegion) error {
 		return nil
 	}
 	if r.CriticalSection.Start >= r.CriticalSection.End {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if r.CriticalSection.Contains(r.Restart) {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	// TODO(jamieliu): check that r.CriticalSection and r.Restart are in
 	// the application address range, for consistency with Linux.
@@ -166,16 +167,18 @@ func (t *Task) SetOldRSeqCriticalRegion(r OldRSeqCriticalRegion) error {
 // CPU number.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) OldRSeqCPUAddr() usermem.Addr {
+func (t *Task) OldRSeqCPUAddr() hostarch.Addr {
 	return t.oldRSeqCPUAddr
 }
 
 // SetOldRSeqCPUAddr replaces the address that old rseq will keep updated with
 // t's CPU number.
 //
-// Preconditions: t.RSeqAvailable() == true. The caller must be running on the
-// task goroutine. t's AddressSpace must be active.
-func (t *Task) SetOldRSeqCPUAddr(addr usermem.Addr) error {
+// Preconditions:
+//   - t.RSeqAvailable() == true.
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
+func (t *Task) SetOldRSeqCPUAddr(addr hostarch.Addr) error {
 	t.oldRSeqCPUAddr = addr
 
 	// Check that addr is writable.
@@ -184,13 +187,14 @@ func (t *Task) SetOldRSeqCPUAddr(addr usermem.Addr) error {
 	// unfortunate, but unlikely in a correct program.
 	if err := t.rseqUpdateCPU(); err != nil {
 		t.oldRSeqCPUAddr = 0
-		return syserror.EINVAL // yes, EINVAL, not err or EFAULT
+		return linuxerr.EINVAL // yes, EINVAL, not err or EFAULT
 	}
 	return nil
 }
 
-// Preconditions: The caller must be running on the task goroutine. t's
-// AddressSpace must be active.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
 func (t *Task) rseqUpdateCPU() error {
 	if t.rseqAddr == 0 && t.oldRSeqCPUAddr == 0 {
 		t.rseqCPU = -1
@@ -209,21 +213,23 @@ func (t *Task) rseqUpdateCPU() error {
 	return oerr
 }
 
-// Preconditions: The caller must be running on the task goroutine. t's
-// AddressSpace must be active.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
 func (t *Task) oldRSeqCopyOutCPU() error {
 	if t.oldRSeqCPUAddr == 0 {
 		return nil
 	}
 
 	buf := t.CopyScratchBuffer(4)
-	usermem.ByteOrder.PutUint32(buf, uint32(t.rseqCPU))
+	hostarch.ByteOrder.PutUint32(buf, uint32(t.rseqCPU))
 	_, err := t.CopyOutBytes(t.oldRSeqCPUAddr, buf)
 	return err
 }
 
-// Preconditions: The caller must be running on the task goroutine. t's
-// AddressSpace must be active.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
 func (t *Task) rseqCopyOutCPU() error {
 	if t.rseqAddr == 0 {
 		return nil
@@ -231,8 +237,8 @@ func (t *Task) rseqCopyOutCPU() error {
 
 	buf := t.CopyScratchBuffer(8)
 	// CPUIDStart and CPUID are the first two fields in linux.RSeq.
-	usermem.ByteOrder.PutUint32(buf, uint32(t.rseqCPU))     // CPUIDStart
-	usermem.ByteOrder.PutUint32(buf[4:], uint32(t.rseqCPU)) // CPUID
+	hostarch.ByteOrder.PutUint32(buf, uint32(t.rseqCPU))     // CPUIDStart
+	hostarch.ByteOrder.PutUint32(buf[4:], uint32(t.rseqCPU)) // CPUID
 	// N.B. This write is not atomic, but since this occurs on the task
 	// goroutine then as long as userspace uses a single-instruction read
 	// it can't see an invalid value.
@@ -240,13 +246,14 @@ func (t *Task) rseqCopyOutCPU() error {
 	return err
 }
 
-// Preconditions: The caller must be running on the task goroutine. t's
-// AddressSpace must be active.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
 func (t *Task) rseqClearCPU() error {
 	buf := t.CopyScratchBuffer(8)
 	// CPUIDStart and CPUID are the first two fields in linux.RSeq.
-	usermem.ByteOrder.PutUint32(buf, 0)                                   // CPUIDStart
-	usermem.ByteOrder.PutUint32(buf[4:], linux.RSEQ_CPU_ID_UNINITIALIZED) // CPUID
+	hostarch.ByteOrder.PutUint32(buf, 0)                                   // CPUIDStart
+	hostarch.ByteOrder.PutUint32(buf[4:], linux.RSEQ_CPU_ID_UNINITIALIZED) // CPUID
 	// N.B. This write is not atomic, but since this occurs on the task
 	// goroutine then as long as userspace uses a single-instruction read
 	// it can't see an invalid value.
@@ -259,18 +266,20 @@ func (t *Task) rseqClearCPU() error {
 // This is a bit complex since both the RSeq and RSeqCriticalSection structs
 // are stored in userspace. So we must:
 //
-// 1. Copy in the address of RSeqCriticalSection from RSeq.
-// 2. Copy in RSeqCriticalSection itself.
-// 3. Validate critical section struct version, address range, abort address.
-// 4. Validate the abort signature (4 bytes preceding abort IP match expected
-//    signature).
+//  1. Copy in the address of RSeqCriticalSection from RSeq.
+//  2. Copy in RSeqCriticalSection itself.
+//  3. Validate critical section struct version, address range, abort address.
+//  4. Validate the abort signature (4 bytes preceding abort IP match expected
+//     signature).
+//
 // 5. Clear address of RSeqCriticalSection from RSeq.
 // 6. Finally, conditionally abort.
 //
 // See kernel/rseq.c:rseq_ip_fixup for reference.
 //
-// Preconditions: The caller must be running on the task goroutine. t's
-// AddressSpace must be active.
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - t's AddressSpace must be active.
 func (t *Task) rseqAddrInterrupt() {
 	if t.rseqAddr == 0 {
 		return
@@ -298,29 +307,17 @@ func (t *Task) rseqAddrInterrupt() {
 		return
 	}
 
-	critAddr := usermem.Addr(usermem.ByteOrder.Uint64(buf))
+	critAddr := hostarch.Addr(hostarch.ByteOrder.Uint64(buf))
 	if critAddr == 0 {
 		return
 	}
 
-	buf = t.CopyScratchBuffer(linux.SizeOfRSeqCriticalSection)
-	if _, err := t.CopyInBytes(critAddr, buf); err != nil {
+	var cs linux.RSeqCriticalSection
+	if _, err := cs.CopyIn(t, critAddr); err != nil {
 		t.Debugf("Failed to copy critical section from %#x for rseq: %v", critAddr, err)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
 		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		return
-	}
-
-	// Manually marshal RSeqCriticalSection as this is in the hot path when
-	// rseq is enabled. It must be as fast as possible.
-	//
-	// TODO(b/130243041): Replace with go_marshal.
-	cs := linux.RSeqCriticalSection{
-		Version:          usermem.ByteOrder.Uint32(buf[0:4]),
-		Flags:            usermem.ByteOrder.Uint32(buf[4:8]),
-		Start:            usermem.ByteOrder.Uint64(buf[8:16]),
-		PostCommitOffset: usermem.ByteOrder.Uint64(buf[16:24]),
-		Abort:            usermem.ByteOrder.Uint64(buf[24:32]),
 	}
 
 	if cs.Version != 0 {
@@ -330,7 +327,7 @@ func (t *Task) rseqAddrInterrupt() {
 		return
 	}
 
-	start := usermem.Addr(cs.Start)
+	start := hostarch.Addr(cs.Start)
 	critRange, ok := start.ToRange(cs.PostCommitOffset)
 	if !ok {
 		t.Debugf("Invalid start and offset in %+v", cs)
@@ -339,7 +336,7 @@ func (t *Task) rseqAddrInterrupt() {
 		return
 	}
 
-	abort := usermem.Addr(cs.Abort)
+	abort := hostarch.Addr(cs.Abort)
 	if critRange.Contains(abort) {
 		t.Debugf("Abort in critical section in %+v", cs)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
@@ -358,7 +355,7 @@ func (t *Task) rseqAddrInterrupt() {
 		return
 	}
 
-	sig := usermem.ByteOrder.Uint32(buf)
+	sig := hostarch.ByteOrder.Uint32(buf)
 	if sig != t.rseqSignature {
 		t.Debugf("Mismatched rseq signature %d != %d", sig, t.rseqSignature)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
@@ -381,7 +378,7 @@ func (t *Task) rseqAddrInterrupt() {
 	}
 
 	// Finally we can actually decide whether or not to restart.
-	if !critRange.Contains(usermem.Addr(t.Arch().IP())) {
+	if !critRange.Contains(hostarch.Addr(t.Arch().IP())) {
 		return
 	}
 
@@ -390,8 +387,8 @@ func (t *Task) rseqAddrInterrupt() {
 
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) oldRSeqInterrupt() {
-	r := t.tg.oldRSeqCritical.Load().(*OldRSeqCriticalRegion)
-	if ip := t.Arch().IP(); r.CriticalSection.Contains(usermem.Addr(ip)) {
+	r := t.tg.oldRSeqCritical.Load()
+	if ip := t.Arch().IP(); r.CriticalSection.Contains(hostarch.Addr(ip)) {
 		t.Debugf("Interrupted rseq critical section at %#x; restarting at %#x", ip, r.Restart)
 		t.Arch().SetIP(uintptr(r.Restart))
 		t.Arch().SetOldRSeqInterruptedIP(ip)

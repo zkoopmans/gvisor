@@ -16,15 +16,22 @@ package ptrace
 
 import (
 	"reflect"
-	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safecopy"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // stub is defined in arch-specific assembly.
 func stub()
+
+// addrOfStub returns the start address of stub.
+//
+// In Go 1.17+, Go references to assembly functions resolve to an ABIInternal
+// wrapper function rather than the function itself. We must reference from
+// assembly to get the ABI0 (i.e., primary) address.
+func addrOfStub() uintptr
 
 // stubCall calls the stub at the given address with the given pid.
 func stubCall(addr, pid uintptr)
@@ -41,12 +48,12 @@ func unsafeSlice(addr uintptr, length int) (slice []byte) {
 // stubInit initializes the stub.
 func stubInit() {
 	// Grab the existing stub.
-	stubBegin := reflect.ValueOf(stub).Pointer()
+	stubBegin := addrOfStub()
 	stubLen := int(safecopy.FindEndAddress(stubBegin) - stubBegin)
 	stubSlice := unsafeSlice(stubBegin, stubLen)
 	mapLen := uintptr(stubLen)
-	if offset := mapLen % usermem.PageSize; offset != 0 {
-		mapLen += usermem.PageSize - offset
+	if offset := mapLen % hostarch.PageSize; offset != 0 {
+		mapLen += hostarch.PageSize - offset
 	}
 
 	for stubStart > 0 {
@@ -56,21 +63,21 @@ func stubInit() {
 		// something that may have been there already. We just walk
 		// down the address space until we find a place where the stub
 		// can be placed.
-		addr, _, errno := syscall.RawSyscall6(
-			syscall.SYS_MMAP,
+		addr, _, errno := unix.RawSyscall6(
+			unix.SYS_MMAP,
 			stubStart,
 			mapLen,
-			syscall.PROT_WRITE|syscall.PROT_READ,
-			syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS,
+			unix.PROT_WRITE|unix.PROT_READ,
+			unix.MAP_PRIVATE|unix.MAP_ANONYMOUS,
 			0 /* fd */, 0 /* offset */)
 		if addr != stubStart || errno != 0 {
 			if addr != 0 {
 				// Unmap the region we've mapped accidentally.
-				syscall.RawSyscall(syscall.SYS_MUNMAP, addr, mapLen, 0)
+				unix.RawSyscall(unix.SYS_MUNMAP, addr, mapLen, 0)
 			}
 
 			// Attempt to begin at a lower address.
-			stubStart -= uintptr(usermem.PageSize)
+			stubStart -= uintptr(hostarch.PageSize)
 			continue
 		}
 
@@ -79,11 +86,11 @@ func stubInit() {
 		copy(targetSlice, stubSlice)
 
 		// Make the stub executable.
-		if _, _, errno := syscall.RawSyscall(
-			syscall.SYS_MPROTECT,
+		if _, _, errno := unix.RawSyscall(
+			unix.SYS_MPROTECT,
 			stubStart,
 			mapLen,
-			syscall.PROT_EXEC|syscall.PROT_READ); errno != 0 {
+			unix.PROT_EXEC|unix.PROT_READ); errno != 0 {
 			panic("mprotect failed: " + errno.Error())
 		}
 

@@ -46,12 +46,13 @@ type Writer interface {
 	WriteFromBlocks(srcs BlockSeq) (uint64, error)
 }
 
-// ReadFullToBlocks repeatedly invokes r.ReadToBlocks until dsts.NumBytes()
-// bytes have been read or ReadToBlocks returns an error.
-func ReadFullToBlocks(r Reader, dsts BlockSeq) (uint64, error) {
+// ReadFullToBlocks repeatedly invokes r until dsts.NumBytes() bytes have been
+// read or r returns an error. Note that we avoid a Reader interface receiver
+// to avoid heap allocation.
+func ReadFullToBlocks(r ReaderFunc, dsts BlockSeq) (uint64, error) {
 	var done uint64
 	for !dsts.IsEmpty() {
-		n, err := r.ReadToBlocks(dsts)
+		n, err := r(dsts)
 		done += n
 		if err != nil {
 			return done, err
@@ -61,12 +62,13 @@ func ReadFullToBlocks(r Reader, dsts BlockSeq) (uint64, error) {
 	return done, nil
 }
 
-// WriteFullFromBlocks repeatedly invokes w.WriteFromBlocks until
-// srcs.NumBytes() bytes have been written or WriteFromBlocks returns an error.
-func WriteFullFromBlocks(w Writer, srcs BlockSeq) (uint64, error) {
+// WriteFullFromBlocks repeatedly invokes w until srcs.NumBytes() bytes have
+// been written or w returns an error. Note that we avoid a Writer interface
+// receiver to avoid heap allocation.
+func WriteFullFromBlocks(w WriterFunc, srcs BlockSeq) (uint64, error) {
 	var done uint64
 	for !srcs.IsEmpty() {
-		n, err := w.WriteFromBlocks(srcs)
+		n, err := w(srcs)
 		done += n
 		if err != nil {
 			return done, err
@@ -144,18 +146,6 @@ func (r ToIOReader) Read(dst []byte) (int, error) {
 	return int(n), err
 }
 
-// ToIOWriter implements io.Writer for a (safemem.)Writer.
-type ToIOWriter struct {
-	Writer Writer
-}
-
-// Write implements io.Writer.Write.
-func (w ToIOWriter) Write(src []byte) (int, error) {
-	// io.Writer does not permit partial writes.
-	n, err := WriteFullFromBlocks(w.Writer, BlockSeqOf(BlockFromSafeSlice(src)))
-	return int(n), err
-}
-
 // FromIOReader implements Reader for an io.Reader by repeatedly invoking
 // io.Reader.Read until it returns an error or partial read. This is not
 // thread-safe.
@@ -200,58 +190,6 @@ func (r FromIOReader) readToBlock(dst Block, buf []byte) (int, []byte, error) {
 		buf = make([]byte, dst.Len())
 	}
 	rn, rerr := r.Reader.Read(buf[:dst.Len()])
-	wbn, wberr := Copy(dst, BlockFromSafeSlice(buf[:rn]))
-	if wberr != nil {
-		return wbn, buf, wberr
-	}
-	return wbn, buf, rerr
-}
-
-// FromIOReaderAt implements Reader for an io.ReaderAt. Does not repeatedly
-// invoke io.ReaderAt.ReadAt because ReadAt is more strict than Read. A partial
-// read indicates an error. This is not thread-safe.
-type FromIOReaderAt struct {
-	ReaderAt io.ReaderAt
-	Offset   int64
-}
-
-// ReadToBlocks implements Reader.ReadToBlocks.
-func (r FromIOReaderAt) ReadToBlocks(dsts BlockSeq) (uint64, error) {
-	var buf []byte
-	var done uint64
-	for !dsts.IsEmpty() {
-		dst := dsts.Head()
-		var n int
-		var err error
-		n, buf, err = r.readToBlock(dst, buf)
-		done += uint64(n)
-		if n != dst.Len() {
-			return done, err
-		}
-		dsts = dsts.Tail()
-		if err != nil {
-			if dsts.IsEmpty() && err == io.EOF {
-				return done, nil
-			}
-			return done, err
-		}
-	}
-	return done, nil
-}
-
-func (r FromIOReaderAt) readToBlock(dst Block, buf []byte) (int, []byte, error) {
-	// io.Reader isn't safecopy-aware, so we have to buffer Blocks that require
-	// safecopy.
-	if !dst.NeedSafecopy() {
-		n, err := r.ReaderAt.ReadAt(dst.ToSlice(), r.Offset)
-		r.Offset += int64(n)
-		return n, buf, err
-	}
-	if len(buf) < dst.Len() {
-		buf = make([]byte, dst.Len())
-	}
-	rn, rerr := r.ReaderAt.ReadAt(buf[:dst.Len()], r.Offset)
-	r.Offset += int64(rn)
 	wbn, wberr := Copy(dst, BlockFromSafeSlice(buf[:rn]))
 	if wberr != nil {
 		return wbn, buf, wberr

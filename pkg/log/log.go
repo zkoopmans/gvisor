@@ -29,6 +29,8 @@
 // This is because the log.Debugf(...) statement alone will generate a
 // significant amount of garbage and churn in many cases, even if no log
 // message is ultimately emitted.
+//
+// +checkalignedignore
 package log
 
 import (
@@ -36,9 +38,9 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"regexp"
 	"runtime"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/linewriter"
@@ -79,7 +81,7 @@ func (l Level) String() string {
 type Emitter interface {
 	// Emit emits the given log statement. This allows for control over the
 	// timestamp used for logging.
-	Emit(level Level, timestamp time.Time, format string, v ...interface{})
+	Emit(depth int, level Level, timestamp time.Time, format string, v ...any)
 }
 
 // Writer writes the output to the given writer.
@@ -93,7 +95,8 @@ type Writer struct {
 	// errors counts failures to write log messages so it can be reported
 	// when writer start to work again. Needs to be accessed using atomics
 	// to make race detector happy because it's read outside the mutex.
-	errors int32
+	// +checklocks
+	atomicErrors int32
 }
 
 // Write writes out the given bytes, handling non-blocking sockets.
@@ -105,7 +108,7 @@ func (l *Writer) Write(data []byte) (int, error) {
 		n += w
 
 		// Is it a non-blocking socket?
-		if pathErr, ok := err.(*os.PathError); ok && pathErr.Err == syscall.EAGAIN {
+		if pathErr, ok := err.(*os.PathError); ok && pathErr.Timeout() {
 			runtime.Gosched()
 			continue
 		}
@@ -113,7 +116,7 @@ func (l *Writer) Write(data []byte) (int, error) {
 		// Some other error?
 		if err != nil {
 			l.mu.Lock()
-			atomic.AddInt32(&l.errors, 1)
+			atomic.AddInt32(&l.atomicErrors, 1)
 			l.mu.Unlock()
 			return n, err
 		}
@@ -125,15 +128,15 @@ func (l *Writer) Write(data []byte) (int, error) {
 	}
 
 	// Dirty read in case there were errors (rare).
-	if atomic.LoadInt32(&l.errors) > 0 {
+	if atomic.LoadInt32(&l.atomicErrors) > 0 {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 
 		// Recheck condition under lock.
-		if e := atomic.LoadInt32(&l.errors); e > 0 {
+		if e := atomic.LoadInt32(&l.atomicErrors); e > 0 {
 			msg := fmt.Sprintf("\n*** Dropped %d log messages ***\n", e)
 			if _, err := l.Next.Write([]byte(msg)); err == nil {
-				atomic.StoreInt32(&l.errors, 0)
+				atomic.StoreInt32(&l.atomicErrors, 0)
 			}
 		}
 	}
@@ -142,7 +145,7 @@ func (l *Writer) Write(data []byte) (int, error) {
 }
 
 // Emit emits the message.
-func (l *Writer) Emit(level Level, timestamp time.Time, format string, args ...interface{}) {
+func (l *Writer) Emit(_ int, _ Level, _ time.Time, format string, args ...any) {
 	fmt.Fprintf(l, format, args...)
 }
 
@@ -150,15 +153,15 @@ func (l *Writer) Emit(level Level, timestamp time.Time, format string, args ...i
 type MultiEmitter []Emitter
 
 // Emit emits to all emitters.
-func (m *MultiEmitter) Emit(level Level, timestamp time.Time, format string, v ...interface{}) {
+func (m *MultiEmitter) Emit(depth int, level Level, timestamp time.Time, format string, v ...any) {
 	for _, e := range *m {
-		e.Emit(level, timestamp, format, v...)
+		e.Emit(1+depth, level, timestamp, format, v...)
 	}
 }
 
 // TestLogger is implemented by testing.T and testing.B.
 type TestLogger interface {
-	Logf(format string, v ...interface{})
+	Logf(format string, v ...any)
 }
 
 // TestEmitter may be used for wrapping tests.
@@ -167,7 +170,7 @@ type TestEmitter struct {
 }
 
 // Emit emits to the TestLogger.
-func (t *TestEmitter) Emit(level Level, timestamp time.Time, format string, v ...interface{}) {
+func (t *TestEmitter) Emit(_ int, level Level, timestamp time.Time, format string, v ...any) {
 	t.Logf(format, v...)
 }
 
@@ -177,13 +180,13 @@ func (t *TestEmitter) Emit(level Level, timestamp time.Time, format string, v ..
 // satisfies this interface, and may be passed around as a Logger.
 type Logger interface {
 	// Debugf logs a debug statement.
-	Debugf(format string, v ...interface{})
+	Debugf(format string, v ...any)
 
 	// Infof logs at an info level.
-	Infof(format string, v ...interface{})
+	Infof(format string, v ...any)
 
 	// Warningf logs at a warning level.
-	Warningf(format string, v ...interface{})
+	Warningf(format string, v ...any)
 
 	// IsLogging returns true iff this level is being logged. This may be
 	// used to short-circuit expensive operations for debugging calls.
@@ -197,23 +200,38 @@ type BasicLogger struct {
 }
 
 // Debugf implements logger.Debugf.
-func (l *BasicLogger) Debugf(format string, v ...interface{}) {
-	if l.IsLogging(Debug) {
-		l.Emit(Debug, time.Now(), format, v...)
-	}
+func (l *BasicLogger) Debugf(format string, v ...any) {
+	l.DebugfAtDepth(1, format, v...)
 }
 
 // Infof implements logger.Infof.
-func (l *BasicLogger) Infof(format string, v ...interface{}) {
-	if l.IsLogging(Info) {
-		l.Emit(Info, time.Now(), format, v...)
-	}
+func (l *BasicLogger) Infof(format string, v ...any) {
+	l.InfofAtDepth(1, format, v...)
 }
 
 // Warningf implements logger.Warningf.
-func (l *BasicLogger) Warningf(format string, v ...interface{}) {
+func (l *BasicLogger) Warningf(format string, v ...any) {
+	l.WarningfAtDepth(1, format, v...)
+}
+
+// DebugfAtDepth logs at a specific depth.
+func (l *BasicLogger) DebugfAtDepth(depth int, format string, v ...any) {
+	if l.IsLogging(Debug) {
+		l.Emit(1+depth, Debug, time.Now(), format, v...)
+	}
+}
+
+// InfofAtDepth logs at a specific depth.
+func (l *BasicLogger) InfofAtDepth(depth int, format string, v ...any) {
+	if l.IsLogging(Info) {
+		l.Emit(1+depth, Info, time.Now(), format, v...)
+	}
+}
+
+// WarningfAtDepth logs at a specific depth.
+func (l *BasicLogger) WarningfAtDepth(depth int, format string, v ...any) {
 	if l.IsLogging(Warning) {
-		l.Emit(Warning, time.Now(), format, v...)
+		l.Emit(1+depth, Warning, time.Now(), format, v...)
 	}
 }
 
@@ -232,17 +250,19 @@ func (l *BasicLogger) SetLevel(level Level) {
 var logMu sync.Mutex
 
 // log is the default logger.
-var log atomic.Value
+var log atomic.Pointer[BasicLogger]
 
 // Log retrieves the global logger.
 func Log() *BasicLogger {
-	return log.Load().(*BasicLogger)
+	return log.Load()
 }
 
 // SetTarget sets the log target.
 //
 // This is not thread safe and shouldn't be called concurrently with any
 // logging calls.
+//
+// SetTarget should be called before any instances of log.Log() to avoid race conditions
 func SetTarget(target Emitter) {
 	logMu.Lock()
 	defer logMu.Unlock()
@@ -256,18 +276,33 @@ func SetLevel(newLevel Level) {
 }
 
 // Debugf logs to the global logger.
-func Debugf(format string, v ...interface{}) {
-	Log().Debugf(format, v...)
+func Debugf(format string, v ...any) {
+	Log().DebugfAtDepth(1, format, v...)
 }
 
 // Infof logs to the global logger.
-func Infof(format string, v ...interface{}) {
-	Log().Infof(format, v...)
+func Infof(format string, v ...any) {
+	Log().InfofAtDepth(1, format, v...)
 }
 
 // Warningf logs to the global logger.
-func Warningf(format string, v ...interface{}) {
-	Log().Warningf(format, v...)
+func Warningf(format string, v ...any) {
+	Log().WarningfAtDepth(1, format, v...)
+}
+
+// DebugfAtDepth logs to the global logger.
+func DebugfAtDepth(depth int, format string, v ...any) {
+	Log().DebugfAtDepth(1+depth, format, v...)
+}
+
+// InfofAtDepth logs to the global logger.
+func InfofAtDepth(depth int, format string, v ...any) {
+	Log().InfofAtDepth(1+depth, format, v...)
+}
+
+// WarningfAtDepth logs to the global logger.
+func WarningfAtDepth(depth int, format string, v ...any) {
+	Log().WarningfAtDepth(1+depth, format, v...)
 }
 
 // defaultStackSize is the default buffer size to allocate for stack traces.
@@ -291,11 +326,27 @@ func Stacks(all bool) []byte {
 	return trace
 }
 
+// stackRegexp matches one level within a stack trace.
+var stackRegexp = regexp.MustCompile("(?m)^\\S+\\(.*\\)$\\r?\\n^\\t\\S+:\\d+.*$\\r?\\n")
+
+// LocalStack returns the local goroutine stack, excluding the top N entries.
+// LocalStack's own entry is excluded by default and does not need to be counted in excludeTopN.
+func LocalStack(excludeTopN int) []byte {
+	replaceNext := excludeTopN + 1
+	return stackRegexp.ReplaceAllFunc(Stacks(false), func(s []byte) []byte {
+		if replaceNext > 0 {
+			replaceNext--
+			return nil
+		}
+		return s
+	})
+}
+
 // Traceback logs the given message and dumps a stacktrace of the current
 // goroutine.
 //
 // This will be print a traceback, tb, as Warningf(format+":\n%s", v..., tb).
-func Traceback(format string, v ...interface{}) {
+func Traceback(format string, v ...any) {
 	v = append(v, Stacks(false))
 	Warningf(format+":\n%s", v...)
 }
@@ -303,7 +354,7 @@ func Traceback(format string, v ...interface{}) {
 // TracebackAll logs the given message and dumps a stacktrace of all goroutines.
 //
 // This will be print a traceback, tb, as Warningf(format+":\n%s", v..., tb).
-func TracebackAll(format string, v ...interface{}) {
+func TracebackAll(format string, v ...any) {
 	v = append(v, Stacks(true))
 	Warningf(format+":\n%s", v...)
 }
@@ -316,7 +367,7 @@ func IsLogging(level Level) bool {
 // CopyStandardLogTo redirects the stdlib log package global output to the global
 // logger for the specified level.
 func CopyStandardLogTo(l Level) error {
-	var f func(string, ...interface{})
+	var f func(string, ...any)
 
 	switch l {
 	case Debug:
@@ -326,7 +377,7 @@ func CopyStandardLogTo(l Level) error {
 	case Warning:
 		f = Warningf
 	default:
-		return fmt.Errorf("Unknown log level %v", l)
+		return fmt.Errorf("unknown log level %v", l)
 	}
 
 	stdlog.SetOutput(linewriter.NewWriter(func(p []byte) {
@@ -344,5 +395,5 @@ func CopyStandardLogTo(l Level) error {
 
 func init() {
 	// Store the initial value for the log.
-	log.Store(&BasicLogger{Level: Info, Emitter: &GoogleEmitter{Writer{Next: os.Stderr}}})
+	log.Store(&BasicLogger{Level: Info, Emitter: GoogleEmitter{&Writer{Next: os.Stderr}}})
 }

@@ -15,240 +15,584 @@
 package stack
 
 import (
-	"gvisor.dev/gvisor/pkg/sleep"
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 // Route represents a route through the networking stack to a given destination.
+//
+// It is safe to call Route's methods from multiple goroutines.
 type Route struct {
-	// RemoteAddress is the final destination of the route.
+	routeInfo routeInfo
+
+	// localAddressNIC is the interface the address is associated with.
+	// TODO(gvisor.dev/issue/4548): Remove this field once we can query the
+	// address's assigned status without the NIC.
+	localAddressNIC *nic
+
+	// mu protects annotated fields below.
+	mu routeRWMutex
+
+	// localAddressEndpoint is the local address this route is associated with.
+	// +checklocks:mu
+	localAddressEndpoint AssignableAddressEndpoint
+
+	// remoteLinkAddress is the link-layer (MAC) address of the next hop.
+	// +checklocks:mu
+	remoteLinkAddress tcpip.LinkAddress
+
+	// outgoingNIC is the interface this route uses to write packets.
+	outgoingNIC *nic
+
+	// linkRes is set if link address resolution is enabled for this protocol on
+	// the route's NIC.
+	linkRes *linkResolver
+
+	// neighborEntry is the cached result of fetching a neighbor entry from the
+	// neighbor cache.
+	// +checklocks:mu
+	neighborEntry *neighborEntry
+
+	// mtu is the maximum transmission unit to use for this route.
+	// If mtu is 0, this field is ignored and the MTU of the outgoing NIC
+	// is used for egress packets.
+	mtu uint32
+}
+
+// +stateify savable
+type routeInfo struct {
 	RemoteAddress tcpip.Address
 
-	// RemoteLinkAddress is the link-layer (MAC) address of the
-	// final destination of the route.
-	RemoteLinkAddress tcpip.LinkAddress
-
-	// LocalAddress is the local address where the route starts.
 	LocalAddress tcpip.Address
 
-	// LocalLinkAddress is the link-layer (MAC) address of the
-	// where the route starts.
 	LocalLinkAddress tcpip.LinkAddress
 
-	// NextHop is the next node in the path to the destination.
 	NextHop tcpip.Address
 
-	// NetProto is the network-layer protocol.
 	NetProto tcpip.NetworkProtocolNumber
 
-	// ref a reference to the network endpoint through which the route
-	// starts.
-	ref *referencedNetworkEndpoint
-
-	// Loop controls where WritePacket should send packets.
 	Loop PacketLooping
 }
 
-// makeRoute initializes a new route. It takes ownership of the provided
-// reference to a network endpoint.
-func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, localLinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, handleLocal, multicastLoop bool) Route {
-	loop := PacketOut
-	if handleLocal && localAddr != "" && remoteAddr == localAddr {
-		loop = PacketLoop
-	} else if multicastLoop && (header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)) {
-		loop |= PacketLoop
-	} else if remoteAddr == header.IPv4Broadcast {
-		loop |= PacketLoop
+// RemoteAddress returns the route's destination.
+func (r *Route) RemoteAddress() tcpip.Address {
+	return r.routeInfo.RemoteAddress
+}
+
+// LocalAddress returns the route's local address.
+func (r *Route) LocalAddress() tcpip.Address {
+	return r.routeInfo.LocalAddress
+}
+
+// LocalLinkAddress returns the route's local link-layer address.
+func (r *Route) LocalLinkAddress() tcpip.LinkAddress {
+	return r.routeInfo.LocalLinkAddress
+}
+
+// NextHop returns the next node in the route's path to the destination.
+func (r *Route) NextHop() tcpip.Address {
+	return r.routeInfo.NextHop
+}
+
+// NetProto returns the route's network-layer protocol number.
+func (r *Route) NetProto() tcpip.NetworkProtocolNumber {
+	return r.routeInfo.NetProto
+}
+
+// Loop returns the route's required packet looping.
+func (r *Route) Loop() PacketLooping {
+	return r.routeInfo.Loop
+}
+
+// OutgoingNIC returns the route's outgoing NIC.
+func (r *Route) OutgoingNIC() tcpip.NICID {
+	return r.outgoingNIC.id
+}
+
+// RouteInfo contains all of Route's exported fields.
+//
+// +stateify savable
+type RouteInfo struct {
+	routeInfo
+
+	// RemoteLinkAddress is the link-layer (MAC) address of the next hop in the
+	// route.
+	RemoteLinkAddress tcpip.LinkAddress
+}
+
+// Fields returns a RouteInfo with all of the known values for the route's
+// fields.
+//
+// If any fields are unknown (e.g. remote link address when it is waiting for
+// link address resolution), they will be unset.
+func (r *Route) Fields() RouteInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fieldsLocked()
+}
+
+// +checklocksread:r.mu
+func (r *Route) fieldsLocked() RouteInfo {
+	return RouteInfo{
+		routeInfo:         r.routeInfo,
+		RemoteLinkAddress: r.remoteLinkAddress,
+	}
+}
+
+// constructAndValidateRoute validates and initializes a route. It takes
+// ownership of the provided local address.
+//
+// Returns an empty route if validation fails.
+func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndpoint AssignableAddressEndpoint, localAddressNIC, outgoingNIC *nic, gateway, localAddr, remoteAddr tcpip.Address, handleLocal, multicastLoop bool, mtu uint32) *Route {
+	if localAddr.BitLen() == 0 {
+		localAddr = addressEndpoint.AddressWithPrefix().Address
 	}
 
-	return Route{
-		NetProto:         netProto,
-		LocalAddress:     localAddr,
-		LocalLinkAddress: localLinkAddr,
-		RemoteAddress:    remoteAddr,
-		ref:              ref,
-		Loop:             loop,
+	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalUnicastAddress(localAddr) {
+		addressEndpoint.DecRef()
+		return nil
 	}
+
+	// If no remote address is provided, use the local address.
+	if remoteAddr.BitLen() == 0 {
+		remoteAddr = localAddr
+	}
+
+	r := makeRoute(
+		netProto,
+		gateway,
+		localAddr,
+		remoteAddr,
+		outgoingNIC,
+		localAddressNIC,
+		addressEndpoint,
+		handleLocal,
+		multicastLoop,
+		mtu,
+	)
+
+	return r
+}
+
+// makeRoute initializes a new route. It takes ownership of the provided
+// AssignableAddressEndpoint.
+func makeRoute(netProto tcpip.NetworkProtocolNumber, gateway, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *nic, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool, mtu uint32) *Route {
+	if localAddressNIC.stack != outgoingNIC.stack {
+		panic(fmt.Sprintf("cannot create a route with NICs from different stacks"))
+	}
+
+	if localAddr.BitLen() == 0 {
+		localAddr = localAddressEndpoint.AddressWithPrefix().Address
+	}
+
+	loop := PacketOut
+
+	// Loopback interface loops back packets at the link endpoint level. We
+	// could remove this check if loopback interfaces looped back packets
+	// at the network layer.
+	if !outgoingNIC.IsLoopback() {
+		if handleLocal && localAddr != (tcpip.Address{}) && remoteAddr == localAddr {
+			loop = PacketLoop
+		} else if multicastLoop && (header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)) {
+			loop |= PacketLoop
+		} else if remoteAddr == header.IPv4Broadcast {
+			loop |= PacketLoop
+		} else if subnet := localAddressEndpoint.AddressWithPrefix().Subnet(); subnet.IsBroadcast(remoteAddr) {
+			loop |= PacketLoop
+		}
+	}
+
+	r := makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop, mtu)
+	if r.Loop()&PacketOut == 0 {
+		// Packet will not leave the stack, no need for a gateway or a remote link
+		// address.
+		return r
+	}
+
+	if r.outgoingNIC.NetworkLinkEndpoint.Capabilities()&CapabilityResolutionRequired != 0 {
+		if linkRes, ok := r.outgoingNIC.linkAddrResolvers[r.NetProto()]; ok {
+			r.linkRes = linkRes
+		}
+	}
+
+	if gateway.BitLen() > 0 {
+		r.routeInfo.NextHop = gateway
+		return r
+	}
+
+	if r.linkRes == nil {
+		return r
+	}
+
+	if linkAddr, ok := r.linkRes.resolver.ResolveStaticAddress(r.RemoteAddress()); ok {
+		r.ResolveWith(linkAddr)
+		return r
+	}
+
+	if subnet := localAddressEndpoint.Subnet(); subnet.IsBroadcast(remoteAddr) {
+		r.ResolveWith(header.EthernetBroadcastAddress)
+		return r
+	}
+
+	if r.RemoteAddress() == r.LocalAddress() {
+		// Local link address is already known.
+		r.ResolveWith(r.LocalLinkAddress())
+	}
+
+	return r
+}
+
+func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *nic, localAddressEndpoint AssignableAddressEndpoint, loop PacketLooping, mtu uint32) *Route {
+	r := &Route{
+		routeInfo: routeInfo{
+			NetProto:         netProto,
+			LocalAddress:     localAddr,
+			LocalLinkAddress: outgoingNIC.NetworkLinkEndpoint.LinkAddress(),
+			RemoteAddress:    remoteAddr,
+			Loop:             loop,
+		},
+		localAddressNIC: localAddressNIC,
+		outgoingNIC:     outgoingNIC,
+		mtu:             mtu,
+	}
+
+	r.mu.Lock()
+	r.localAddressEndpoint = localAddressEndpoint
+	r.mu.Unlock()
+
+	return r
+}
+
+// makeLocalRoute initializes a new local route. It takes ownership of the
+// provided AssignableAddressEndpoint.
+//
+// A local route is a route to a destination that is local to the stack.
+func makeLocalRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *nic, localAddressEndpoint AssignableAddressEndpoint) *Route {
+	loop := PacketLoop
+	// Loopback interface loops back packets at the link endpoint level. We
+	// could remove this check if loopback interfaces looped back packets
+	// at the network layer.
+	if outgoingNIC.IsLoopback() {
+		loop = PacketOut
+	}
+	return makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop, 0 /* mtu */)
+}
+
+// RemoteLinkAddress returns the link-layer (MAC) address of the next hop in
+// the route.
+func (r *Route) RemoteLinkAddress() tcpip.LinkAddress {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.remoteLinkAddress
 }
 
 // NICID returns the id of the NIC from which this route originates.
 func (r *Route) NICID() tcpip.NICID {
-	return r.ref.ep.NICID()
+	return r.outgoingNIC.ID()
 }
 
 // MaxHeaderLength forwards the call to the network endpoint's implementation.
 func (r *Route) MaxHeaderLength() uint16 {
-	return r.ref.ep.MaxHeaderLength()
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).MaxHeaderLength()
 }
 
 // Stats returns a mutable copy of current stats.
 func (r *Route) Stats() tcpip.Stats {
-	return r.ref.nic.stack.Stats()
+	return r.outgoingNIC.stack.Stats()
 }
 
 // PseudoHeaderChecksum forwards the call to the network endpoint's
 // implementation.
 func (r *Route) PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber, totalLen uint16) uint16 {
-	return header.PseudoHeaderChecksum(protocol, r.LocalAddress, r.RemoteAddress, totalLen)
+	return header.PseudoHeaderChecksum(protocol, r.LocalAddress(), r.RemoteAddress(), totalLen)
 }
 
-// Capabilities returns the link-layer capabilities of the route.
-func (r *Route) Capabilities() LinkEndpointCapabilities {
-	return r.ref.ep.Capabilities()
+// RequiresTXTransportChecksum returns false if the route does not require
+// transport checksums to be populated.
+func (r *Route) RequiresTXTransportChecksum() bool {
+	if r.local() {
+		return false
+	}
+	return r.outgoingNIC.NetworkLinkEndpoint.Capabilities()&CapabilityTXChecksumOffload == 0
+}
+
+// HasGVisorGSOCapability returns true if the route supports gVisor GSO.
+func (r *Route) HasGVisorGSOCapability() bool {
+	if gso, ok := r.outgoingNIC.NetworkLinkEndpoint.(GSOEndpoint); ok {
+		return gso.SupportedGSO() == GVisorGSOSupported
+	}
+	return false
+}
+
+// HasHostGSOCapability returns true if the route supports host GSO.
+func (r *Route) HasHostGSOCapability() bool {
+	if gso, ok := r.outgoingNIC.NetworkLinkEndpoint.(GSOEndpoint); ok {
+		return gso.SupportedGSO() == HostGSOSupported
+	}
+	return false
+}
+
+// HasSaveRestoreCapability returns true if the route supports save/restore.
+func (r *Route) HasSaveRestoreCapability() bool {
+	return r.outgoingNIC.NetworkLinkEndpoint.Capabilities()&CapabilitySaveRestore != 0
+}
+
+// HasDisconnectOkCapability returns true if the route supports disconnecting.
+func (r *Route) HasDisconnectOkCapability() bool {
+	return r.outgoingNIC.NetworkLinkEndpoint.Capabilities()&CapabilityDisconnectOk != 0
 }
 
 // GSOMaxSize returns the maximum GSO packet size.
 func (r *Route) GSOMaxSize() uint32 {
-	if gso, ok := r.ref.ep.(GSOEndpoint); ok {
+	if gso, ok := r.outgoingNIC.NetworkLinkEndpoint.(GSOEndpoint); ok {
 		return gso.GSOMaxSize()
 	}
 	return 0
 }
 
-// Resolve attempts to resolve the link address if necessary. Returns ErrWouldBlock in
-// case address resolution requires blocking, e.g. wait for ARP reply. Waker is
-// notified when address resolution is complete (success or not).
+// ResolveWith immediately resolves a route with the specified remote link
+// address.
+func (r *Route) ResolveWith(addr tcpip.LinkAddress) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.remoteLinkAddress = addr
+}
+
+// ResolvedFieldsResult is the result of a route resolution attempt.
+type ResolvedFieldsResult struct {
+	RouteInfo RouteInfo
+	Err       tcpip.Error
+}
+
+// ResolvedFields attempts to resolve the remote link address if it is not
+// known.
 //
-// If address resolution is required, ErrNoLinkAddress and a notification channel is
-// returned for the top level caller to block. Channel is closed once address resolution
-// is complete (success or not).
-func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
-	if !r.IsResolutionRequired() {
-		// Nothing to do if there is no cache (which does the resolution on cache miss) or
-		// link address is already known.
-		return nil, nil
-	}
-
-	nextAddr := r.NextHop
-	if nextAddr == "" {
-		// Local link address is already known.
-		if r.RemoteAddress == r.LocalAddress {
-			r.RemoteLinkAddress = r.LocalLinkAddress
-			return nil, nil
-		}
-		nextAddr = r.RemoteAddress
-	}
-	linkAddr, ch, err := r.ref.linkCache.GetLinkAddress(r.ref.nic.ID(), nextAddr, r.LocalAddress, r.NetProto, waker)
-	if err != nil {
-		return ch, err
-	}
-	r.RemoteLinkAddress = linkAddr
-	return nil, nil
-}
-
-// RemoveWaker removes a waker that has been added in Resolve().
-func (r *Route) RemoveWaker(waker *sleep.Waker) {
-	nextAddr := r.NextHop
-	if nextAddr == "" {
-		nextAddr = r.RemoteAddress
-	}
-	r.ref.linkCache.RemoveWaker(r.ref.nic.ID(), nextAddr, waker)
-}
-
-// IsResolutionRequired returns true if Resolve() must be called to resolve
-// the link address before the this route can be written to.
-func (r *Route) IsResolutionRequired() bool {
-	return r.ref.isValidForOutgoing() && r.ref.linkCache != nil && r.RemoteLinkAddress == ""
-}
-
-// WritePacket writes the packet through the given route.
-func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt tcpip.PacketBuffer) *tcpip.Error {
-	if !r.ref.isValidForOutgoing() {
-		return tcpip.ErrInvalidEndpointState
-	}
-
-	err := r.ref.ep.WritePacket(r, gso, params, pkt)
-	if err != nil {
-		r.Stats().IP.OutgoingPacketErrors.Increment()
-	} else {
-		r.ref.nic.stats.Tx.Packets.Increment()
-		r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(pkt.Header.UsedLength() + pkt.Data.Size()))
-	}
+// If a callback is provided, it will be called before ResolvedFields returns
+// when address resolution is not required. If address resolution is required,
+// the callback will be called once address resolution is complete, regardless
+// of success or failure.
+//
+// Note, the route will not cache the remote link address when address
+// resolution completes.
+func (r *Route) ResolvedFields(afterResolve func(ResolvedFieldsResult)) tcpip.Error {
+	_, _, err := r.resolvedFields(afterResolve)
 	return err
 }
 
-// WritePackets writes the set of packets through the given route.
-func (r *Route) WritePackets(gso *GSO, pkts []tcpip.PacketBuffer, params NetworkHeaderParams) (int, *tcpip.Error) {
-	if !r.ref.isValidForOutgoing() {
-		return 0, tcpip.ErrInvalidEndpointState
+// resolvedFields is like ResolvedFields but also returns a notification channel
+// when address resolution is required. This channel will become readable once
+// address resolution is complete.
+//
+// The route's fields will also be returned, regardless of whether address
+// resolution is required or not.
+func (r *Route) resolvedFields(afterResolve func(ResolvedFieldsResult)) (RouteInfo, <-chan struct{}, tcpip.Error) {
+	r.mu.RLock()
+	fields := r.fieldsLocked()
+	resolutionRequired := r.isResolutionRequiredRLocked()
+	r.mu.RUnlock()
+	if !resolutionRequired {
+		if afterResolve != nil {
+			afterResolve(ResolvedFieldsResult{RouteInfo: fields, Err: nil})
+		}
+		return fields, nil, nil
 	}
 
-	n, err := r.ref.ep.WritePackets(r, gso, pkts, params)
-	if err != nil {
-		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(len(pkts) - n))
+	// If specified, the local address used for link address resolution must be an
+	// address on the outgoing interface.
+	var linkAddressResolutionRequestLocalAddr tcpip.Address
+	if r.localAddressNIC == r.outgoingNIC {
+		linkAddressResolutionRequestLocalAddr = r.LocalAddress()
 	}
-	r.ref.nic.stats.Tx.Packets.IncrementBy(uint64(n))
-	payloadSize := 0
-	for i := 0; i < n; i++ {
-		r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(pkts[i].Header.UsedLength()))
-		payloadSize += pkts[i].DataSize
+
+	nEntry := r.getCachedNeighborEntry()
+	if nEntry != nil {
+		if addr, ok := nEntry.getRemoteLinkAddress(); ok {
+			fields.RemoteLinkAddress = addr
+			if afterResolve != nil {
+				afterResolve(ResolvedFieldsResult{RouteInfo: fields, Err: nil})
+			}
+			return fields, nil, nil
+		}
 	}
-	r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(payloadSize))
-	return n, err
+	afterResolveFields := fields
+	entry, ch, err := r.linkRes.neigh.entry(r.nextHop(), linkAddressResolutionRequestLocalAddr, func(lrr LinkResolutionResult) {
+		if afterResolve != nil {
+			if lrr.Err == nil {
+				afterResolveFields.RemoteLinkAddress = lrr.LinkAddress
+			}
+
+			afterResolve(ResolvedFieldsResult{RouteInfo: afterResolveFields, Err: lrr.Err})
+		}
+	})
+	if err == nil {
+		fields.RemoteLinkAddress, _ = entry.getRemoteLinkAddress()
+	}
+	r.setCachedNeighborEntry(entry)
+	return fields, ch, err
+}
+
+func (r *Route) getCachedNeighborEntry() *neighborEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.neighborEntry
+}
+
+func (r *Route) setCachedNeighborEntry(entry *neighborEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.neighborEntry = entry
+}
+
+func (r *Route) nextHop() tcpip.Address {
+	if r.NextHop().BitLen() == 0 {
+		return r.RemoteAddress()
+	}
+	return r.NextHop()
+}
+
+// local returns true if the route is a local route.
+func (r *Route) local() bool {
+	return r.Loop() == PacketLoop || r.outgoingNIC.IsLoopback()
+}
+
+// IsResolutionRequired returns true if Resolve() must be called to resolve
+// the link address before the route can be written to.
+//
+// The NICs the route is associated with must not be locked.
+func (r *Route) IsResolutionRequired() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isResolutionRequiredRLocked()
+}
+
+// +checklocksread:r.mu
+func (r *Route) isResolutionRequiredRLocked() bool {
+	return len(r.remoteLinkAddress) == 0 && r.linkRes != nil && r.isValidForOutgoingRLocked() && !r.local()
+}
+
+func (r *Route) isValidForOutgoing() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isValidForOutgoingRLocked()
+}
+
+// +checklocksread:r.mu
+func (r *Route) isValidForOutgoingRLocked() bool {
+	if !r.outgoingNIC.Enabled() {
+		return false
+	}
+
+	localAddressEndpoint := r.localAddressEndpoint
+	if localAddressEndpoint == nil || !r.localAddressNIC.isValidForOutgoing(localAddressEndpoint) {
+		return false
+	}
+
+	// If the source NIC and outgoing NIC are different, make sure the stack has
+	// forwarding enabled, or the packet will be handled locally.
+	if r.outgoingNIC != r.localAddressNIC && !isNICForwarding(r.localAddressNIC, r.NetProto()) && (!r.outgoingNIC.stack.handleLocal || !r.outgoingNIC.hasAddress(r.NetProto(), r.RemoteAddress())) {
+		return false
+	}
+
+	return true
+}
+
+// WritePacket writes the packet through the given route.
+func (r *Route) WritePacket(params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error {
+	if !r.isValidForOutgoing() {
+		return &tcpip.ErrInvalidEndpointState{}
+	}
+
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WritePacket(r, params, pkt)
 }
 
 // WriteHeaderIncludedPacket writes a packet already containing a network
 // header through the given route.
-func (r *Route) WriteHeaderIncludedPacket(pkt tcpip.PacketBuffer) *tcpip.Error {
-	if !r.ref.isValidForOutgoing() {
-		return tcpip.ErrInvalidEndpointState
+func (r *Route) WriteHeaderIncludedPacket(pkt *PacketBuffer) tcpip.Error {
+	if !r.isValidForOutgoing() {
+		return &tcpip.ErrInvalidEndpointState{}
 	}
 
-	if err := r.ref.ep.WriteHeaderIncludedPacket(r, pkt); err != nil {
-		r.Stats().IP.OutgoingPacketErrors.Increment()
-		return err
-	}
-	r.ref.nic.stats.Tx.Packets.Increment()
-	r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(pkt.Data.Size()))
-	return nil
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WriteHeaderIncludedPacket(r, pkt)
 }
 
 // DefaultTTL returns the default TTL of the underlying network endpoint.
 func (r *Route) DefaultTTL() uint8 {
-	return r.ref.ep.DefaultTTL()
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).DefaultTTL()
 }
 
-// MTU returns the MTU of the underlying network endpoint.
+// MTU returns the MTU of the route if present, otherwise the MTU of the underlying network endpoint.
 func (r *Route) MTU() uint32 {
-	return r.ref.ep.MTU()
+	if r.mtu > 0 {
+		return r.mtu
+	}
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).MTU()
 }
 
-// Release frees all resources associated with the route.
+// Release decrements the reference counter of the resources associated with the
+// route.
 func (r *Route) Release() {
-	if r.ref != nil {
-		r.ref.decRef()
-		r.ref = nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if ep := r.localAddressEndpoint; ep != nil {
+		ep.DecRef()
 	}
 }
 
-// Clone Clone a route such that the original one can be released and the new
-// one will remain valid.
-func (r *Route) Clone() Route {
-	if r.ref != nil {
-		r.ref.incRef()
-	}
-	return *r
+// Acquire increments the reference counter of the resources associated with the
+// route.
+func (r *Route) Acquire() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.acquireLocked()
 }
 
-// MakeLoopedRoute duplicates the given route with special handling for routes
-// used for sending multicast or broadcast packets. In those cases the
-// multicast/broadcast address is the remote address when sending out, but for
-// incoming (looped) packets it becomes the local address. Similarly, the local
-// interface address that was the local address going out becomes the remote
-// address coming in. This is different to unicast routes where local and
-// remote addresses remain the same as they identify location (local vs remote)
-// not direction (source vs destination).
-func (r *Route) MakeLoopedRoute() Route {
-	l := r.Clone()
-	if r.RemoteAddress == header.IPv4Broadcast || header.IsV4MulticastAddress(r.RemoteAddress) || header.IsV6MulticastAddress(r.RemoteAddress) {
-		l.RemoteAddress, l.LocalAddress = l.LocalAddress, l.RemoteAddress
-		l.RemoteLinkAddress = l.LocalLinkAddress
+// +checklocksread:r.mu
+func (r *Route) acquireLocked() {
+	if ep := r.localAddressEndpoint; ep != nil {
+		if !ep.TryIncRef() {
+			panic(fmt.Sprintf("failed to increment reference count for local address endpoint = %s", r.LocalAddress()))
+		}
 	}
-	return l
 }
 
 // Stack returns the instance of the Stack that owns this route.
 func (r *Route) Stack() *Stack {
-	return r.ref.stack()
+	return r.outgoingNIC.stack
+}
+
+func (r *Route) isV4Broadcast(addr tcpip.Address) bool {
+	if addr == header.IPv4Broadcast {
+		return true
+	}
+
+	r.mu.RLock()
+	localAddressEndpoint := r.localAddressEndpoint
+	r.mu.RUnlock()
+	if localAddressEndpoint == nil {
+		return false
+	}
+
+	subnet := localAddressEndpoint.Subnet()
+	return subnet.IsBroadcast(addr)
+}
+
+// IsOutboundBroadcast returns true if the route is for an outbound broadcast
+// packet.
+func (r *Route) IsOutboundBroadcast() bool {
+	// Only IPv4 has a notion of broadcast.
+	return r.isV4Broadcast(r.RemoteAddress())
+}
+
+// ConfirmReachable informs the network/link layer that the neighbour used for
+// the route is reachable.
+//
+// "Reachable" is defined as having full-duplex communication between the
+// local and remote ends of the route.
+func (r *Route) ConfirmReachable() {
+	if entry := r.getCachedNeighborEntry(); entry != nil {
+		entry.handleUpperLevelConfirmation()
+	}
 }

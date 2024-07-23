@@ -12,173 +12,226 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
 // +build linux
 
 package fdbased
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/stack/gro"
 )
 
-// BufConfig defines the shape of the vectorised view used to read packets from the NIC.
+// BufConfig defines the shape of the buffer used to read packets from the NIC.
 var BufConfig = []int{128, 256, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
+
+type iovecBuffer struct {
+	// buffer is the actual buffer that holds the packet contents. Some contents
+	// are reused across calls to pullBuffer if number of requested bytes is
+	// smaller than the number of bytes allocated in the buffer.
+	views []*buffer.View
+
+	// iovecs are initialized with base pointers/len of the corresponding
+	// entries in the views defined above, except when GSO is enabled
+	// (skipsVnetHdr) then the first iovec points to a buffer for the vnet header
+	// which is stripped before the views are passed up the stack for further
+	// processing.
+	iovecs []unix.Iovec
+
+	// sizes is an array of buffer sizes for the underlying views. sizes is
+	// immutable.
+	sizes []int
+
+	// skipsVnetHdr is true if virtioNetHdr is to skipped.
+	skipsVnetHdr bool
+
+	// pulledIndex is the index of the last []byte buffer pulled from the
+	// underlying buffer storage during a call to pullBuffers. It is -1
+	// if no buffer is pulled.
+	pulledIndex int
+}
+
+func newIovecBuffer(sizes []int, skipsVnetHdr bool) *iovecBuffer {
+	b := &iovecBuffer{
+		views:        make([]*buffer.View, len(sizes)),
+		sizes:        sizes,
+		skipsVnetHdr: skipsVnetHdr,
+	}
+	niov := len(b.views)
+	if b.skipsVnetHdr {
+		niov++
+	}
+	b.iovecs = make([]unix.Iovec, niov)
+	return b
+}
+
+func (b *iovecBuffer) nextIovecs() []unix.Iovec {
+	vnetHdrOff := 0
+	if b.skipsVnetHdr {
+		var vnetHdr [virtioNetHdrSize]byte
+		// The kernel adds virtioNetHdr before each packet, but
+		// we don't use it, so we allocate a buffer for it,
+		// add it in iovecs but don't add it in a view.
+		b.iovecs[0] = unix.Iovec{Base: &vnetHdr[0]}
+		b.iovecs[0].SetLen(virtioNetHdrSize)
+		vnetHdrOff++
+	}
+
+	for i := range b.views {
+		if b.views[i] != nil {
+			break
+		}
+		v := buffer.NewViewSize(b.sizes[i])
+		b.views[i] = v
+		b.iovecs[i+vnetHdrOff] = unix.Iovec{Base: v.BasePtr()}
+		b.iovecs[i+vnetHdrOff].SetLen(v.Size())
+	}
+	return b.iovecs
+}
+
+// pullBuffer extracts the enough underlying storage from b.buffer to hold n
+// bytes. It removes this storage from b.buffer, returns a new buffer
+// that holds the storage, and updates pulledIndex to indicate which part
+// of b.buffer's storage must be reallocated during the next call to
+// nextIovecs.
+func (b *iovecBuffer) pullBuffer(n int) buffer.Buffer {
+	var views []*buffer.View
+	c := 0
+	if b.skipsVnetHdr {
+		c += virtioNetHdrSize
+		if c >= n {
+			// Nothing in the packet.
+			return buffer.Buffer{}
+		}
+	}
+	// Remove the used views from the buffer.
+	for i, v := range b.views {
+		c += v.Size()
+		if c >= n {
+			b.views[i].CapLength(v.Size() - (c - n))
+			views = append(views, b.views[:i+1]...)
+			break
+		}
+	}
+	for i := range views {
+		b.views[i] = nil
+	}
+	if b.skipsVnetHdr {
+		// Exclude the size of the vnet header.
+		n -= virtioNetHdrSize
+	}
+	pulled := buffer.Buffer{}
+	for _, v := range views {
+		pulled.Append(v)
+	}
+	pulled.Truncate(int64(n))
+	return pulled
+}
+
+func (b *iovecBuffer) release() {
+	for _, v := range b.views {
+		if v != nil {
+			v.Release()
+			v = nil
+		}
+	}
+}
 
 // readVDispatcher uses readv() system call to read inbound packets and
 // dispatches them.
 type readVDispatcher struct {
+	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
 	// e is the endpoint this dispatcher is attached to.
 	e *endpoint
 
-	// views are the actual buffers that hold the packet contents.
-	views []buffer.View
+	// buf is the iovec buffer that contains the packet contents.
+	buf *iovecBuffer
 
-	// iovecs are initialized with base pointers/len of the corresponding
-	// entries in the views defined above, except when GSO is enabled then
-	// the first iovec points to a buffer for the vnet header which is
-	// stripped before the views are passed up the stack for further
-	// processing.
-	iovecs []syscall.Iovec
+	// mgr is the processor goroutine manager.
+	mgr *processorManager
 }
 
-func newReadVDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
-	d := &readVDispatcher{fd: fd, e: e}
-	d.views = make([]buffer.View, len(BufConfig))
-	iovLen := len(BufConfig)
-	if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-		iovLen++
+func newReadVDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
+	stopFD, err := stopfd.New()
+	if err != nil {
+		return nil, err
 	}
-	d.iovecs = make([]syscall.Iovec, iovLen)
+	d := &readVDispatcher{
+		StopFD: stopFD,
+		fd:     fd,
+		e:      e,
+	}
+	skipsVnetHdr := d.e.gsoKind == stack.HostGSOSupported
+	d.buf = newIovecBuffer(BufConfig, skipsVnetHdr)
+	d.mgr = newProcessorManager(opts, e)
+	d.mgr.start()
 	return d, nil
 }
 
-func (d *readVDispatcher) allocateViews(bufConfig []int) {
-	var vnetHdr [virtioNetHdrSize]byte
-	vnetHdrOff := 0
-	if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-		// The kernel adds virtioNetHdr before each packet, but
-		// we don't use it, so so we allocate a buffer for it,
-		// add it in iovecs but don't add it in a view.
-		d.iovecs[0] = syscall.Iovec{
-			Base: &vnetHdr[0],
-			Len:  uint64(virtioNetHdrSize),
-		}
-		vnetHdrOff++
-	}
-	for i := 0; i < len(bufConfig); i++ {
-		if d.views[i] != nil {
-			break
-		}
-		b := buffer.NewView(bufConfig[i])
-		d.views[i] = b
-		d.iovecs[i+vnetHdrOff] = syscall.Iovec{
-			Base: &b[0],
-			Len:  uint64(len(b)),
-		}
-	}
-}
-
-func (d *readVDispatcher) capViews(n int, buffers []int) int {
-	c := 0
-	for i, s := range buffers {
-		c += s
-		if c >= n {
-			d.views[i].CapLength(s - (c - n))
-			return i + 1
-		}
-	}
-	return len(buffers)
+func (d *readVDispatcher) release() {
+	d.buf.release()
+	d.mgr.close()
 }
 
 // dispatch reads one packet from the file descriptor and dispatches it.
-func (d *readVDispatcher) dispatch() (bool, *tcpip.Error) {
-	d.allocateViews(BufConfig)
-
-	n, err := rawfile.BlockingReadv(d.fd, d.iovecs)
-	if err != nil {
-		return false, err
-	}
-	if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-		// Skip virtioNetHdr which is added before each packet, it
-		// isn't used and it isn't in a view.
-		n -= virtioNetHdrSize
-	}
-	if n <= d.e.hdrSize {
-		return false, nil
+func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
+	n, errno := rawfile.BlockingReadvUntilStopped(d.EFD, d.fd, d.buf.nextIovecs())
+	if n <= 0 || errno != 0 {
+		return false, tcpip.TranslateErrno(errno)
 	}
 
-	var (
-		p             tcpip.NetworkProtocolNumber
-		remote, local tcpip.LinkAddress
-		eth           header.Ethernet
-	)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: d.buf.pullBuffer(n),
+	})
+	defer pkt.DecRef()
+
 	if d.e.hdrSize > 0 {
-		eth = header.Ethernet(d.views[0][:header.EthernetMinimumSize])
-		p = eth.Type()
-		remote = eth.SourceAddress()
-		local = eth.DestinationAddress()
-	} else {
-		// We don't get any indication of what the packet is, so try to guess
-		// if it's an IPv4 or IPv6 packet.
-		switch header.IPVersion(d.views[0]) {
-		case header.IPv4Version:
-			p = header.IPv4ProtocolNumber
-		case header.IPv6Version:
-			p = header.IPv6ProtocolNumber
-		default:
-			return true, nil
+		if !d.e.parseHeader(pkt) {
+			return false, nil
 		}
+		pkt.NetworkProtocolNumber = header.Ethernet(pkt.LinkHeader().Slice()).Type()
 	}
-
-	used := d.capViews(n, BufConfig)
-	pkt := tcpip.PacketBuffer{
-		Data:       buffer.NewVectorisedView(n, append([]buffer.View(nil), d.views[:used]...)),
-		LinkHeader: buffer.View(eth),
-	}
-	pkt.Data.TrimFront(d.e.hdrSize)
-
-	d.e.dispatcher.DeliverNetworkPacket(d.e, remote, local, p, pkt)
-
-	// Prepare e.views for another packet: release used views.
-	for i := 0; i < used; i++ {
-		d.views[i] = nil
-	}
-
+	d.mgr.queuePacket(pkt, d.e.hdrSize > 0)
+	d.mgr.wakeReady()
 	return true, nil
 }
 
 // recvMMsgDispatcher uses the recvmmsg system call to read inbound packets and
 // dispatches them.
 type recvMMsgDispatcher struct {
+	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
 	// e is the endpoint this dispatcher is attached to.
 	e *endpoint
 
-	// views is an array of array of buffers that contain packet contents.
-	views [][]buffer.View
-
-	// iovecs is an array of array of iovec records where each iovec base
-	// pointer and length are initialzed to the corresponding view above,
-	// except when GSO is neabled then the first iovec in each array of
-	// iovecs points to a buffer for the vnet header which is stripped
-	// before the views are passed up the stack for further processing.
-	iovecs [][]syscall.Iovec
+	// bufs is an array of iovec buffers that contain packet contents.
+	bufs []*iovecBuffer
 
 	// msgHdrs is an array of MMsgHdr objects where each MMsghdr is used to
 	// reference an array of iovecs in the iovecs field defined above.  This
 	// array is passed as the parameter to recvmmsg call to retrieve
-	// potentially more than 1 packet per syscall.
+	// potentially more than 1 packet per unix.
 	msgHdrs []rawfile.MMsgHdr
+
+	// pkts is reused to avoid allocations.
+	pkts stack.PacketBufferList
+
+	// gro coalesces incoming packets to increase throughput.
+	gro gro.GRO
+
+	// mgr is the processor goroutine manager.
+	mgr *processorManager
 }
 
 const (
@@ -187,131 +240,89 @@ const (
 	MaxMsgsPerRecv = 8
 )
 
-func newRecvMMsgDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
+func newRecvMMsgDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
+	stopFD, err := stopfd.New()
+	if err != nil {
+		return nil, err
+	}
 	d := &recvMMsgDispatcher{
-		fd: fd,
-		e:  e,
+		StopFD:  stopFD,
+		fd:      fd,
+		e:       e,
+		bufs:    make([]*iovecBuffer, MaxMsgsPerRecv),
+		msgHdrs: make([]rawfile.MMsgHdr, MaxMsgsPerRecv),
 	}
-	d.views = make([][]buffer.View, MaxMsgsPerRecv)
-	for i := range d.views {
-		d.views[i] = make([]buffer.View, len(BufConfig))
+	skipsVnetHdr := d.e.gsoKind == stack.HostGSOSupported
+	for i := range d.bufs {
+		d.bufs[i] = newIovecBuffer(BufConfig, skipsVnetHdr)
 	}
-	d.iovecs = make([][]syscall.Iovec, MaxMsgsPerRecv)
-	iovLen := len(BufConfig)
-	if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-		// virtioNetHdr is prepended before each packet.
-		iovLen++
-	}
-	for i := range d.iovecs {
-		d.iovecs[i] = make([]syscall.Iovec, iovLen)
-	}
-	d.msgHdrs = make([]rawfile.MMsgHdr, MaxMsgsPerRecv)
-	for i := range d.msgHdrs {
-		d.msgHdrs[i].Msg.Iov = &d.iovecs[i][0]
-		d.msgHdrs[i].Msg.Iovlen = uint64(iovLen)
-	}
+	d.gro.Init(opts.GRO)
+	d.mgr = newProcessorManager(opts, e)
+	d.mgr.start()
+
 	return d, nil
 }
 
-func (d *recvMMsgDispatcher) capViews(k, n int, buffers []int) int {
-	c := 0
-	for i, s := range buffers {
-		c += s
-		if c >= n {
-			d.views[k][i].CapLength(s - (c - n))
-			return i + 1
-		}
+func (d *recvMMsgDispatcher) release() {
+	for _, iov := range d.bufs {
+		iov.release()
 	}
-	return len(buffers)
-}
-
-func (d *recvMMsgDispatcher) allocateViews(bufConfig []int) {
-	for k := 0; k < len(d.views); k++ {
-		var vnetHdr [virtioNetHdrSize]byte
-		vnetHdrOff := 0
-		if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-			// The kernel adds virtioNetHdr before each packet, but
-			// we don't use it, so so we allocate a buffer for it,
-			// add it in iovecs but don't add it in a view.
-			d.iovecs[k][0] = syscall.Iovec{
-				Base: &vnetHdr[0],
-				Len:  uint64(virtioNetHdrSize),
-			}
-			vnetHdrOff++
-		}
-		for i := 0; i < len(bufConfig); i++ {
-			if d.views[k][i] != nil {
-				break
-			}
-			b := buffer.NewView(bufConfig[i])
-			d.views[k][i] = b
-			d.iovecs[k][i+vnetHdrOff] = syscall.Iovec{
-				Base: &b[0],
-				Len:  uint64(len(b)),
-			}
-		}
-	}
+	d.mgr.close()
 }
 
 // recvMMsgDispatch reads more than one packet at a time from the file
 // descriptor and dispatches it.
-func (d *recvMMsgDispatcher) dispatch() (bool, *tcpip.Error) {
-	d.allocateViews(BufConfig)
-
-	nMsgs, err := rawfile.BlockingRecvMMsg(d.fd, d.msgHdrs)
-	if err != nil {
-		return false, err
+func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
+	// Fill message headers.
+	for k := range d.msgHdrs {
+		if d.msgHdrs[k].Msg.Iovlen > 0 {
+			break
+		}
+		iovecs := d.bufs[k].nextIovecs()
+		iovLen := len(iovecs)
+		d.msgHdrs[k].Len = 0
+		d.msgHdrs[k].Msg.Iov = &iovecs[0]
+		d.msgHdrs[k].Msg.SetIovlen(iovLen)
 	}
+
+	nMsgs, errno := rawfile.BlockingRecvMMsgUntilStopped(d.EFD, d.fd, d.msgHdrs)
+	if errno != 0 {
+		return false, tcpip.TranslateErrno(errno)
+	}
+	if nMsgs == -1 {
+		return false, nil
+	}
+
 	// Process each of received packets.
+
+	d.e.mu.RLock()
+	dsp := d.e.dispatcher
+	d.e.mu.RUnlock()
+
+	d.gro.Dispatcher = dsp
+	defer d.pkts.Reset()
+
 	for k := 0; k < nMsgs; k++ {
 		n := int(d.msgHdrs[k].Len)
-		if d.e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
-			n -= virtioNetHdrSize
-		}
-		if n <= d.e.hdrSize {
-			return false, nil
-		}
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: d.bufs[k].pullBuffer(n),
+		})
+		d.pkts.PushBack(pkt)
 
-		var (
-			p             tcpip.NetworkProtocolNumber
-			remote, local tcpip.LinkAddress
-			eth           header.Ethernet
-		)
+		// Mark that this iovec has been processed.
+		d.msgHdrs[k].Msg.Iovlen = 0
+
 		if d.e.hdrSize > 0 {
-			eth = header.Ethernet(d.views[k][0])
-			p = eth.Type()
-			remote = eth.SourceAddress()
-			local = eth.DestinationAddress()
-		} else {
-			// We don't get any indication of what the packet is, so try to guess
-			// if it's an IPv4 or IPv6 packet.
-			switch header.IPVersion(d.views[k][0]) {
-			case header.IPv4Version:
-				p = header.IPv4ProtocolNumber
-			case header.IPv6Version:
-				p = header.IPv6ProtocolNumber
-			default:
-				return true, nil
+			hdr, ok := pkt.LinkHeader().Consume(d.e.hdrSize)
+			if !ok {
+				return false, nil
 			}
+			pkt.NetworkProtocolNumber = header.Ethernet(hdr).Type()
 		}
-
-		used := d.capViews(k, int(n), BufConfig)
-		pkt := tcpip.PacketBuffer{
-			Data:       buffer.NewVectorisedView(int(n), append([]buffer.View(nil), d.views[k][:used]...)),
-			LinkHeader: buffer.View(eth),
-		}
-		pkt.Data.TrimFront(d.e.hdrSize)
-		d.e.dispatcher.DeliverNetworkPacket(d.e, remote, local, p, pkt)
-
-		// Prepare e.views for another packet: release used views.
-		for i := 0; i < used; i++ {
-			d.views[k][i] = nil
-		}
+		pkt.RXChecksumValidated = d.e.caps&stack.CapabilityRXChecksumOffload != 0
+		d.mgr.queuePacket(pkt, d.e.hdrSize > 0)
 	}
-
-	for k := 0; k < nMsgs; k++ {
-		d.msgHdrs[k].Len = 0
-	}
+	d.mgr.wakeReady()
 
 	return true, nil
 }

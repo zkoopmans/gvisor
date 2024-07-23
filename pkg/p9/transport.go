@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -64,16 +64,19 @@ const (
 )
 
 var dataPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		// These buffers are used for decoding without a payload.
-		return make([]byte, initialBufferLength)
+		// We need to return a pointer to avoid unnecessary allocations
+		// (see https://staticcheck.io/docs/checks#SA6002).
+		b := make([]byte, initialBufferLength)
+		return &b
 	},
 }
 
 // send sends the given message over the socket.
 func send(s *unet.Socket, tag Tag, m message) error {
-	data := dataPool.Get().([]byte)
-	dataBuf := buffer{data: data[:0]}
+	data := dataPool.Get().(*[]byte)
+	dataBuf := buffer{data: (*data)[:0]}
 
 	if log.IsLogging(log.Debug) {
 		log.Debugf("send [FD %d] [Tag %06d] %s", s.FD(), tag, m.String())
@@ -141,7 +144,7 @@ func send(s *unet.Socket, tag Tag, m message) error {
 	}
 
 	// All set.
-	dataPool.Put(dataBuf.data)
+	dataPool.Put(&dataBuf.data)
 	return nil
 }
 
@@ -184,7 +187,7 @@ func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, 
 		// fds are caught and used is handled below,
 		// and the fds variable will be set to nil.
 		for _, fd := range fds {
-			syscall.Close(fd)
+			unix.Close(fd)
 		}
 	}()
 	r.EnableFDs(0)
@@ -227,12 +230,29 @@ func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, 
 
 	// Not yet initialized.
 	var dataBuf buffer
+	var vecs [][]byte
+
+	appendBuffer := func(size int) *[]byte {
+		// Pull a data buffer from the pool.
+		datap := dataPool.Get().(*[]byte)
+		data := *datap
+		if size > len(data) {
+			// Create a larger data buffer.
+			data = make([]byte, size)
+			datap = &data
+		} else {
+			// Limit the data buffer.
+			data = data[:size]
+		}
+		dataBuf = buffer{data: data}
+		vecs = append(vecs, data)
+		return datap
+	}
 
 	// Read the rest of the payload.
 	//
 	// This requires some special care to ensure that the vectors all line
 	// up the way they should. We do this to minimize copying data around.
-	var vecs [][]byte
 	if payloader, ok := m.(payloader); ok {
 		fixedSize := payloader.FixedSize()
 
@@ -246,22 +266,8 @@ func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, 
 		}
 
 		if fixedSize != 0 {
-			// Pull a data buffer from the pool.
-			data := dataPool.Get().([]byte)
-			if int(fixedSize) > len(data) {
-				// Create a larger data buffer, ensuring
-				// sufficient capicity for the message.
-				data = make([]byte, fixedSize)
-				defer dataPool.Put(data)
-				dataBuf = buffer{data: data}
-				vecs = append(vecs, data)
-			} else {
-				// Limit the data buffer, and make sure it
-				// gets filled before the payload buffer.
-				defer dataPool.Put(data)
-				dataBuf = buffer{data: data[:fixedSize]}
-				vecs = append(vecs, data[:fixedSize])
-			}
+			datap := appendBuffer(int(fixedSize))
+			defer dataPool.Put(datap)
 		}
 
 		// Include the payload.
@@ -274,20 +280,8 @@ func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, 
 			vecs = append(vecs, p)
 		}
 	} else if remaining != 0 {
-		// Pull a data buffer from the pool.
-		data := dataPool.Get().([]byte)
-		if int(remaining) > len(data) {
-			// Create a larger data buffer.
-			data = make([]byte, remaining)
-			defer dataPool.Put(data)
-			dataBuf = buffer{data: data}
-			vecs = append(vecs, data)
-		} else {
-			// Limit the data buffer.
-			defer dataPool.Put(data)
-			dataBuf = buffer{data: data[:remaining]}
-			vecs = append(vecs, data[:remaining])
-		}
+		datap := appendBuffer(int(remaining))
+		defer dataPool.Put(datap)
 	}
 
 	if len(vecs) > 0 {
@@ -329,7 +323,7 @@ func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, 
 
 		// Close the rest. We support only one.
 		for i := 1; i < len(fds); i++ {
-			syscall.Close(fds[i])
+			unix.Close(fds[i])
 		}
 
 		// Don't close in the defer.

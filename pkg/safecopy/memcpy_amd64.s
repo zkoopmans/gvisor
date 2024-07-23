@@ -28,7 +28,7 @@
 //
 // It must have the same frame configuration as memcpy so that it can undo any
 // potential call frame set up by the assembler.
-TEXT handleMemcpyFault(SB), NOSPLIT, $0-36
+TEXT handleMemcpyFault(SB), NOSPLIT|NOFRAME, $0-36
 	MOVQ	AX, addr+24(FP)
 	MOVL	DI, sig+32(FP)
 	RET
@@ -45,25 +45,19 @@ TEXT handleMemcpyFault(SB), NOSPLIT, $0-36
 // The code is derived from the forward copying part of runtime.memmove.
 //
 // func memcpy(dst, src unsafe.Pointer, n uintptr) (fault unsafe.Pointer, sig int32)
-TEXT ·memcpy(SB), NOSPLIT, $0-36
+TEXT ·memcpy(SB), NOSPLIT|NOFRAME, $0-36
 	// Store 0 as the returned signal number. If we run to completion,
 	// this is the value the caller will see; if a signal is received,
 	// handleMemcpyFault will store a different value in this address.
 	MOVL	$0, sig+32(FP)
 
-	MOVQ	to+0(FP), DI
-	MOVQ	from+8(FP), SI
+	MOVQ	dst+0(FP), DI
+	MOVQ	src+8(FP), SI
 	MOVQ	n+16(FP), BX
 
-	// REP instructions have a high startup cost, so we handle small sizes
-	// with some straightline code. The REP MOVSQ instruction is really fast
-	// for large sizes. The cutover is approximately 2K.
 tail:
-	// move_129through256 or smaller work whether or not the source and the
-	// destination memory regions overlap because they load all data into
-	// registers before writing it back.  move_256through2048 on the other
-	// hand can be used only when the memory regions don't overlap or the copy
-	// direction is forward.
+	// BSR+branch table make almost all memmove/memclr benchmarks worse. Not
+	// worth doing.
 	TESTQ	BX, BX
 	JEQ	move_0
 	CMPQ	BX, $2
@@ -83,31 +77,45 @@ tail:
 	JBE	move_65through128
 	CMPQ	BX, $256
 	JBE	move_129through256
-	// TODO: use branch table and BSR to make this just a single dispatch
 
-/*
- * forward copy loop
- */
-	CMPQ	BX, $2048
-	JLS	move_256through2048
-
-	// Check alignment
-	MOVL	SI, AX
-	ORL	DI, AX
-	TESTL	$7, AX
-	JEQ	fwdBy8
-
-	// Do 1 byte at a time
-	MOVQ	BX, CX
-	REP;	MOVSB
-	RET
-
-fwdBy8:
-	// Do 8 bytes at a time
-	MOVQ	BX, CX
-	SHRQ	$3, CX
-	ANDQ	$7, BX
-	REP;	MOVSQ
+move_257plus:
+	SUBQ	$256, BX
+	MOVOU	(SI), X0
+	MOVOU	X0, (DI)
+	MOVOU	16(SI), X1
+	MOVOU	X1, 16(DI)
+	MOVOU	32(SI), X2
+	MOVOU	X2, 32(DI)
+	MOVOU	48(SI), X3
+	MOVOU	X3, 48(DI)
+	MOVOU	64(SI), X4
+	MOVOU	X4, 64(DI)
+	MOVOU	80(SI), X5
+	MOVOU	X5, 80(DI)
+	MOVOU	96(SI), X6
+	MOVOU	X6, 96(DI)
+	MOVOU	112(SI), X7
+	MOVOU	X7, 112(DI)
+	MOVOU	128(SI), X8
+	MOVOU	X8, 128(DI)
+	MOVOU	144(SI), X9
+	MOVOU	X9, 144(DI)
+	MOVOU	160(SI), X10
+	MOVOU	X10, 160(DI)
+	MOVOU	176(SI), X11
+	MOVOU	X11, 176(DI)
+	MOVOU	192(SI), X12
+	MOVOU	X12, 192(DI)
+	MOVOU	208(SI), X13
+	MOVOU	X13, 208(DI)
+	MOVOU	224(SI), X14
+	MOVOU	X14, 224(DI)
+	MOVOU	240(SI), X15
+	MOVOU	X15, 240(DI)
+	CMPQ	BX, $256
+	LEAQ	256(SI), SI
+	LEAQ	256(DI), DI
+	JGE	move_257plus
 	JMP	tail
 
 move_1or2:
@@ -209,42 +217,9 @@ move_129through256:
 	MOVOU	-16(SI)(BX*1), X15
 	MOVOU	X15, -16(DI)(BX*1)
 	RET
-move_256through2048:
-	SUBQ	$256, BX
-	MOVOU	(SI), X0
-	MOVOU	X0, (DI)
-	MOVOU	16(SI), X1
-	MOVOU	X1, 16(DI)
-	MOVOU	32(SI), X2
-	MOVOU	X2, 32(DI)
-	MOVOU	48(SI), X3
-	MOVOU	X3, 48(DI)
-	MOVOU	64(SI), X4
-	MOVOU	X4, 64(DI)
-	MOVOU	80(SI), X5
-	MOVOU	X5, 80(DI)
-	MOVOU	96(SI), X6
-	MOVOU	X6, 96(DI)
-	MOVOU	112(SI), X7
-	MOVOU	X7, 112(DI)
-	MOVOU	128(SI), X8
-	MOVOU	X8, 128(DI)
-	MOVOU	144(SI), X9
-	MOVOU	X9, 144(DI)
-	MOVOU	160(SI), X10
-	MOVOU	X10, 160(DI)
-	MOVOU	176(SI), X11
-	MOVOU	X11, 176(DI)
-	MOVOU	192(SI), X12
-	MOVOU	X12, 192(DI)
-	MOVOU	208(SI), X13
-	MOVOU	X13, 208(DI)
-	MOVOU	224(SI), X14
-	MOVOU	X14, 224(DI)
-	MOVOU	240(SI), X15
-	MOVOU	X15, 240(DI)
-	CMPQ	BX, $256
-	LEAQ	256(SI), SI
-	LEAQ	256(DI), DI
-	JGE	move_256through2048
-	JMP	tail
+
+// func addrOfMemcpy() uintptr
+TEXT ·addrOfMemcpy(SB), $0-8
+	MOVQ	$·memcpy(SB), AX
+	MOVQ	AX, ret+0(FP)
+	RET

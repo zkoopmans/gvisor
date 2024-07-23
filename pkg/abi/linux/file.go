@@ -19,7 +19,6 @@ import (
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi"
-	"gvisor.dev/gvisor/pkg/binary"
 )
 
 // Constants for open(2).
@@ -95,6 +94,11 @@ const (
 const (
 	AT_SYMLINK_FOLLOW = 0x400
 	AT_EMPTY_PATH     = 0x1000
+)
+
+// Constants for faccessat2(2).
+const (
+	AT_EACCESS = 0x200
 )
 
 // Constants for all file-related ...at(2) syscalls.
@@ -189,10 +193,45 @@ var DirentType = abi.ValueSet{
 	DT_WHT:     "DT_WHT",
 }
 
+// Values for fs on-disk file types.
+const (
+	FT_UNKNOWN  = 0
+	FT_REG_FILE = 1
+	FT_DIR      = 2
+	FT_CHRDEV   = 3
+	FT_BLKDEV   = 4
+	FT_FIFO     = 5
+	FT_SOCK     = 6
+	FT_SYMLINK  = 7
+	FT_MAX      = 8
+)
+
+// Conversion from fs on-disk file type to dirent type.
+var direntTypeByFileType = [FT_MAX]uint8{
+	FT_UNKNOWN:  DT_UNKNOWN,
+	FT_REG_FILE: DT_REG,
+	FT_DIR:      DT_DIR,
+	FT_CHRDEV:   DT_CHR,
+	FT_BLKDEV:   DT_BLK,
+	FT_FIFO:     DT_FIFO,
+	FT_SOCK:     DT_SOCK,
+	FT_SYMLINK:  DT_LNK,
+}
+
+// FileTypeToDirentType converts the on-disk file type (FT_*) to the directory
+// entry type (DT_*).
+func FileTypeToDirentType(filetype uint8) uint8 {
+	if filetype >= FT_MAX {
+		return DT_UNKNOWN
+	}
+	return direntTypeByFileType[filetype]
+}
+
 // Values for preadv2/pwritev2.
 const (
-	// Note: gVisor does not implement the RWF_HIPRI feature, but the flag is
-	// accepted as a valid flag argument for preadv2/pwritev2.
+	// NOTE(b/120162627): gVisor does not implement the RWF_HIPRI feature, but
+	// the flag is accepted as a valid flag argument for preadv2/pwritev2 and
+	// silently ignored.
 	RWF_HIPRI = 0x00000001
 	RWF_DSYNC = 0x00000002
 	RWF_SYNC  = 0x00000004
@@ -200,10 +239,11 @@ const (
 )
 
 // SizeOfStat is the size of a Stat struct.
-var SizeOfStat = binary.Size(Stat{})
+var SizeOfStat = (*Stat)(nil).SizeBytes()
 
 // Flags for statx.
 const (
+	AT_NO_AUTOMOUNT       = 0x800
 	AT_STATX_SYNC_TYPE    = 0x6000
 	AT_STATX_SYNC_AS_STAT = 0x0000
 	AT_STATX_FORCE_SYNC   = 0x2000
@@ -241,6 +281,8 @@ const (
 )
 
 // Statx represents struct statx.
+//
+// +marshal boundCheck slice:StatxSlice
 type Statx struct {
 	Mask           uint32
 	Blksize        uint32
@@ -264,7 +306,18 @@ type Statx struct {
 	DevMinor       uint32
 }
 
+// String implements fmt.Stringer.String.
+func (s *Statx) String() string {
+	return fmt.Sprintf("Statx{Mask: %#x, Mode: %s, UID: %d, GID: %d, Ino: %d, DevMajor: %d, DevMinor: %d, Size: %d, Blocks: %d, Blksize: %d, Nlink: %d, Atime: %s, Btime: %s, Ctime: %s, Mtime: %s, Attributes: %d, AttributesMask: %d, RdevMajor: %d, RdevMinor: %d}",
+		s.Mask, FileMode(s.Mode), s.UID, s.GID, s.Ino, s.DevMajor, s.DevMinor, s.Size, s.Blocks, s.Blksize, s.Nlink, s.Atime.ToTime(), s.Btime.ToTime(), s.Ctime.ToTime(), s.Mtime.ToTime(), s.Attributes, s.AttributesMask, s.RdevMajor, s.RdevMinor)
+}
+
+// SizeOfStatx is the size of a Statx struct.
+var SizeOfStatx = (*Statx)(nil).SizeBytes()
+
 // FileMode represents a mode_t.
+//
+// +marshal
 type FileMode uint16
 
 // Permissions returns just the permission bits.
@@ -280,6 +333,11 @@ func (m FileMode) FileType() FileMode {
 // ExtraBits returns everything but the file type and permission bits.
 func (m FileMode) ExtraBits() FileMode {
 	return m &^ (PermissionsMask | FileTypeMask)
+}
+
+// IsDir returns true if file type represents a directory.
+func (m FileMode) IsDir() bool {
+	return m.FileType() == S_IFDIR
 }
 
 // String returns a string representation of m.
@@ -370,4 +428,10 @@ const (
 	FALLOC_FL_ZERO_RANGE     = 0x10
 	FALLOC_FL_INSERT_RANGE   = 0x20
 	FALLOC_FL_UNSHARE_RANGE  = 0x40
+)
+
+// Constants related to close_range(2). Source: /include/uapi/linux/close_range.h
+const (
+	CLOSE_RANGE_UNSHARE = uint32(1 << 1)
+	CLOSE_RANGE_CLOEXEC = uint32(1 << 2)
 )

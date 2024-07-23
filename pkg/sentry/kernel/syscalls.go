@@ -16,26 +16,29 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
+	"strconv"
 
+	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/abi"
+	"gvisor.dev/gvisor/pkg/abi/sentry"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// maxSyscallNum is the highest supported syscall number.
-//
-// The types below create fast lookup slices for all syscalls. This maximum
-// serves as a sanity check that we don't allocate huge slices for a very large
-// syscall.
-const maxSyscallNum = 2000
+// outOfRangeSyscallNumber is used to represent a syscall number that is out of the
+// range [0, maxSyscallNum] in monitoring.
+var outOfRangeSyscallNumber = []*metric.FieldValue{&metric.FieldValue{"-1"}}
 
 // SyscallSupportLevel is a syscall support levels.
 type SyscallSupportLevel int
 
-// String returns a human readable represetation of the support level.
+// String returns a human readable representation of the support level.
 func (l SyscallSupportLevel) String() string {
 	switch l {
 	case SupportUnimplemented:
@@ -75,10 +78,15 @@ type Syscall struct {
 	Note string
 	// URLs is set of URLs to any relevant bugs or issues.
 	URLs []string
+	// PointCallback is an optional callback that converts syscall arguments
+	// to a proto that can be used with seccheck.Sink.
+	// Callback functions must follow this naming convention:
+	//   PointSyscallNameInCamelCase, e.g. PointReadat, PointRtSigaction.
+	PointCallback SyscallToProto
 }
 
 // SyscallFn is a syscall implementation.
-type SyscallFn func(t *Task, args arch.SyscallArguments) (uintptr, *SyscallControl, error)
+type SyscallFn func(t *Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *SyscallControl, error)
 
 // MissingFn is a syscall to be called when an implementation is missing.
 type MissingFn func(t *Task, sysno uintptr, args arch.SyscallArguments) (uintptr, error)
@@ -101,6 +109,18 @@ const (
 
 	// ExternalAfterEnable enables the external hook after syscall execution.
 	ExternalAfterEnable
+
+	// SecCheckEnter represents a schematized/enter syscall seccheck event.
+	SecCheckEnter
+
+	// SecCheckExit represents a schematized/exit syscall seccheck event.
+	SecCheckExit
+
+	// SecCheckRawEnter represents raw/enter syscall seccheck event.
+	SecCheckRawEnter
+
+	// SecCheckRawExit represents raw/exit syscall seccheck event.
+	SecCheckRawExit
 )
 
 // StraceEnableBits combines both strace log and event flags.
@@ -119,34 +139,73 @@ type SyscallFlagsTable struct {
 	//
 	// missing syscalls have the same value in enable as missingEnable to
 	// avoid an extra branch in Word.
-	enable []uint32
+	enable [sentry.MaxSyscallNum + 1]atomicbitops.Uint32
 
 	// missingEnable contains the enable bits for missing syscalls.
-	missingEnable uint32
+	missingEnable atomicbitops.Uint32
 }
 
 // Init initializes the struct, with all syscalls in table set to enable.
 //
 // max is the largest syscall number in table.
-func (e *SyscallFlagsTable) init(table map[uintptr]Syscall, max uintptr) {
-	e.enable = make([]uint32, max+1)
+func (e *SyscallFlagsTable) init(table map[uintptr]Syscall) {
 	for num := range table {
-		e.enable[num] = syscallPresent
+		enableFlags := uint32(syscallPresent)
+		e.enable[num] = atomicbitops.FromUint32(enableFlags)
+	}
+	seccheck.Global.AddSyscallFlagListener(e)
+	e.UpdateSecCheck(&seccheck.Global)
+}
+
+// UpdateSecCheck implements seccheck.SyscallFlagListener.
+//
+// It is called when per-syscall seccheck event enablement changes.
+func (e *SyscallFlagsTable) UpdateSecCheck(state *seccheck.State) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for sysno := uintptr(0); sysno <= sentry.MaxSyscallNum; sysno++ {
+		oldFlags := e.enable[sysno].Load()
+		if !bits.IsOn32(oldFlags, syscallPresent) {
+			continue
+		}
+		flags := oldFlags
+		if state.SyscallEnabled(seccheck.SyscallEnter, sysno) {
+			flags |= SecCheckEnter
+		} else {
+			flags &^= SecCheckEnter
+		}
+		if state.SyscallEnabled(seccheck.SyscallExit, sysno) {
+			flags |= SecCheckExit
+		} else {
+			flags &^= SecCheckExit
+		}
+		if state.SyscallEnabled(seccheck.SyscallRawEnter, sysno) {
+			flags |= SecCheckRawEnter
+		} else {
+			flags &^= SecCheckRawEnter
+		}
+		if state.SyscallEnabled(seccheck.SyscallRawExit, sysno) {
+			flags |= SecCheckRawExit
+		} else {
+			flags &^= SecCheckRawExit
+		}
+		if flags != oldFlags {
+			e.enable[sysno].Store(flags)
+		}
 	}
 }
 
 // Word returns the enable bitfield for sysno.
 func (e *SyscallFlagsTable) Word(sysno uintptr) uint32 {
-	if sysno < uintptr(len(e.enable)) {
-		return atomic.LoadUint32(&e.enable[sysno])
+	if sysno <= sentry.MaxSyscallNum {
+		return e.enable[sysno].Load()
 	}
-
-	return atomic.LoadUint32(&e.missingEnable)
+	return e.missingEnable.Load()
 }
 
-// Enable sets enable bit bit for all syscalls based on s.
+// Enable sets enable bit `bit` for all syscalls based on s.
 //
-// Syscalls missing from s are disabled.
+// Syscalls missing from `s` are disabled.
 //
 // Syscalls missing from the initial table passed to Init cannot be added as
 // individual syscalls. If present in s they will be ignored.
@@ -157,19 +216,19 @@ func (e *SyscallFlagsTable) Enable(bit uint32, s map[uintptr]bool, missingEnable
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	missingVal := atomic.LoadUint32(&e.missingEnable)
+	missingVal := e.missingEnable.Load()
 	if missingEnable {
 		missingVal |= bit
 	} else {
 		missingVal &^= bit
 	}
-	atomic.StoreUint32(&e.missingEnable, missingVal)
+	e.missingEnable.Store(missingVal)
 
 	for num := range e.enable {
-		val := atomic.LoadUint32(&e.enable[num])
+		val := e.enable[num].Load()
 		if !bits.IsOn32(val, syscallPresent) {
 			// Missing.
-			atomic.StoreUint32(&e.enable[num], missingVal)
+			e.enable[num].Store(missingVal)
 			continue
 		}
 
@@ -178,7 +237,7 @@ func (e *SyscallFlagsTable) Enable(bit uint32, s map[uintptr]bool, missingEnable
 		} else {
 			val &^= bit
 		}
-		atomic.StoreUint32(&e.enable[num], val)
+		e.enable[num].Store(val)
 	}
 }
 
@@ -187,20 +246,20 @@ func (e *SyscallFlagsTable) EnableAll(bit uint32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	missingVal := atomic.LoadUint32(&e.missingEnable)
+	missingVal := e.missingEnable.Load()
 	missingVal |= bit
-	atomic.StoreUint32(&e.missingEnable, missingVal)
+	e.missingEnable.Store(missingVal)
 
 	for num := range e.enable {
-		val := atomic.LoadUint32(&e.enable[num])
+		val := e.enable[num].Load()
 		if !bits.IsOn32(val, syscallPresent) {
 			// Missing.
-			atomic.StoreUint32(&e.enable[num], missingVal)
+			e.enable[num].Store(missingVal)
 			continue
 		}
 
 		val |= bit
-		atomic.StoreUint32(&e.enable[num], val)
+		e.enable[num].Store(val)
 	}
 }
 
@@ -209,69 +268,96 @@ type Stracer interface {
 	// SyscallEnter is called on syscall entry.
 	//
 	// The returned private data is passed to SyscallExit.
-	//
-	// TODO(gvisor.dev/issue/155): remove kernel imports from the strace
-	// package so that the type can be used directly.
-	SyscallEnter(t *Task, sysno uintptr, args arch.SyscallArguments, flags uint32) interface{}
+	SyscallEnter(t *Task, sysno uintptr, args arch.SyscallArguments, flags uint32) any
 
 	// SyscallExit is called on syscall exit.
-	SyscallExit(context interface{}, t *Task, sysno, rval uintptr, err error)
+	SyscallExit(context any, t *Task, sysno, rval uintptr, err error)
 }
 
-// SyscallTable is a lookup table of system calls. Critically, a SyscallTable
-// is *immutable*. In order to make supporting suspend and resume sane, they
-// must be uniquely registered and may not change during operation.
+// SyscallTable is a lookup table of system calls.
 //
-// +stateify savable
+// Note that a SyscallTable is not savable directly. Instead, they are saved as
+// an OS/Arch pair and lookup happens again on restore.
 type SyscallTable struct {
 	// OS is the operating system that this syscall table implements.
-	OS abi.OS `state:"wait"`
+	OS abi.OS
 
 	// Arch is the architecture that this syscall table targets.
-	Arch arch.Arch `state:"wait"`
+	Arch arch.Arch
 
 	// The OS version that this syscall table implements.
-	Version Version `state:"manual"`
+	Version Version
 
 	// AuditNumber is a numeric constant that represents the syscall table. If
 	// non-zero, auditNumber must be one of the AUDIT_ARCH_* values defined by
 	// linux/audit.h.
-	AuditNumber uint32 `state:"manual"`
+	AuditNumber uint32
 
 	// Table is the collection of functions.
-	Table map[uintptr]Syscall `state:"manual"`
+	Table map[uintptr]Syscall
 
 	// lookup is a fixed-size array that holds the syscalls (indexed by
 	// their numbers). It is used for fast look ups.
-	lookup []SyscallFn `state:"manual"`
+	lookup [sentry.MaxSyscallNum + 1]SyscallFn
+
+	// pointCallbacks is a fixed-size array that holds SyscallToProto callbacks
+	// (indexed by syscall numbers). It is used for fast lookups when
+	// seccheck.Point is enabled for the syscall.
+	pointCallbacks [sentry.MaxSyscallNum + 1]SyscallToProto
 
 	// Emulate is a collection of instruction addresses to emulate. The
 	// keys are addresses, and the values are system call numbers.
-	Emulate map[usermem.Addr]uintptr `state:"manual"`
+	Emulate map[hostarch.Addr]uintptr
 
 	// The function to call in case of a missing system call.
-	Missing MissingFn `state:"manual"`
+	Missing MissingFn
 
 	// Stracer traces this syscall table.
-	Stracer Stracer `state:"manual"`
+	Stracer Stracer
 
 	// External is used to handle an external callback.
-	External func(*Kernel) `state:"manual"`
+	External func(*Kernel)
 
 	// ExternalFilterBefore is called before External is called before the syscall is executed.
 	// External is not called if it returns false.
-	ExternalFilterBefore func(*Task, uintptr, arch.SyscallArguments) bool `state:"manual"`
+	ExternalFilterBefore func(*Task, uintptr, arch.SyscallArguments) bool
 
 	// ExternalFilterAfter is called before External is called after the syscall is executed.
 	// External is not called if it returns false.
-	ExternalFilterAfter func(*Task, uintptr, arch.SyscallArguments) bool `state:"manual"`
+	ExternalFilterAfter func(*Task, uintptr, arch.SyscallArguments) bool
 
 	// FeatureEnable stores the strace and one-shot enable bits.
-	FeatureEnable SyscallFlagsTable `state:"manual"`
+	FeatureEnable SyscallFlagsTable
+}
+
+// MaxSysno returns the largest system call number.
+func (s *SyscallTable) MaxSysno() (max uintptr) {
+	for num := range s.Table {
+		if num > max {
+			max = num
+		}
+	}
+	return max
 }
 
 // allSyscallTables contains all known tables.
 var allSyscallTables []*SyscallTable
+
+var (
+	// unimplementedSyscallCounterInit ensures the following fields are only initialized once.
+	unimplementedSyscallCounterInit sync.Once
+
+	// unimplementedSyscallNumbers maps syscall numbers to their string representation.
+	// Used such that incrementing unimplementedSyscallCounter does not require allocating memory.
+	// Each element in the mapped slices are of length 1, as there is only one field for the
+	// unimplemented syscall counter metric. Allocating a slice is necessary as it is passed as a
+	// variadic argument to the metric library.
+	unimplementedSyscallNumbers map[uintptr][]*metric.FieldValue
+
+	// unimplementedSyscallCounter tracks the number of times each unimplemented syscall has been
+	// called by the sandboxed application.
+	unimplementedSyscallCounter *metric.Uint64Metric
+)
 
 // SyscallTables returns a read-only slice of registered SyscallTables.
 func SyscallTables() []*SyscallTable {
@@ -290,52 +376,65 @@ func LookupSyscallTable(os abi.OS, a arch.Arch) (*SyscallTable, bool) {
 
 // RegisterSyscallTable registers a new syscall table for use by a Kernel.
 func RegisterSyscallTable(s *SyscallTable) {
+	if max := s.MaxSysno(); max > sentry.MaxSyscallNum {
+		panic(fmt.Sprintf("SyscallTable %+v contains too large syscall number %d", s, max))
+	}
+	if _, ok := LookupSyscallTable(s.OS, s.Arch); ok {
+		panic(fmt.Sprintf("Duplicate SyscallTable registered for OS %v Arch %v", s.OS, s.Arch))
+	}
+	allSyscallTables = append(allSyscallTables, s)
+	unimplementedSyscallCounterInit.Do(func() {
+		allowedValues := make([]*metric.FieldValue, sentry.MaxSyscallNum+2)
+		unimplementedSyscallNumbers = make(map[uintptr][]*metric.FieldValue, len(allowedValues))
+		for i := uintptr(0); i <= sentry.MaxSyscallNum; i++ {
+			s := &metric.FieldValue{strconv.Itoa(int(i))}
+			allowedValues[i] = s
+			unimplementedSyscallNumbers[i] = []*metric.FieldValue{s}
+		}
+		allowedValues[len(allowedValues)-1] = outOfRangeSyscallNumber[0]
+		unimplementedSyscallCounter = metric.MustCreateNewUint64Metric("/unimplemented_syscalls",
+			metric.Uint64Metadata{
+				Cumulative:  true,
+				Sync:        true,
+				Description: "Number of times the application tried to call an unimplemented syscall, broken down by syscall number",
+				Fields: []metric.Field{
+					metric.NewField("sysno", allowedValues...),
+				},
+			})
+	})
+	s.Init()
+}
+
+// Init initializes the system call table.
+//
+// This should normally be called only during registration.
+func (s *SyscallTable) Init() {
 	if s.Table == nil {
 		// Ensure non-nil lookup table.
 		s.Table = make(map[uintptr]Syscall)
 	}
 	if s.Emulate == nil {
 		// Ensure non-nil emulate table.
-		s.Emulate = make(map[usermem.Addr]uintptr)
+		s.Emulate = make(map[hostarch.Addr]uintptr)
 	}
 
-	var max uintptr
-	for num := range s.Table {
-		if num > max {
-			max = num
-		}
-	}
-
-	if max > maxSyscallNum {
-		panic(fmt.Sprintf("SyscallTable %+v contains too large syscall number %d", s, max))
-	}
-
-	s.lookup = make([]SyscallFn, max+1)
-
-	// Initialize the fast-lookup table.
+	// Initialize the fast-lookup tables.
 	for num, sc := range s.Table {
 		s.lookup[num] = sc.Fn
 	}
-
-	s.FeatureEnable.init(s.Table, max)
-
-	if _, ok := LookupSyscallTable(s.OS, s.Arch); ok {
-		panic(fmt.Sprintf("Duplicate SyscallTable registered for OS %v Arch %v", s.OS, s.Arch))
+	for num, sc := range s.Table {
+		s.pointCallbacks[num] = sc.PointCallback
 	}
 
-	// Save a reference to this table.
-	//
-	// This is required for a Kernel to find the table and for save/restore
-	// operations below.
-	allSyscallTables = append(allSyscallTables, s)
+	// Initialize all features.
+	s.FeatureEnable.init(s.Table)
 }
 
 // Lookup returns the syscall implementation, if one exists.
 func (s *SyscallTable) Lookup(sysno uintptr) SyscallFn {
-	if sysno < uintptr(len(s.lookup)) {
+	if sysno <= sentry.MaxSyscallNum {
 		return s.lookup[sysno]
 	}
-
 	return nil
 }
 
@@ -347,8 +446,18 @@ func (s *SyscallTable) LookupName(sysno uintptr) string {
 	return fmt.Sprintf("sys_%d", sysno) // Unlikely.
 }
 
+// LookupNo looks up a syscall number by name.
+func (s *SyscallTable) LookupNo(name string) (uintptr, error) {
+	for i, syscall := range s.Table {
+		if syscall.Name == name {
+			return uintptr(i), nil
+		}
+	}
+	return 0, fmt.Errorf("syscall %q not found", name)
+}
+
 // LookupEmulate looks up an emulation syscall number.
-func (s *SyscallTable) LookupEmulate(addr usermem.Addr) (uintptr, bool) {
+func (s *SyscallTable) LookupEmulate(addr hostarch.Addr) (uintptr, bool) {
 	sysno, ok := s.Emulate[addr]
 	return sysno, ok
 }
@@ -360,4 +469,43 @@ func (s *SyscallTable) mapLookup(sysno uintptr) SyscallFn {
 		return sc.Fn
 	}
 	return nil
+}
+
+// LookupSyscallToProto looks up the SyscallToProto callback for the given
+// syscall. It may return nil if none is registered.
+func (s *SyscallTable) LookupSyscallToProto(sysno uintptr) SyscallToProto {
+	if sysno > sentry.MaxSyscallNum {
+		return nil
+	}
+	return s.pointCallbacks[sysno]
+}
+
+// SyscallToProto is a callback function that converts generic syscall data to
+// schematized protobuf for the corresponding syscall.
+type SyscallToProto func(*Task, seccheck.FieldSet, *pb.ContextData, SyscallInfo) (proto.Message, pb.MessageType)
+
+// SyscallInfo provides generic information about the syscall.
+type SyscallInfo struct {
+	Exit  bool
+	Sysno uintptr
+	Args  arch.SyscallArguments
+	Rval  uintptr
+	Errno int
+}
+
+// IncrementUnimplementedSyscallCounter increments the "unimplemented syscall" metric for the given
+// syscall number.
+// A syscall table must have been initialized prior to calling this function.
+//
+// FIXME(gvisor.dev/issue/10556): checkescape can't distinguish between this
+// file and files named syscalls.go in other directories, resulting in false
+// positives, so this function cannot be +checkescape:all.
+//
+//go:nosplit
+func IncrementUnimplementedSyscallCounter(sysno uintptr) {
+	s, found := unimplementedSyscallNumbers[sysno]
+	if !found {
+		s = outOfRangeSyscallNumber
+	}
+	unimplementedSyscallCounter.Increment(s...)
 }

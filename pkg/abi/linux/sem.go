@@ -32,21 +32,51 @@ const (
 	SEM_STAT_ANY = 20
 )
 
-const SEM_UNDO = 0x1000
+// Information about system-wide semaphore limits and parameters.
+//
+// Source: include/uapi/linux/sem.h
+const (
+	SEMMNI = 32000
+	SEMMSL = 32000
+	SEMMNS = SEMMNI * SEMMSL
+	SEMOPM = 500
+	SEMVMX = 32767
+	SEMAEM = SEMVMX
 
-// SemidDS is equivalent to struct semid64_ds.
-type SemidDS struct {
-	SemPerm  IPCPerm
-	SemOTime TimeT
-	SemCTime TimeT
-	SemNSems uint64
-	unused3  uint64
-	unused4  uint64
-}
+	SEMUME = SEMOPM
+	SEMMNU = SEMMNS
+	SEMMAP = SEMMNS
+	SEMUSZ = 20
+)
+
+// Semaphore flags.
+const (
+	SEM_UNDO = 0x1000
+)
 
 // Sembuf is equivalent to struct sembuf.
+//
+// +marshal slice:SembufSlice
 type Sembuf struct {
 	SemNum uint16
 	SemOp  int16
 	SemFlg int16
+}
+
+// SemInfo is equivalent to struct seminfo.
+//
+// Source: include/uapi/linux/sem.h
+//
+// +marshal
+type SemInfo struct {
+	SemMap uint32
+	SemMni uint32
+	SemMns uint32
+	SemMnu uint32
+	SemMsl uint32
+	SemOpm uint32
+	SemUme uint32
+	SemUsz uint32
+	SemVmx uint32
+	SemAem uint32
 }

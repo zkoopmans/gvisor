@@ -15,39 +15,37 @@
 package linux
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/eventfd"
-	"gvisor.dev/gvisor/pkg/syserror"
-)
-
-const (
-	// EFD_SEMAPHORE is a flag used in syscall eventfd(2) and eventfd2(2). Please
-	// see its man page for more information.
-	EFD_SEMAPHORE = 1
-	EFD_NONBLOCK  = 0x800
-	EFD_CLOEXEC   = 0x80000
 )
 
 // Eventfd2 implements linux syscall eventfd2(2).
-func Eventfd2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	initVal := args[0].Int()
+func Eventfd2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	initVal := uint64(args[0].Uint())
 	flags := uint(args[1].Uint())
-	allOps := uint(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC)
+	allOps := uint(linux.EFD_SEMAPHORE | linux.EFD_NONBLOCK | linux.EFD_CLOEXEC)
 
 	if flags & ^allOps != 0 {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 
-	event := eventfd.New(t, uint64(initVal), flags&EFD_SEMAPHORE != 0)
-	event.SetFlags(fs.SettableFileFlags{
-		NonBlocking: flags&EFD_NONBLOCK != 0,
-	})
-	defer event.DecRef()
+	vfsObj := t.Kernel().VFS()
+	fileFlags := uint32(linux.O_RDWR)
+	if flags&linux.EFD_NONBLOCK != 0 {
+		fileFlags |= linux.O_NONBLOCK
+	}
+	semMode := flags&linux.EFD_SEMAPHORE != 0
+	eventfd, err := eventfd.New(t, vfsObj, initVal, semMode, fileFlags)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer eventfd.DecRef(t)
 
-	fd, err := t.NewFDFrom(0, event, kernel.FDFlags{
-		CloseOnExec: flags&EFD_CLOEXEC != 0,
+	fd, err := t.NewFDFrom(0, eventfd, kernel.FDFlags{
+		CloseOnExec: flags&linux.EFD_CLOEXEC != 0,
 	})
 	if err != nil {
 		return 0, nil, err
@@ -57,7 +55,7 @@ func Eventfd2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 }
 
 // Eventfd implements linux syscall eventfd(2).
-func Eventfd(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Eventfd(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	args[1].Value = 0
-	return Eventfd2(t, args)
+	return Eventfd2(t, sysno, args)
 }

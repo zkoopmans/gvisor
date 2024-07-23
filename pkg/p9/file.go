@@ -15,18 +15,45 @@
 package p9
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fd"
 )
+
+// AttacherOptions contains Attacher configuration.
+type AttacherOptions struct {
+	// SetAttrOnDeleted is set to true if it's safe to call File.SetAttr for
+	// deleted files.
+	SetAttrOnDeleted bool
+
+	// AllocateOnDeleted is set to true if it's safe to call File.Allocate for
+	// deleted files.
+	AllocateOnDeleted bool
+
+	// MultiGetAttrSupported is set to true if it's safe to call
+	// File.MultiGetAttr with read concurrency guarantee only on start directory.
+	MultiGetAttrSupported bool
+}
+
+// NoServerOptions partially implements Attacher with empty AttacherOptions.
+type NoServerOptions struct{}
+
+// ServerOptions implements Attacher.
+func (*NoServerOptions) ServerOptions() AttacherOptions {
+	return AttacherOptions{}
+}
 
 // Attacher is provided by the server.
 type Attacher interface {
 	// Attach returns a new File.
 	//
-	// The client-side attach will be translate to a series of walks from
+	// The client-side attach will be translated to a series of walks from
 	// the file returned by this Attach call.
 	Attach() (File, error)
+
+	// ServerOptions returns configuration options for this attach point.
+	//
+	// This is never caller in the client-side.
+	ServerOptions() AttacherOptions
 }
 
 // File is a set of operations corresponding to a single node.
@@ -67,11 +94,20 @@ type File interface {
 	// WalkGetAttr walks to the next file and returns its maximal set of
 	// attributes.
 	//
-	// Server-side p9.Files may return syscall.ENOSYS to indicate that Walk
+	// Server-side p9.Files may return unix.ENOSYS to indicate that Walk
 	// and GetAttr should be used separately to satisfy this request.
 	//
 	// On the server, WalkGetAttr has a read concurrency guarantee.
 	WalkGetAttr([]string) ([]QID, File, AttrMask, Attr, error)
+
+	// MultiGetAttr batches up multiple calls to GetAttr(). names is a list of
+	// path components similar to Walk(). If the first component name is empty,
+	// the current file is stat'd and included in the results. If the walk reaches
+	// a file that doesn't exist or not a directory, MultiGetAttr returns the
+	// partial result with no error.
+	//
+	// On the server, MultiGetAttr has a read concurrency guarantee.
+	MultiGetAttr(names []string) ([]FullStat, error)
 
 	// StatFS returns information about the file system associated with
 	// this file.
@@ -97,12 +133,12 @@ type File interface {
 	// free to ignore the hint entirely (i.e. the value returned may be larger
 	// than size). All size checking is done independently at the syscall layer.
 	//
-	// TODO(b/127675828): Determine concurrency guarantees once implemented.
+	// On the server, GetXattr has a read concurrency guarantee.
 	GetXattr(name string, size uint64) (string, error)
 
 	// SetXattr sets extended attributes on this node.
 	//
-	// TODO(b/127675828): Determine concurrency guarantees once implemented.
+	// On the server, SetXattr has a write concurrency guarantee.
 	SetXattr(name, value string, flags uint32) error
 
 	// ListXattr lists the names of the extended attributes on this node.
@@ -113,12 +149,12 @@ type File interface {
 	// free to ignore the hint entirely (i.e. the value returned may be larger
 	// than size). All size checking is done independently at the syscall layer.
 	//
-	// TODO(b/148303075): Determine concurrency guarantees once implemented.
+	// On the server, ListXattr has a read concurrency guarantee.
 	ListXattr(size uint64) (map[string]struct{}, error)
 
 	// RemoveXattr removes extended attributes on this node.
 	//
-	// TODO(b/148303075): Determine concurrency guarantees once implemented.
+	// On the server, RemoveXattr has a write concurrency guarantee.
 	RemoveXattr(name string) error
 
 	// Allocate allows the caller to directly manipulate the allocated disk space
@@ -134,6 +170,14 @@ type File interface {
 	//
 	// On the server, Close has no concurrency guarantee.
 	Close() error
+
+	// SetAttrClose is the equivalent of calling SetAttr() followed by Close().
+	// This can be used to set file times before closing the file in a single
+	// operation.
+	//
+	// On the server, SetAttr has a write concurrency guarantee.
+	// On the server, Close has no concurrency guarantee.
+	SetAttrClose(valid SetAttrMask, attr SetAttr) error
 
 	// Open must be called prior to using Read, Write or Readdir. Once Open
 	// is called, some operations, such as Walk, will no longer work.
@@ -152,7 +196,7 @@ type File interface {
 
 	// Read reads from this file. Open must be called first.
 	//
-	// This may return io.EOF in addition to syscall.Errno values.
+	// This may return io.EOF in addition to unix.Errno values.
 	//
 	// On the server, ReadAt has a read concurrency guarantee. See Open for
 	// additional requirements regarding lazy path resolution.
@@ -160,7 +204,7 @@ type File interface {
 
 	// Write writes to this file. Open must be called first.
 	//
-	// This may return io.EOF in addition to syscall.Errno values.
+	// This may return io.EOF in addition to unix.Errno values.
 	//
 	// On the server, WriteAt has a read concurrency guarantee. See Open
 	// for additional requirements regarding lazy path resolution.
@@ -231,10 +275,19 @@ type File interface {
 
 	// Readdir reads directory entries.
 	//
-	// This may return io.EOF in addition to syscall.Errno values.
+	// This may return io.EOF in addition to unix.Errno values. count is the
+	// number of bytes to read.
+	//
+	// direntOffset is the directory offset at which the read should happen.
+	// direntOffset can be set to 0 to start reading the directory from start.
+	// direntOffset is used more like a cookie. The unit of direntOffset is
+	// unspecified. Gofers can choose their own unit. The client must set it
+	// to one of the values returned in Dirent.Offset, preferably the last offset
+	// returned, which should cause the readdir to continue from where it was
+	// left off.
 	//
 	// On the server, Readdir has a read concurrency guarantee.
-	Readdir(offset uint64, count uint32) ([]Dirent, error)
+	Readdir(direntOffset uint64, count uint32) ([]Dirent, error)
 
 	// Readlink reads the link target.
 	//
@@ -252,6 +305,17 @@ type File interface {
 	// On the server, Flush has a read concurrency guarantee.
 	Flush() error
 
+	// Bind binds to a host unix domain socket. If successful, it creates a
+	// socket file on the host filesystem and returns a File for the newly
+	// created socket file. The File implementation must save the bound socket
+	// FD so that subsequent Listen and Accept operations on the File can be
+	// served.
+	//
+	// Bind is an extension to 9P2000.L, see version.go.
+	//
+	// On the server, Bind has a write concurrency guarantee.
+	Bind(sockType uint32, sockName string, uid UID, gid GID) (File, QID, AttrMask, Attr, error)
+
 	// Connect establishes a new host-socket backed connection with a
 	// socket. A File does not need to be opened before it can be connected
 	// and it can be connected to multiple times resulting in a unique
@@ -264,7 +328,7 @@ type File interface {
 	// Flags indicates the requested type of socket.
 	//
 	// On the server, Connect has a read concurrency guarantee.
-	Connect(flags ConnectFlags) (*fd.FD, error)
+	Connect(socketType SocketType) (*fd.FD, error)
 
 	// Renamed is called when this node is renamed.
 	//
@@ -283,6 +347,27 @@ type File interface {
 type DefaultWalkGetAttr struct{}
 
 // WalkGetAttr implements File.WalkGetAttr.
-func (DefaultWalkGetAttr) WalkGetAttr([]string) ([]QID, File, AttrMask, Attr, error) {
-	return nil, nil, AttrMask{}, Attr{}, syscall.ENOSYS
+func (*DefaultWalkGetAttr) WalkGetAttr([]string) ([]QID, File, AttrMask, Attr, error) {
+	return nil, nil, AttrMask{}, Attr{}, unix.ENOSYS
+}
+
+// DisallowClientCalls panics if a client-only function is called.
+type DisallowClientCalls struct{}
+
+// SetAttrClose implements File.SetAttrClose.
+func (*DisallowClientCalls) SetAttrClose(SetAttrMask, SetAttr) error {
+	panic("SetAttrClose should not be called on the server")
+}
+
+// DisallowServerCalls panics if a server-only function is called.
+type DisallowServerCalls struct{}
+
+// Renamed implements File.Renamed.
+func (*DisallowServerCalls) Renamed(File, string) {
+	panic("Renamed should not be called on the client")
+}
+
+// ServerOptions implements Attacher.
+func (*DisallowServerCalls) ServerOptions() AttacherOptions {
+	panic("ServerOptions should not be called on the client")
 }

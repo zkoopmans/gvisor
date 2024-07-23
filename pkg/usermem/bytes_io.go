@@ -16,8 +16,9 @@ package usermem
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 const maxInt = int(^uint(0) >> 1)
@@ -30,7 +31,7 @@ type BytesIO struct {
 }
 
 // CopyOut implements IO.CopyOut.
-func (b *BytesIO) CopyOut(ctx context.Context, addr Addr, src []byte, opts IOOpts) (int, error) {
+func (b *BytesIO) CopyOut(ctx context.Context, addr hostarch.Addr, src []byte, opts IOOpts) (int, error) {
 	rngN, rngErr := b.rangeCheck(addr, len(src))
 	if rngN == 0 {
 		return 0, rngErr
@@ -39,7 +40,7 @@ func (b *BytesIO) CopyOut(ctx context.Context, addr Addr, src []byte, opts IOOpt
 }
 
 // CopyIn implements IO.CopyIn.
-func (b *BytesIO) CopyIn(ctx context.Context, addr Addr, dst []byte, opts IOOpts) (int, error) {
+func (b *BytesIO) CopyIn(ctx context.Context, addr hostarch.Addr, dst []byte, opts IOOpts) (int, error) {
 	rngN, rngErr := b.rangeCheck(addr, len(dst))
 	if rngN == 0 {
 		return 0, rngErr
@@ -48,23 +49,21 @@ func (b *BytesIO) CopyIn(ctx context.Context, addr Addr, dst []byte, opts IOOpts
 }
 
 // ZeroOut implements IO.ZeroOut.
-func (b *BytesIO) ZeroOut(ctx context.Context, addr Addr, toZero int64, opts IOOpts) (int64, error) {
+func (b *BytesIO) ZeroOut(ctx context.Context, addr hostarch.Addr, toZero int64, opts IOOpts) (int64, error) {
 	if toZero > int64(maxInt) {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	rngN, rngErr := b.rangeCheck(addr, int(toZero))
 	if rngN == 0 {
 		return 0, rngErr
 	}
 	zeroSlice := b.Bytes[int(addr) : int(addr)+rngN]
-	for i := range zeroSlice {
-		zeroSlice[i] = 0
-	}
+	clear(zeroSlice)
 	return int64(rngN), rngErr
 }
 
 // CopyOutFrom implements IO.CopyOutFrom.
-func (b *BytesIO) CopyOutFrom(ctx context.Context, ars AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error) {
+func (b *BytesIO) CopyOutFrom(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error) {
 	dsts, rngErr := b.blocksFromAddrRanges(ars)
 	n, err := src.ReadToBlocks(dsts)
 	if err != nil {
@@ -74,7 +73,7 @@ func (b *BytesIO) CopyOutFrom(ctx context.Context, ars AddrRangeSeq, src safemem
 }
 
 // CopyInTo implements IO.CopyInTo.
-func (b *BytesIO) CopyInTo(ctx context.Context, ars AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error) {
+func (b *BytesIO) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error) {
 	srcs, rngErr := b.blocksFromAddrRanges(ars)
 	n, err := dst.WriteFromBlocks(srcs)
 	if err != nil {
@@ -83,25 +82,25 @@ func (b *BytesIO) CopyInTo(ctx context.Context, ars AddrRangeSeq, dst safemem.Wr
 	return int64(n), rngErr
 }
 
-func (b *BytesIO) rangeCheck(addr Addr, length int) (int, error) {
+func (b *BytesIO) rangeCheck(addr hostarch.Addr, length int) (int, error) {
 	if length == 0 {
 		return 0, nil
 	}
 	if length < 0 {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
-	max := Addr(len(b.Bytes))
+	max := hostarch.Addr(len(b.Bytes))
 	if addr >= max {
-		return 0, syserror.EFAULT
+		return 0, linuxerr.EFAULT
 	}
 	end, ok := addr.AddLength(uint64(length))
 	if !ok || end > max {
-		return int(max - addr), syserror.EFAULT
+		return int(max - addr), linuxerr.EFAULT
 	}
 	return length, nil
 }
 
-func (b *BytesIO) blocksFromAddrRanges(ars AddrRangeSeq) (safemem.BlockSeq, error) {
+func (b *BytesIO) blocksFromAddrRanges(ars hostarch.AddrRangeSeq) (safemem.BlockSeq, error) {
 	switch ars.NumRanges() {
 	case 0:
 		return safemem.BlockSeq{}, nil
@@ -124,7 +123,7 @@ func (b *BytesIO) blocksFromAddrRanges(ars AddrRangeSeq) (safemem.BlockSeq, erro
 	}
 }
 
-func (b *BytesIO) blockFromAddrRange(ar AddrRange) (safemem.Block, error) {
+func (b *BytesIO) blockFromAddrRange(ar hostarch.AddrRange) (safemem.Block, error) {
 	n, err := b.rangeCheck(ar.Start, int(ar.Length()))
 	if n == 0 {
 		return safemem.Block{}, err
@@ -136,6 +135,6 @@ func (b *BytesIO) blockFromAddrRange(ar AddrRange) (safemem.Block, error) {
 func BytesIOSequence(buf []byte) IOSequence {
 	return IOSequence{
 		IO:    &BytesIO{buf},
-		Addrs: AddrRangeSeqOf(AddrRange{0, Addr(len(buf))}),
+		Addrs: hostarch.AddrRangeSeqOf(hostarch.AddrRange{0, hostarch.Addr(len(buf))}),
 	}
 }

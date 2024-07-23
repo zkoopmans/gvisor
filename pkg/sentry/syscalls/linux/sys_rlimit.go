@@ -16,27 +16,24 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // rlimit describes an implementation of 'struct rlimit', which may vary from
 // system-to-system.
 type rlimit interface {
+	marshal.Marshallable
+
 	// toLimit converts an rlimit to a limits.Limit.
 	toLimit() *limits.Limit
 
 	// fromLimit converts a limits.Limit to an rlimit.
 	fromLimit(lim limits.Limit)
-
-	// copyIn copies an rlimit from the untrusted app to the kernel.
-	copyIn(t *kernel.Task, addr usermem.Addr) error
-
-	// copyOut copies an rlimit from the kernel to the untrusted app.
-	copyOut(t *kernel.Task, addr usermem.Addr) error
 }
 
 // newRlimit returns the appropriate rlimit type for 'struct rlimit' on this system.
@@ -46,10 +43,11 @@ func newRlimit(t *kernel.Task) (rlimit, error) {
 		// On 64-bit system, struct rlimit and struct rlimit64 are identical.
 		return &rlimit64{}, nil
 	default:
-		return nil, syserror.ENOSYS
+		return nil, linuxerr.ENOSYS
 	}
 }
 
+// +marshal
 type rlimit64 struct {
 	Cur uint64
 	Max uint64
@@ -69,13 +67,13 @@ func (r *rlimit64) fromLimit(lim limits.Limit) {
 	}
 }
 
-func (r *rlimit64) copyIn(t *kernel.Task, addr usermem.Addr) error {
-	_, err := t.CopyIn(addr, r)
+func (r *rlimit64) copyIn(t *kernel.Task, addr hostarch.Addr) error {
+	_, err := r.CopyIn(t, addr)
 	return err
 }
 
-func (r *rlimit64) copyOut(t *kernel.Task, addr usermem.Addr) error {
-	_, err := t.CopyOut(addr, *r)
+func (r *rlimit64) copyOut(t *kernel.Task, addr hostarch.Addr) error {
+	_, err := r.CopyOut(t, addr)
 	return err
 }
 
@@ -92,6 +90,9 @@ var setableLimits = map[limits.LimitType]struct{}{
 	limits.FileSize:      {},
 	limits.MemoryLocked:  {},
 	limits.Stack:         {},
+	// RSS can be set, but it's not enforced because Linux doesn't enforce it
+	// either: "This limit has effect only in Linux 2.4.x, x < 30"
+	limits.Rss: {},
 	// These are not enforced, but we include them here to avoid returning
 	// EPERM, since some apps expect them to succeed.
 	limits.Core:         {},
@@ -104,7 +105,14 @@ func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) 
 	}
 
 	if _, ok := setableLimits[resource]; !ok {
-		return limits.Limit{}, syserror.EPERM
+		return limits.Limit{}, linuxerr.EPERM
+	}
+
+	switch resource {
+	case limits.NumberOfFiles:
+		if newLim.Max > uint64(t.Kernel().MaxFDLimit.Load()) {
+			return limits.Limit{}, linuxerr.EPERM
+		}
 	}
 
 	// "A privileged process (under Linux: one with the CAP_SYS_RESOURCE
@@ -124,11 +132,11 @@ func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) 
 }
 
 // Getrlimit implements linux syscall getrlimit(2).
-func Getrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Getrlimit(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	resource, ok := limits.FromLinuxResource[int(args[0].Int())]
 	if !ok {
 		// Return err; unknown limit.
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 	addr := args[1].Pointer()
 	rlim, err := newRlimit(t)
@@ -140,35 +148,36 @@ func Getrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 		return 0, nil, err
 	}
 	rlim.fromLimit(lim)
-	return 0, nil, rlim.copyOut(t, addr)
+	_, err = rlim.CopyOut(t, addr)
+	return 0, nil, err
 }
 
 // Setrlimit implements linux syscall setrlimit(2).
-func Setrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Setrlimit(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	resource, ok := limits.FromLinuxResource[int(args[0].Int())]
 	if !ok {
 		// Return err; unknown limit.
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 	addr := args[1].Pointer()
 	rlim, err := newRlimit(t)
 	if err != nil {
 		return 0, nil, err
 	}
-	if err := rlim.copyIn(t, addr); err != nil {
-		return 0, nil, syserror.EFAULT
+	if _, err := rlim.CopyIn(t, addr); err != nil {
+		return 0, nil, linuxerr.EFAULT
 	}
 	_, err = prlimit64(t, resource, rlim.toLimit())
 	return 0, nil, err
 }
 
 // Prlimit64 implements linux syscall prlimit64(2).
-func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Prlimit64(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	tid := kernel.ThreadID(args[0].Int())
 	resource, ok := limits.FromLinuxResource[int(args[1].Int())]
 	if !ok {
 		// Return err; unknown limit.
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 	newRlimAddr := args[2].Pointer()
 	oldRlimAddr := args[3].Pointer()
@@ -177,18 +186,18 @@ func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	if newRlimAddr != 0 {
 		var nrl rlimit64
 		if err := nrl.copyIn(t, newRlimAddr); err != nil {
-			return 0, nil, syserror.EFAULT
+			return 0, nil, linuxerr.EFAULT
 		}
 		newLim = nrl.toLimit()
 	}
 
 	if tid < 0 {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 	ot := t
 	if tid > 0 {
 		if ot = t.PIDNamespace().TaskWithID(tid); ot == nil {
-			return 0, nil, syserror.ESRCH
+			return 0, nil, linuxerr.ESRCH
 		}
 	}
 
@@ -197,7 +206,7 @@ func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	// saved set user IDs of the target process must match the real user ID of
 	// the caller and the real, effective, and saved set group IDs of the
 	// target process must match the real group ID of the caller."
-	if !t.HasCapabilityIn(linux.CAP_SYS_RESOURCE, t.PIDNamespace().UserNamespace()) {
+	if ot != t && !t.HasCapabilityIn(linux.CAP_SYS_RESOURCE, t.PIDNamespace().UserNamespace()) {
 		cred, tcred := t.Credentials(), ot.Credentials()
 		if cred.RealKUID != tcred.RealKUID ||
 			cred.RealKUID != tcred.EffectiveKUID ||
@@ -205,7 +214,7 @@ func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 			cred.RealKGID != tcred.RealKGID ||
 			cred.RealKGID != tcred.EffectiveKGID ||
 			cred.RealKGID != tcred.SavedKGID {
-			return 0, nil, syserror.EPERM
+			return 0, nil, linuxerr.EPERM
 		}
 	}
 
@@ -216,7 +225,7 @@ func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 
 	if oldRlimAddr != 0 {
 		if err := makeRlimit64(oldLim).copyOut(t, oldRlimAddr); err != nil {
-			return 0, nil, syserror.EFAULT
+			return 0, nil, linuxerr.EFAULT
 		}
 	}
 

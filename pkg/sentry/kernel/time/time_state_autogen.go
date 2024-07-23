@@ -3,54 +3,103 @@
 package time
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Time) beforeSave() {}
-func (x *Time) save(m state.Map) {
-	x.beforeSave()
-	m.Save("ns", &x.ns)
+func (t *Time) StateTypeName() string {
+	return "pkg/sentry/kernel/time.Time"
 }
 
-func (x *Time) afterLoad() {}
-func (x *Time) load(m state.Map) {
-	m.Load("ns", &x.ns)
+func (t *Time) StateFields() []string {
+	return []string{
+		"ns",
+	}
 }
 
-func (x *Setting) beforeSave() {}
-func (x *Setting) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Enabled", &x.Enabled)
-	m.Save("Next", &x.Next)
-	m.Save("Period", &x.Period)
+func (t *Time) beforeSave() {}
+
+// +checklocksignore
+func (t *Time) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.ns)
 }
 
-func (x *Setting) afterLoad() {}
-func (x *Setting) load(m state.Map) {
-	m.Load("Enabled", &x.Enabled)
-	m.Load("Next", &x.Next)
-	m.Load("Period", &x.Period)
+func (t *Time) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (t *Time) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.ns)
 }
 
-func (x *Timer) beforeSave() {}
-func (x *Timer) save(m state.Map) {
-	x.beforeSave()
-	m.Save("clock", &x.clock)
-	m.Save("listener", &x.listener)
-	m.Save("setting", &x.setting)
-	m.Save("paused", &x.paused)
+func (s *Setting) StateTypeName() string {
+	return "pkg/sentry/kernel/time.Setting"
 }
 
-func (x *Timer) afterLoad() {}
-func (x *Timer) load(m state.Map) {
-	m.Load("clock", &x.clock)
-	m.Load("listener", &x.listener)
-	m.Load("setting", &x.setting)
-	m.Load("paused", &x.paused)
+func (s *Setting) StateFields() []string {
+	return []string{
+		"Enabled",
+		"Next",
+		"Period",
+	}
+}
+
+func (s *Setting) beforeSave() {}
+
+// +checklocksignore
+func (s *Setting) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.Enabled)
+	stateSinkObject.Save(1, &s.Next)
+	stateSinkObject.Save(2, &s.Period)
+}
+
+func (s *Setting) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *Setting) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.Enabled)
+	stateSourceObject.Load(1, &s.Next)
+	stateSourceObject.Load(2, &s.Period)
+}
+
+func (t *Timer) StateTypeName() string {
+	return "pkg/sentry/kernel/time.Timer"
+}
+
+func (t *Timer) StateFields() []string {
+	return []string{
+		"clock",
+		"listener",
+		"setting",
+		"paused",
+	}
+}
+
+func (t *Timer) beforeSave() {}
+
+// +checklocksignore
+func (t *Timer) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.clock)
+	stateSinkObject.Save(1, &t.listener)
+	stateSinkObject.Save(2, &t.setting)
+	stateSinkObject.Save(3, &t.paused)
+}
+
+func (t *Timer) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (t *Timer) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.clock)
+	stateSourceObject.Load(1, &t.listener)
+	stateSourceObject.Load(2, &t.setting)
+	stateSourceObject.Load(3, &t.paused)
 }
 
 func init() {
-	state.Register("pkg/sentry/kernel/time.Time", (*Time)(nil), state.Fns{Save: (*Time).save, Load: (*Time).load})
-	state.Register("pkg/sentry/kernel/time.Setting", (*Setting)(nil), state.Fns{Save: (*Setting).save, Load: (*Setting).load})
-	state.Register("pkg/sentry/kernel/time.Timer", (*Timer)(nil), state.Fns{Save: (*Timer).save, Load: (*Timer).load})
+	state.Register((*Time)(nil))
+	state.Register((*Setting)(nil))
+	state.Register((*Timer)(nil))
 }

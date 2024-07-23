@@ -3,48 +3,86 @@
 package usage
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *CPUStats) beforeSave() {}
-func (x *CPUStats) save(m state.Map) {
-	x.beforeSave()
-	m.Save("UserTime", &x.UserTime)
-	m.Save("SysTime", &x.SysTime)
-	m.Save("VoluntarySwitches", &x.VoluntarySwitches)
+func (s *CPUStats) StateTypeName() string {
+	return "pkg/sentry/usage.CPUStats"
 }
 
-func (x *CPUStats) afterLoad() {}
-func (x *CPUStats) load(m state.Map) {
-	m.Load("UserTime", &x.UserTime)
-	m.Load("SysTime", &x.SysTime)
-	m.Load("VoluntarySwitches", &x.VoluntarySwitches)
+func (s *CPUStats) StateFields() []string {
+	return []string{
+		"UserTime",
+		"SysTime",
+		"VoluntarySwitches",
+	}
 }
 
-func (x *IO) beforeSave() {}
-func (x *IO) save(m state.Map) {
-	x.beforeSave()
-	m.Save("CharsRead", &x.CharsRead)
-	m.Save("CharsWritten", &x.CharsWritten)
-	m.Save("ReadSyscalls", &x.ReadSyscalls)
-	m.Save("WriteSyscalls", &x.WriteSyscalls)
-	m.Save("BytesRead", &x.BytesRead)
-	m.Save("BytesWritten", &x.BytesWritten)
-	m.Save("BytesWriteCancelled", &x.BytesWriteCancelled)
+func (s *CPUStats) beforeSave() {}
+
+// +checklocksignore
+func (s *CPUStats) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.UserTime)
+	stateSinkObject.Save(1, &s.SysTime)
+	stateSinkObject.Save(2, &s.VoluntarySwitches)
 }
 
-func (x *IO) afterLoad() {}
-func (x *IO) load(m state.Map) {
-	m.Load("CharsRead", &x.CharsRead)
-	m.Load("CharsWritten", &x.CharsWritten)
-	m.Load("ReadSyscalls", &x.ReadSyscalls)
-	m.Load("WriteSyscalls", &x.WriteSyscalls)
-	m.Load("BytesRead", &x.BytesRead)
-	m.Load("BytesWritten", &x.BytesWritten)
-	m.Load("BytesWriteCancelled", &x.BytesWriteCancelled)
+func (s *CPUStats) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *CPUStats) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.UserTime)
+	stateSourceObject.Load(1, &s.SysTime)
+	stateSourceObject.Load(2, &s.VoluntarySwitches)
+}
+
+func (i *IO) StateTypeName() string {
+	return "pkg/sentry/usage.IO"
+}
+
+func (i *IO) StateFields() []string {
+	return []string{
+		"CharsRead",
+		"CharsWritten",
+		"ReadSyscalls",
+		"WriteSyscalls",
+		"BytesRead",
+		"BytesWritten",
+		"BytesWriteCancelled",
+	}
+}
+
+func (i *IO) beforeSave() {}
+
+// +checklocksignore
+func (i *IO) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.CharsRead)
+	stateSinkObject.Save(1, &i.CharsWritten)
+	stateSinkObject.Save(2, &i.ReadSyscalls)
+	stateSinkObject.Save(3, &i.WriteSyscalls)
+	stateSinkObject.Save(4, &i.BytesRead)
+	stateSinkObject.Save(5, &i.BytesWritten)
+	stateSinkObject.Save(6, &i.BytesWriteCancelled)
+}
+
+func (i *IO) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (i *IO) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.CharsRead)
+	stateSourceObject.Load(1, &i.CharsWritten)
+	stateSourceObject.Load(2, &i.ReadSyscalls)
+	stateSourceObject.Load(3, &i.WriteSyscalls)
+	stateSourceObject.Load(4, &i.BytesRead)
+	stateSourceObject.Load(5, &i.BytesWritten)
+	stateSourceObject.Load(6, &i.BytesWriteCancelled)
 }
 
 func init() {
-	state.Register("pkg/sentry/usage.CPUStats", (*CPUStats)(nil), state.Fns{Save: (*CPUStats).save, Load: (*CPUStats).load})
-	state.Register("pkg/sentry/usage.IO", (*IO)(nil), state.Fns{Save: (*IO).save, Load: (*IO).load})
+	state.Register((*CPUStats)(nil))
+	state.Register((*IO)(nil))
 }

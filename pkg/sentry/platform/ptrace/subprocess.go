@@ -18,15 +18,24 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/usermem"
+)
+
+var (
+	// maximumUserAddress is the largest possible user address.
+	maximumUserAddress = linux.TaskSize
+
+	// stubInitAddress is the initial attempt link address for the stub.
+	stubInitAddress = linux.TaskSize
 )
 
 // Linux kernel errnos which "should never be seen by user programs", but will
@@ -34,9 +43,9 @@ import (
 //
 // These constants are only used in subprocess.go.
 const (
-	ERESTARTSYS    = syscall.Errno(512)
-	ERESTARTNOINTR = syscall.Errno(513)
-	ERESTARTNOHAND = syscall.Errno(514)
+	ERESTARTSYS    = unix.Errno(512)
+	ERESTARTNOINTR = unix.Errno(513)
+	ERESTARTNOHAND = unix.Errno(514)
 )
 
 // globalPool exists to solve two distinct problems:
@@ -63,13 +72,13 @@ type thread struct {
 	// initRegs are the initial registers for the first thread.
 	//
 	// These are used for the register set for system calls.
-	initRegs syscall.PtraceRegs
+	initRegs arch.Registers
 }
 
 // threadPool is a collection of threads.
 type threadPool struct {
 	// mu protects below.
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// threads is the collection of threads.
 	//
@@ -85,30 +94,42 @@ type threadPool struct {
 //
 // Precondition: the runtime OS thread must be locked.
 func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread) *thread {
-	tp.mu.Lock()
+	// The overwhelming common case is that the thread is already created.
+	// Optimistically attempt the lookup by only locking for reading.
+	tp.mu.RLock()
 	t, ok := tp.threads[currentTID]
-	if !ok {
-		// Before creating a new thread, see if we can find a thread
-		// whose system tid has disappeared.
-		//
-		// TODO(b/77216482): Other parts of this package depend on
-		// threads never exiting.
-		for origTID, t := range tp.threads {
-			// Signal zero is an easy existence check.
-			if err := syscall.Tgkill(syscall.Getpid(), int(origTID), 0); err != nil {
-				// This thread has been abandoned; reuse it.
-				delete(tp.threads, origTID)
-				tp.threads[currentTID] = t
-				tp.mu.Unlock()
-				return t
-			}
-		}
-
-		// Create a new thread.
-		t = newThread()
-		tp.threads[currentTID] = t
+	tp.mu.RUnlock()
+	if ok {
+		return t
 	}
-	tp.mu.Unlock()
+
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	// Another goroutine might have created the thread for currentTID in between
+	// mu.RUnlock() and mu.Lock().
+	if t, ok = tp.threads[currentTID]; ok {
+		return t
+	}
+
+	// Before creating a new thread, see if we can find a thread
+	// whose system tid has disappeared.
+	//
+	// TODO(b/77216482): Other parts of this package depend on
+	// threads never exiting.
+	for origTID, t := range tp.threads {
+		// Signal zero is an easy existence check.
+		if err := unix.Tgkill(unix.Getpid(), int(origTID), 0); err != nil {
+			// This thread has been abandoned; reuse it.
+			delete(tp.threads, origTID)
+			tp.threads[currentTID] = t
+			return t
+		}
+	}
+
+	// Create a new thread.
+	t = newThread()
+	tp.threads[currentTID] = t
 	return t
 }
 
@@ -185,7 +206,7 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 			// (Hopefully nobody tgkilled it with a signal <
 			// SIGSTOP before the SIGSTOP was delivered, in which
 			// case that signal would be delivered before SIGSTOP.)
-			if sig := t.wait(stopped); sig != syscall.SIGSTOP {
+			if sig := t.wait(stopped); sig != unix.SIGSTOP {
 				panic(fmt.Sprintf("error waiting for new clone: expected SIGSTOP, got %v", sig))
 			}
 
@@ -228,13 +249,13 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 func (s *subprocess) unmap() {
 	s.Unmap(0, uint64(stubStart))
 	if maximumUserAddress != stubEnd {
-		s.Unmap(usermem.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+		s.Unmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
 	}
 }
 
 // Release kills the subprocess.
 //
-// Just kidding! We can't safely co-ordinate the detaching of all the
+// Just kidding! We can't safely coordinate the detaching of all the
 // tracees (since the tracers are random runtime threads, and the process
 // won't exit until tracers have been notifier).
 //
@@ -268,7 +289,7 @@ func (s *subprocess) newThread() *thread {
 
 // attach attaches to the thread.
 func (t *thread) attach() {
-	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
 		panic(fmt.Sprintf("unable to attach: %v", errno))
 	}
 
@@ -276,7 +297,7 @@ func (t *thread) attach() {
 	// stopped from the SIGSTOP queued by CLONE_PTRACE (see inner loop of
 	// newSubprocess), so we always expect to see signal-delivery-stop with
 	// SIGSTOP.
-	if sig := t.wait(stopped); sig != syscall.SIGSTOP {
+	if sig := t.wait(stopped); sig != unix.SIGSTOP {
 		panic(fmt.Sprintf("wait failed: expected SIGSTOP, got %v", sig))
 	}
 
@@ -300,7 +321,7 @@ func (t *thread) grabInitRegs() {
 //
 // Because the SIGSTOP is not suppressed, the thread will enter group-stop.
 func (t *thread) detach() {
-	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_DETACH, uintptr(t.tid), 0, uintptr(syscall.SIGSTOP), 0, 0); errno != 0 {
+	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(t.tid), 0, uintptr(unix.SIGSTOP), 0, 0); errno != 0 {
 		panic(fmt.Sprintf("can't detach new clone: %v", errno))
 	}
 }
@@ -317,7 +338,7 @@ const (
 )
 
 func (t *thread) dumpAndPanic(message string) {
-	var regs syscall.PtraceRegs
+	var regs arch.Registers
 	message += "\n"
 	if err := t.getRegs(&regs); err == nil {
 		message += dumpRegs(&regs)
@@ -330,14 +351,14 @@ func (t *thread) dumpAndPanic(message string) {
 
 func (t *thread) unexpectedStubExit() {
 	msg, err := t.getEventMessage()
-	status := syscall.WaitStatus(msg)
-	if status.Signaled() && status.Signal() == syscall.SIGKILL {
-		// SIGKILL can be only sent by an user or OOM-killer. In both
+	status := unix.WaitStatus(msg)
+	if status.Signaled() && status.Signal() == unix.SIGKILL {
+		// SIGKILL can be only sent by a user or OOM-killer. In both
 		// these cases, we don't need to panic. There is no reasons to
 		// think that something wrong in gVisor.
 		log.Warningf("The ptrace stub process %v has been killed by SIGKILL.", t.tgid)
 		pid := os.Getpid()
-		syscall.Tgkill(pid, pid, syscall.Signal(syscall.SIGKILL))
+		unix.Tgkill(pid, pid, unix.Signal(unix.SIGKILL))
 	}
 	t.dumpAndPanic(fmt.Sprintf("wait failed: the process %d:%d exited: %x (err %v)", t.tgid, t.tid, msg, err))
 }
@@ -345,12 +366,12 @@ func (t *thread) unexpectedStubExit() {
 // wait waits for a stop event.
 //
 // Precondition: outcome is a valid waitOutcome.
-func (t *thread) wait(outcome waitOutcome) syscall.Signal {
-	var status syscall.WaitStatus
+func (t *thread) wait(outcome waitOutcome) unix.Signal {
+	var status unix.WaitStatus
 
 	for {
-		r, err := syscall.Wait4(int(t.tid), &status, syscall.WALL|syscall.WUNTRACED, nil)
-		if err == syscall.EINTR || err == syscall.EAGAIN {
+		r, err := unix.Wait4(int(t.tid), &status, unix.WALL|unix.WUNTRACED, nil)
+		if err == unix.EINTR || err == unix.EAGAIN {
 			// Wait was interrupted; wait again.
 			continue
 		} else if err != nil {
@@ -368,12 +389,12 @@ func (t *thread) wait(outcome waitOutcome) syscall.Signal {
 			if stopSig == 0 {
 				continue // Spurious stop.
 			}
-			if stopSig == syscall.SIGTRAP {
-				if status.TrapCause() == syscall.PTRACE_EVENT_EXIT {
+			if stopSig == unix.SIGTRAP {
+				if status.TrapCause() == unix.PTRACE_EVENT_EXIT {
 					t.unexpectedStubExit()
 				}
 				// Re-encode the trap cause the way it's expected.
-				return stopSig | syscall.Signal(status.TrapCause()<<8)
+				return stopSig | unix.Signal(status.TrapCause()<<8)
 			}
 			// Not a trap signal.
 			return stopSig
@@ -381,7 +402,7 @@ func (t *thread) wait(outcome waitOutcome) syscall.Signal {
 			if !status.Exited() && !status.Signaled() {
 				t.dumpAndPanic(fmt.Sprintf("ptrace status unexpected: got %v, wanted exited", status))
 			}
-			return syscall.Signal(status.ExitStatus())
+			return unix.Signal(status.ExitStatus())
 		default:
 			// Should not happen.
 			t.dumpAndPanic(fmt.Sprintf("unknown outcome: %v", outcome))
@@ -396,7 +417,7 @@ func (t *thread) wait(outcome waitOutcome) syscall.Signal {
 // manually created threads.
 func (t *thread) destroy() {
 	t.detach()
-	syscall.Tgkill(int(t.tgid), int(t.tid), syscall.Signal(syscall.SIGKILL))
+	unix.Tgkill(int(t.tgid), int(t.tid), unix.Signal(unix.SIGKILL))
 	t.wait(killed)
 }
 
@@ -406,12 +427,12 @@ func (t *thread) init() {
 	// set PTRACE_O_EXITKILL to ensure that the unexpected exit of the
 	// sentry will immediately kill the associated stubs.
 	const PTRACE_O_EXITKILL = 0x100000
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_SETOPTIONS,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_SETOPTIONS,
 		uintptr(t.tid),
 		0,
-		syscall.PTRACE_O_TRACESYSGOOD|syscall.PTRACE_O_TRACEEXIT|PTRACE_O_EXITKILL,
+		unix.PTRACE_O_TRACESYSGOOD|unix.PTRACE_O_TRACEEXIT|PTRACE_O_EXITKILL,
 		0, 0)
 	if errno != 0 {
 		panic(fmt.Sprintf("ptrace set options failed: %v", errno))
@@ -423,7 +444,7 @@ func (t *thread) init() {
 // This is _not_ for use by application system calls, rather it is for use when
 // a system call must be injected into the remote context (e.g. mmap, munmap).
 // Note that clones are handled separately.
-func (t *thread) syscall(regs *syscall.PtraceRegs) (uintptr, error) {
+func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 	// Set registers.
 	if err := t.setRegs(regs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
@@ -433,17 +454,17 @@ func (t *thread) syscall(regs *syscall.PtraceRegs) (uintptr, error) {
 		// Execute the syscall instruction. The task has to stop on the
 		// trap instruction which is right after the syscall
 		// instruction.
-		if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_CONT, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+		if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
 			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
 		}
 
 		sig := t.wait(stopped)
-		if sig == syscall.SIGTRAP {
+		if sig == unix.SIGTRAP {
 			// Reached syscall-enter-stop.
 			break
 		} else {
 			// Some other signal caused a thread stop; ignore.
-			if sig != syscall.SIGSTOP && sig != syscall.SIGCHLD {
+			if sig != unix.SIGSTOP && sig != unix.SIGCHLD {
 				log.Warningf("The thread %d:%d has been interrupted by %d", t.tgid, t.tid, sig)
 			}
 			continue
@@ -461,7 +482,7 @@ func (t *thread) syscall(regs *syscall.PtraceRegs) (uintptr, error) {
 // syscallIgnoreInterrupt ignores interrupts on the system call thread and
 // restarts the syscall if the kernel indicates that should happen.
 func (t *thread) syscallIgnoreInterrupt(
-	initRegs *syscall.PtraceRegs,
+	initRegs *arch.Registers,
 	sysno uintptr,
 	args ...arch.SyscallArgument) (uintptr, error) {
 	for {
@@ -482,63 +503,62 @@ func (t *thread) syscallIgnoreInterrupt(
 
 // NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
 func (t *thread) NotifyInterrupt() {
-	syscall.Tgkill(int(t.tgid), int(t.tid), syscall.Signal(platform.SignalInterrupt))
+	unix.Tgkill(int(t.tgid), int(t.tid), unix.Signal(platform.SignalInterrupt))
 }
 
 // switchToApp is called from the main SwitchToApp entrypoint.
 //
 // This function returns true on a system call, false on a signal.
-func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
+func (s *subprocess) switchToApp(c *context, ac *arch.Context64) bool {
 	// Lock the thread for ptrace operations.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	// Extract floating point state.
 	fpState := ac.FloatingPointData()
-	fpLen, _ := ac.FeatureSet().ExtendedStateSize()
-	useXsave := ac.FeatureSet().UseXsave()
 
 	// Grab our thread from the pool.
-	currentTID := int32(procid.Current())
+	currentTID := int32(hosttid.Current())
 	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
 
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	t.resetSysemuRegs(regs)
 
+	// Extract TLS register
+	tls := uint64(ac.TLS())
+
 	// Check for interrupts, and ensure that future interrupts will signal t.
 	if !c.interrupt.Enable(t) {
 		// Pending interrupt; simulate.
-		c.signalInfo = arch.SignalInfo{Signo: int32(platform.SignalInterrupt)}
+		c.signalInfo = linux.SignalInfo{Signo: int32(platform.SignalInterrupt)}
 		return false
 	}
 	defer c.interrupt.Disable()
-
-	// Ensure that the CPU set is bound appropriately; this makes the
-	// emulation below several times faster, presumably by avoiding
-	// interprocessor wakeups and by simplifying the schedule.
-	t.bind()
 
 	// Set registers.
 	if err := t.setRegs(regs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs (%+v) failed: %v", regs, err))
 	}
-	if err := t.setFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
+	if err := t.setFPRegs(fpState, &c.archContext); err != nil {
 		panic(fmt.Sprintf("ptrace set fpregs (%+v) failed: %v", fpState, err))
+	}
+	if err := t.setTLS(&tls); err != nil {
+		panic(fmt.Sprintf("ptrace set tls (%+v) failed: %v", tls, err))
 	}
 
 	for {
 		// Start running until the next system call.
 		if isSingleStepping(regs) {
-			if _, _, errno := syscall.RawSyscall6(
-				syscall.SYS_PTRACE,
+			if _, _, errno := unix.RawSyscall6(
+				unix.SYS_PTRACE,
 				unix.PTRACE_SYSEMU_SINGLESTEP,
 				uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
 				panic(fmt.Sprintf("ptrace sysemu failed: %v", errno))
 			}
 		} else {
-			if _, _, errno := syscall.RawSyscall6(
-				syscall.SYS_PTRACE,
+			if _, _, errno := unix.RawSyscall6(
+				unix.SYS_PTRACE,
 				unix.PTRACE_SYSEMU,
 				uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
 				panic(fmt.Sprintf("ptrace sysemu failed: %v", errno))
@@ -548,23 +568,33 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 		// Wait for the syscall-enter stop.
 		sig := t.wait(stopped)
 
+		if sig == unix.SIGSTOP {
+			// SIGSTOP was delivered to another thread in the same thread
+			// group, which initiated another group stop. Just ignore it.
+			continue
+		}
+
 		// Refresh all registers.
 		if err := t.getRegs(regs); err != nil {
 			panic(fmt.Sprintf("ptrace get regs failed: %v", err))
 		}
-		if err := t.getFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
+		if err := t.getFPRegs(fpState, &c.archContext); err != nil {
 			panic(fmt.Sprintf("ptrace get fpregs failed: %v", err))
+		}
+		if err := t.getTLS(&tls); err != nil {
+			panic(fmt.Sprintf("ptrace get tls failed: %v", err))
+		}
+		if !ac.SetTLS(uintptr(tls)) {
+			panic(fmt.Sprintf("tls value %v is invalid", tls))
 		}
 
 		// Is it a system call?
-		if sig == (syscallEvent | syscall.SIGTRAP) {
+		if sig == (syscallEvent | unix.SIGTRAP) {
+			s.arm64SyscallWorkaround(t, regs)
+
 			// Ensure registers are sane.
 			updateSyscallRegs(regs)
 			return true
-		} else if sig == syscall.SIGSTOP {
-			// SIGSTOP was delivered to another thread in the same thread
-			// group, which initiated another group stop. Just ignore it.
-			continue
 		}
 
 		// Grab signal information.
@@ -582,7 +612,7 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 			// facilitate vsyscall emulation. See patchSignalInfo.
 			patchSignalInfo(regs, &c.signalInfo)
 			return false
-		} else if c.signalInfo.Code <= 0 && c.signalInfo.Pid() == int32(os.Getpid()) {
+		} else if c.signalInfo.Code <= 0 && c.signalInfo.PID() == int32(os.Getpid()) {
 			// The signal was generated by this process. That means
 			// that it was an interrupt or something else that we
 			// should bail for. Note that we ignore signals
@@ -597,31 +627,31 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 	// Grab a thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	currentTID := int32(procid.Current())
+	currentTID := int32(hosttid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
 
 	return t.syscallIgnoreInterrupt(&t.initRegs, sysno, args...)
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
-func (s *subprocess) MapFile(addr usermem.Addr, f platform.File, fr platform.FileRange, at usermem.AccessType, precommit bool) error {
+func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	var flags int
 	if precommit {
-		flags |= syscall.MAP_POPULATE
+		flags |= unix.MAP_POPULATE
 	}
 	_, err := s.syscall(
-		syscall.SYS_MMAP,
+		unix.SYS_MMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
 		arch.SyscallArgument{Value: uintptr(fr.Length())},
 		arch.SyscallArgument{Value: uintptr(at.Prot())},
-		arch.SyscallArgument{Value: uintptr(flags | syscall.MAP_SHARED | syscall.MAP_FIXED)},
+		arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
 		arch.SyscallArgument{Value: uintptr(f.FD())},
 		arch.SyscallArgument{Value: uintptr(fr.Start)})
 	return err
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
-func (s *subprocess) Unmap(addr usermem.Addr, length uint64) {
+func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 	ar, ok := addr.ToRange(length)
 	if !ok {
 		panic(fmt.Sprintf("addr %#x + length %#x overflows", addr, length))
@@ -641,7 +671,7 @@ func (s *subprocess) Unmap(addr usermem.Addr, length uint64) {
 	}
 	s.mu.Unlock()
 	_, err := s.syscall(
-		syscall.SYS_MUNMAP,
+		unix.SYS_MUNMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
 		arch.SyscallArgument{Value: uintptr(length)})
 	if err != nil {
@@ -649,3 +679,9 @@ func (s *subprocess) Unmap(addr usermem.Addr, length uint64) {
 		panic(fmt.Sprintf("munmap(%x, %x)) failed: %v", addr, length, err))
 	}
 }
+
+// PreFork implements platform.AddressSpace.PreFork.
+func (s *subprocess) PreFork() {}
+
+// PostFork implements platform.AddressSpace.PostFork.
+func (s *subprocess) PostFork() {}

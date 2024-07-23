@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package kvm
 
 import (
 	"fmt"
-	"sync/atomic"
-	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/time"
 )
 
 // loadSegments copies the current segments.
@@ -32,120 +31,115 @@ import (
 //
 //go:nosplit
 func (c *vCPU) loadSegments(tid uint64) {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_ARCH_PRCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_ARCH_PRCTL,
 		linux.ARCH_GET_FS,
 		uintptr(unsafe.Pointer(&c.CPU.Registers().Fs_base)),
 		0); errno != 0 {
 		throw("getting FS segment")
 	}
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_ARCH_PRCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_ARCH_PRCTL,
 		linux.ARCH_GET_GS,
 		uintptr(unsafe.Pointer(&c.CPU.Registers().Gs_base)),
 		0); errno != 0 {
 		throw("getting GS segment")
 	}
-	atomic.StoreUint64(&c.tid, tid)
+	c.tid.Store(tid)
 }
 
 // setCPUID sets the CPUID to be used by the guest.
 func (c *vCPU) setCPUID() error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_CPUID2,
+		KVM_SET_CPUID2,
 		uintptr(unsafe.Pointer(&cpuidSupported))); errno != 0 {
 		return fmt.Errorf("error setting CPUID: %v", errno)
 	}
 	return nil
 }
 
-// setSystemTime sets the TSC for the vCPU.
+// getTSCFreq gets the TSC frequency.
 //
-// This has to make the call many times in order to minimize the intrinsic
-// error in the offset. Unfortunately KVM does not expose a relative offset via
-// the API, so this is an approximation. We do this via an iterative algorithm.
-// This has the advantage that it can generally deal with highly variable
-// system call times and should converge on the correct offset.
-func (c *vCPU) setSystemTime() error {
-	const (
-		_MSR_IA32_TSC  = 0x00000010
-		calibrateTries = 10
-	)
-	registers := modelControlRegisters{
-		nmsrs: 1,
+// If mustSucceed is true, then this function panics on error.
+func (c *vCPU) getTSCFreq() (uintptr, error) {
+	rawFreq, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_GET_TSC_KHZ,
+		0 /* ignored */)
+	if errno != 0 {
+		return 0, errno
 	}
-	registers.entries[0] = modelControlRegister{
-		index: _MSR_IA32_TSC,
-	}
-	target := uint64(^uint32(0))
-	for done := 0; done < calibrateTries; {
-		start := uint64(time.Rdtsc())
-		registers.entries[0].data = start + target
-		if _, _, errno := syscall.RawSyscall(
-			syscall.SYS_IOCTL,
-			uintptr(c.fd),
-			_KVM_SET_MSRS,
-			uintptr(unsafe.Pointer(&registers))); errno != 0 {
-			return fmt.Errorf("error setting system time: %v", errno)
-		}
-		// See if this is our new minimum call time. Note that this
-		// serves two functions: one, we make sure that we are
-		// accurately predicting the offset we need to set. Second, we
-		// don't want to do the final set on a slow call, which could
-		// produce a really bad result. So we only count attempts
-		// within +/- 6.25% of our minimum as an attempt.
-		end := uint64(time.Rdtsc())
-		if end < start {
-			continue // Totally bogus.
-		}
-		half := (end - start) / 2
-		if half < target {
-			target = half
-		}
-		if (half - target) < target/8 {
-			done++
-		}
+	return rawFreq, nil
+}
+
+// setTSCFreq sets the TSC frequency.
+func (c *vCPU) setTSCFreq(freq uintptr) error {
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_SET_TSC_KHZ,
+		freq /* khz */); errno != 0 {
+		return fmt.Errorf("error setting TSC frequency: %v", errno)
 	}
 	return nil
 }
 
-// setSignalMask sets the vCPU signal mask.
-//
-// This must be called prior to running the vCPU.
-func (c *vCPU) setSignalMask() error {
-	// The layout of this structure implies that it will not necessarily be
-	// the same layout chosen by the Go compiler. It gets fudged here.
-	var data struct {
-		length uint32
-		mask1  uint32
-		mask2  uint32
-		_      uint32
+// setTSCOffset sets the TSC offset to zero.
+func (c *vCPU) setTSCOffset() error {
+	offset := uint64(0)
+	da := struct {
+		flags uint32
+		group uint32
+		attr  uint64
+		addr  unsafe.Pointer
+	}{
+		group: _KVM_VCPU_TSC_CTRL,
+		attr:  _KVM_VCPU_TSC_OFFSET,
+		addr:  unsafe.Pointer(&offset),
 	}
-	data.length = 8 // Fixed sigset size.
-	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
-	data.mask2 = ^uint32(bounceSignalMask >> 32)
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_SIGNAL_MASK,
-		uintptr(unsafe.Pointer(&data))); errno != 0 {
-		return fmt.Errorf("error setting signal mask: %v", errno)
+		KVM_SET_DEVICE_ATTR,
+		uintptr(unsafe.Pointer(&da))); errno != 0 {
+		return fmt.Errorf("error setting tsc offset: %v", errno)
+	}
+	return nil
+}
+
+// setTSC sets the TSC value.
+func (c *vCPU) setTSC(value uint64) error {
+	const _MSR_IA32_TSC = 0x00000010
+	registers := modelControlRegisters{
+		nmsrs: 1,
+	}
+	registers.entries[0].index = _MSR_IA32_TSC
+	registers.entries[0].data = value
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_SET_MSRS,
+		uintptr(unsafe.Pointer(&registers))); errno != 0 {
+		return fmt.Errorf("error setting tsc: %v", errno)
 	}
 	return nil
 }
 
 // setUserRegisters sets user registers in the vCPU.
-func (c *vCPU) setUserRegisters(uregs *userRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+//
+//go:nosplit
+func (c *vCPU) setUserRegisters(uregs *userRegs) unix.Errno {
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_REGS,
+		KVM_SET_REGS,
 		uintptr(unsafe.Pointer(uregs))); errno != 0 {
-		return fmt.Errorf("error setting user registers: %v", errno)
+		return errno
 	}
-	return nil
+	return 0
 }
 
 // getUserRegisters reloads user registers in the vCPU.
@@ -153,11 +147,11 @@ func (c *vCPU) setUserRegisters(uregs *userRegs) error {
 // This is safe to call from a nosplit context.
 //
 //go:nosplit
-func (c *vCPU) getUserRegisters(uregs *userRegs) syscall.Errno {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+func (c *vCPU) getUserRegisters(uregs *userRegs) unix.Errno {
+	if _, _, errno := unix.RawSyscall( // escapes: no.
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_GET_REGS,
+		KVM_GET_REGS,
 		uintptr(unsafe.Pointer(uregs))); errno != 0 {
 		return errno
 	}
@@ -166,12 +160,38 @@ func (c *vCPU) getUserRegisters(uregs *userRegs) syscall.Errno {
 
 // setSystemRegisters sets system registers.
 func (c *vCPU) setSystemRegisters(sregs *systemRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_SREGS,
+		KVM_SET_SREGS,
 		uintptr(unsafe.Pointer(sregs))); errno != 0 {
 		return fmt.Errorf("error setting system registers: %v", errno)
 	}
 	return nil
+}
+
+// getSystemRegisters sets system registers.
+//
+//go:nosplit
+func (c *vCPU) getSystemRegisters(sregs *systemRegs) unix.Errno {
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_GET_SREGS,
+		uintptr(unsafe.Pointer(sregs))); errno != 0 {
+		return errno
+	}
+	return 0
+}
+
+//go:nosplit
+func seccompMmapSyscall(context unsafe.Pointer) (uintptr, uintptr, unix.Errno) {
+	ctx := bluepillArchContext(context)
+
+	// MAP_DENYWRITE is deprecated and ignored by kernel. We use it only for seccomp filters.
+	addr, _, e := unix.RawSyscall6(uintptr(ctx.Rax), uintptr(ctx.Rdi), uintptr(ctx.Rsi),
+		uintptr(ctx.Rdx), uintptr(ctx.R10)|unix.MAP_DENYWRITE, uintptr(ctx.R8), uintptr(ctx.R9))
+	ctx.Rax = uint64(addr)
+
+	return addr, uintptr(ctx.Rsi), e
 }

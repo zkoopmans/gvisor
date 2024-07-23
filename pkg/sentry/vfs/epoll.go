@@ -17,8 +17,8 @@ package vfs
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -27,21 +27,30 @@ import (
 var epollCycleMu sync.Mutex
 
 // EpollInstance represents an epoll instance, as described by epoll(7).
+//
+// +stateify savable
 type EpollInstance struct {
 	vfsfd FileDescription
 	FileDescriptionDefaultImpl
 	DentryMetadataFileDescriptionImpl
+	NoLockFD
 
 	// q holds waiters on this EpollInstance.
 	q waiter.Queue
 
-	// interest is the set of file descriptors that are registered with the
-	// EpollInstance for monitoring. interest is protected by interestMu.
-	interestMu sync.Mutex
-	interest   map[epollInterestKey]*epollInterest
+	// interestMu protects interest and most fields in registered
+	// epollInterests. interestMu is analogous to Linux's struct
+	// eventpoll::mtx.
+	interestMu sync.Mutex `state:"nosave"`
 
-	// mu protects fields in registered epollInterests.
-	mu sync.Mutex
+	// interest is the set of file descriptors that are registered with the
+	// EpollInstance for monitoring.
+	interest map[epollInterestKey]*epollInterest
+
+	// readyMu protects ready, readySeq, epollInterest.ready, and
+	// epollInterest.epollInterestEntry. ready is analogous to Linux's struct
+	// eventpoll::lock.
+	readyMu epollReadyInstanceMutex `state:"nosave"`
 
 	// ready is the set of file descriptors that may be "ready" for I/O. Note
 	// that this must be an ordered list, not a map: "If more than maxevents
@@ -52,8 +61,15 @@ type EpollInstance struct {
 	// because it focuses on a set of file descriptors that are already known
 	// to be ready." - epoll_wait(2)
 	ready epollInterestList
+
+	// readySeq is used to detect calls to epollInterest.NotifyEvent() while
+	// Readiness() or ReadEvents() are running with readyMu unlocked. readySeq
+	// is protected by both interestMu and readyMu; reading requires either
+	// mutex to be locked, but mutation requires both mutexes to be locked.
+	readySeq uint32
 }
 
+// +stateify savable
 type epollInterestKey struct {
 	// file is the registered FileDescription. No reference is held on file;
 	// instead, when the last reference is dropped, FileDescription.DecRef()
@@ -66,39 +82,46 @@ type epollInterestKey struct {
 }
 
 // epollInterest represents an EpollInstance's interest in a file descriptor.
+//
+// +stateify savable
 type epollInterest struct {
 	// epoll is the owning EpollInstance. epoll is immutable.
-	epoll *EpollInstance
+	epoll *EpollInstance `state:"wait"`
 
 	// key is the file to which this epollInterest applies. key is immutable.
 	key epollInterestKey
 
-	// waiter is registered with key.file. entry is protected by epoll.mu.
+	// waiter is registered with key.file. entry is protected by
+	// epoll.interestMu.
 	waiter waiter.Entry
 
 	// mask is the event mask associated with this registration, including
-	// flags EPOLLET and EPOLLONESHOT. mask is protected by epoll.mu.
+	// flags EPOLLET and EPOLLONESHOT. mask is protected by epoll.interestMu.
 	mask uint32
 
-	// ready is true if epollInterestEntry is linked into epoll.ready. ready
-	// and epollInterestEntry are protected by epoll.mu.
+	// ready is true if epollInterestEntry is linked into epoll.ready. readySeq
+	// is the value of epoll.readySeq when NotifyEvent() was last called.
+	// ready, epollInterestEntry, and readySeq are protected by epoll.readyMu.
 	ready bool
 	epollInterestEntry
+	readySeq uint32
 
-	// userData is the epoll_data_t associated with this epollInterest.
-	// userData is protected by epoll.mu.
+	// userData is the struct epoll_event::data associated with this
+	// epollInterest. userData is protected by epoll.interestMu.
 	userData [2]int32
 }
 
 // NewEpollInstanceFD returns a FileDescription representing a new epoll
 // instance. A reference is taken on the returned FileDescription.
-func (vfs *VirtualFilesystem) NewEpollInstanceFD() (*FileDescription, error) {
+func (vfs *VirtualFilesystem) NewEpollInstanceFD(ctx context.Context) (*FileDescription, error) {
 	vd := vfs.NewAnonVirtualDentry("[eventpoll]")
-	defer vd.DecRef()
+	defer vd.DecRef(ctx)
 	ep := &EpollInstance{
 		interest: make(map[epollInterestKey]*epollInterest),
 	}
 	if err := ep.vfsfd.Init(ep, linux.O_RDWR, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
 		UseDentryMetadata: true,
 	}); err != nil {
 		return nil, err
@@ -107,7 +130,7 @@ func (vfs *VirtualFilesystem) NewEpollInstanceFD() (*FileDescription, error) {
 }
 
 // Release implements FileDescriptionImpl.Release.
-func (ep *EpollInstance) Release() {
+func (ep *EpollInstance) Release(ctx context.Context) {
 	// Unregister all polled fds.
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()
@@ -123,29 +146,79 @@ func (ep *EpollInstance) Release() {
 
 // Readiness implements waiter.Waitable.Readiness.
 func (ep *EpollInstance) Readiness(mask waiter.EventMask) waiter.EventMask {
-	if mask&waiter.EventIn == 0 {
+	if mask&waiter.ReadableEvents == 0 {
 		return 0
 	}
-	ep.mu.Lock()
-	for epi := ep.ready.Front(); epi != nil; epi = epi.Next() {
+
+	// We can't call FileDescription.Readiness() while holding ep.readyMu.
+	// Instead, hold ep.interestMu to prevent changes to the set of
+	// epollInterests, then temporarily move all epollInterests already on
+	// ep.ready to a local list that we can iterate without holding ep.readyMu.
+	// epollInterest.ready is left set to true so that
+	// epollInterest.NotifyEvent() doesn't touch epollInterestEntry.
+	ep.interestMu.Lock()
+	defer ep.interestMu.Unlock()
+	var (
+		ready    epollInterestList
+		notReady epollInterestList
+	)
+	ep.readyMu.Lock()
+	ready.PushBackList(&ep.ready)
+	ep.readySeq++
+	ep.readyMu.Unlock()
+	if ready.Empty() {
+		return 0
+	}
+	defer func() {
+		notify := false
+		ep.readyMu.Lock()
+		ep.ready.PushFrontList(&ready)
+		var next *epollInterest
+		for epi := notReady.Front(); epi != nil; epi = next {
+			next = epi.Next()
+			if epi.readySeq == ep.readySeq {
+				// epi.NotifyEvent() was called while we were running.
+				notReady.Remove(epi)
+				ep.ready.PushBack(epi)
+				notify = true
+			} else {
+				epi.ready = false
+			}
+		}
+		ep.readyMu.Unlock()
+		if notify {
+			ep.q.Notify(waiter.ReadableEvents)
+		}
+	}()
+
+	var next *epollInterest
+	for epi := ready.Front(); epi != nil; epi = next {
+		next = epi.Next()
 		wmask := waiter.EventMaskFromLinux(epi.mask)
 		if epi.key.file.Readiness(wmask)&wmask != 0 {
-			ep.mu.Unlock()
-			return waiter.EventIn
+			return waiter.ReadableEvents
 		}
+		// epi.key.file was readied spuriously; leave it off of ep.ready.
+		ready.Remove(epi)
+		notReady.PushBack(epi)
 	}
-	ep.mu.Unlock()
 	return 0
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (ep *EpollInstance) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	ep.q.EventRegister(e, mask)
+func (ep *EpollInstance) EventRegister(e *waiter.Entry) error {
+	ep.q.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (ep *EpollInstance) EventUnregister(e *waiter.Entry) {
 	ep.q.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (ep *EpollInstance) Epollable() bool {
+	return true
 }
 
 // Seek implements FileDescriptionImpl.Seek.
@@ -157,7 +230,11 @@ func (ep *EpollInstance) Seek(ctx context.Context, offset int64, whence int32) (
 // AddInterest implements the semantics of EPOLL_CTL_ADD.
 //
 // Preconditions: A reference must be held on file.
-func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, mask uint32, userData [2]int32) error {
+func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event linux.EpollEvent) error {
+	if !file.Epollable() {
+		return linuxerr.EPERM
+	}
+
 	// Check for cyclic polling if necessary.
 	subep, _ := file.impl.(*EpollInstance)
 	if subep != nil {
@@ -166,7 +243,7 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, mask uint
 		// that cyclic polling is not introduced after the check.
 		defer epollCycleMu.Unlock()
 		if subep.mightPoll(ep) {
-			return syserror.ELOOP
+			return linuxerr.ELOOP
 		}
 	}
 
@@ -179,29 +256,35 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, mask uint
 		num:  num,
 	}
 	if _, ok := ep.interest[key]; ok {
-		return syserror.EEXIST
+		return linuxerr.EEXIST
 	}
 
 	// Register interest in file.
-	mask |= linux.EPOLLERR | linux.EPOLLRDHUP
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	epi := &epollInterest{
 		epoll:    ep,
 		key:      key,
 		mask:     mask,
-		userData: userData,
+		userData: event.Data,
 	}
 	ep.interest[key] = epi
 	wmask := waiter.EventMaskFromLinux(mask)
-	file.EventRegister(&epi.waiter, wmask)
+	epi.waiter.Init(epi, wmask)
+	if err := file.EventRegister(&epi.waiter); err != nil {
+		return err
+	}
 
 	// Check if the file is already ready.
-	if file.Readiness(wmask)&wmask != 0 {
-		epi.Callback(nil)
+	if m := file.Readiness(wmask) & wmask; m != 0 {
+		epi.NotifyEvent(m)
 	}
 
 	// Add epi to file.epolls so that it is removed when the last
 	// FileDescription reference is dropped.
 	file.epollMu.Lock()
+	if file.epolls == nil {
+		file.epolls = make(map[*epollInterest]struct{})
+	}
 	file.epolls[epi] = struct{}{}
 	file.epollMu.Unlock()
 
@@ -236,7 +319,7 @@ func (ep *EpollInstance) mightPollRecursive(ep2 *EpollInstance, remainingRecursi
 // ModifyInterest implements the semantics of EPOLL_CTL_MOD.
 //
 // Preconditions: A reference must be held on file.
-func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, mask uint32, userData [2]int32) error {
+func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event linux.EpollEvent) error {
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()
 
@@ -246,24 +329,25 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, mask u
 		num:  num,
 	}]
 	if !ok {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 
 	// Update epi for the next call to ep.ReadEvents().
-	ep.mu.Lock()
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	epi.mask = mask
-	epi.userData = userData
-	ep.mu.Unlock()
+	epi.userData = event.Data
 
 	// Re-register with the new mask.
-	mask |= linux.EPOLLERR | linux.EPOLLRDHUP
 	file.EventUnregister(&epi.waiter)
 	wmask := waiter.EventMaskFromLinux(mask)
-	file.EventRegister(&epi.waiter, wmask)
+	epi.waiter.Init(epi, wmask)
+	if err := file.EventRegister(&epi.waiter); err != nil {
+		return err
+	}
 
 	// Check if the file is already ready with the new mask.
-	if file.Readiness(wmask)&wmask != 0 {
-		epi.Callback(nil)
+	if m := file.Readiness(wmask) & wmask; m != 0 {
+		epi.NotifyEvent(m)
 	}
 
 	return nil
@@ -282,7 +366,7 @@ func (ep *EpollInstance) DeleteInterest(file *FileDescription, num int32) error 
 		num:  num,
 	}]
 	if !ok {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 
 	// Unregister from the file so that epi will no longer be readied.
@@ -298,52 +382,94 @@ func (ep *EpollInstance) DeleteInterest(file *FileDescription, num int32) error 
 	return nil
 }
 
-// Callback implements waiter.EntryCallback.Callback.
-func (epi *epollInterest) Callback(*waiter.Entry) {
+// NotifyEvent implements waiter.EventListener.NotifyEvent.
+func (epi *epollInterest) NotifyEvent(waiter.EventMask) {
 	newReady := false
-	epi.epoll.mu.Lock()
+	epi.epoll.readyMu.Lock()
 	if !epi.ready {
 		newReady = true
 		epi.ready = true
 		epi.epoll.ready.PushBack(epi)
 	}
-	epi.epoll.mu.Unlock()
+	epi.readySeq = epi.epoll.readySeq
+	epi.epoll.readyMu.Unlock()
 	if newReady {
-		epi.epoll.q.Notify(waiter.EventIn)
+		epi.epoll.q.Notify(waiter.ReadableEvents)
 	}
 }
 
 // Preconditions: ep.interestMu must be locked.
 func (ep *EpollInstance) removeLocked(epi *epollInterest) {
 	delete(ep.interest, epi.key)
-	ep.mu.Lock()
+	ep.readyMu.Lock()
 	if epi.ready {
 		epi.ready = false
 		ep.ready.Remove(epi)
 	}
-	ep.mu.Unlock()
+	ep.readyMu.Unlock()
 }
 
-// ReadEvents reads up to len(events) ready events into events and returns the
-// number of events read.
-//
-// Preconditions: len(events) != 0.
-func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent) int {
+// ReadEvents appends up to maxReady events to events and returns the updated
+// slice of events.
+func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent, maxEvents int) []linux.EpollEvent {
+	// We can't call FileDescription.Readiness() while holding ep.readyMu.
+	// Instead, hold ep.interestMu to prevent changes to the set of
+	// epollInterests, then temporarily move all epollInterests already on
+	// ep.ready to a local list that we can iterate without holding ep.readyMu.
+	// epollInterest.ready is left set to true so that
+	// epollInterest.NotifyEvent() doesn't touch epollInterestEntry.
+	ep.interestMu.Lock()
+	defer ep.interestMu.Unlock()
+	var (
+		ready    epollInterestList
+		notReady epollInterestList
+		requeue  epollInterestList
+	)
+	ep.readyMu.Lock()
+	ready.PushBackList(&ep.ready)
+	ep.readySeq++
+	ep.readyMu.Unlock()
+	if ready.Empty() {
+		return nil
+	}
+	defer func() {
+		notify := false
+		ep.readyMu.Lock()
+		// epollInterests that we never checked are re-inserted at the start of
+		// ep.ready. epollInterests that were ready are re-inserted at the end
+		// for reasons described by EpollInstance.ready.
+		ep.ready.PushFrontList(&ready)
+		var next *epollInterest
+		for epi := notReady.Front(); epi != nil; epi = next {
+			next = epi.Next()
+			if epi.readySeq == ep.readySeq {
+				// epi.NotifyEvent() was called while we were running.
+				notReady.Remove(epi)
+				ep.ready.PushBack(epi)
+				notify = true
+			} else {
+				epi.ready = false
+			}
+		}
+		ep.ready.PushBackList(&requeue)
+		ep.readyMu.Unlock()
+		if notify {
+			ep.q.Notify(waiter.ReadableEvents)
+		}
+	}()
+
 	i := 0
-	// Hot path: avoid defer.
-	ep.mu.Lock()
 	var next *epollInterest
-	var requeue epollInterestList
-	for epi := ep.ready.Front(); epi != nil; epi = next {
+	for epi := ready.Front(); epi != nil; epi = next {
 		next = epi.Next()
 		// Regardless of what else happens, epi is initially removed from the
 		// ready list.
-		ep.ready.Remove(epi)
+		ready.Remove(epi)
 		wmask := waiter.EventMaskFromLinux(epi.mask)
 		ievents := epi.key.file.Readiness(wmask) & wmask
 		if ievents == 0 {
 			// Leave epi off the ready list.
-			epi.ready = false
+			notReady.PushBack(epi)
 			continue
 		}
 		// Determine what we should do with epi.
@@ -355,23 +481,20 @@ func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent) int {
 			fallthrough
 		case epi.mask&linux.EPOLLET != 0:
 			// Leave epi off the ready list.
-			epi.ready = false
+			notReady.PushBack(epi)
 		default:
 			// Queue epi to be moved to the end of the ready list.
 			requeue.PushBack(epi)
 		}
 		// Report ievents.
-		events[i] = linux.EpollEvent{
+		events = append(events, linux.EpollEvent{
 			Events: ievents.ToLinux(),
-			Fd:     epi.userData[0],
-			Data:   epi.userData[1],
-		}
+			Data:   epi.userData,
+		})
 		i++
-		if i == len(events) {
+		if i == maxEvents {
 			break
 		}
 	}
-	ep.ready.PushBackList(&requeue)
-	ep.mu.Unlock()
-	return i
+	return events
 }

@@ -12,27 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package kvm
 
 import (
 	"fmt"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
-	runDataSize int
+	runDataSize  int
+	hasGuestPCID bool
 )
 
 func updateSystemValues(fd int) error {
 	// Extract the mmap size.
-	sz, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(fd), _KVM_GET_VCPU_MMAP_SIZE, 0)
+	sz, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), KVM_GET_VCPU_MMAP_SIZE, 0)
 	if errno != 0 {
 		return fmt.Errorf("getting VCPU mmap size: %v", errno)
 	}
 	// Save the data.
 	runDataSize = int(sz)
+	hasGuestPCID = true
 
 	// Success.
 	return nil

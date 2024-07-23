@@ -16,9 +16,7 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
 // SessionID is the public identifier.
@@ -31,7 +29,7 @@ type ProcessGroupID ThreadID
 //
 // +stateify savable
 type Session struct {
-	refs refs.AtomicRefCount
+	SessionRefs
 
 	// leader is the originator of the Session.
 	//
@@ -61,16 +59,11 @@ type Session struct {
 	sessionEntry
 }
 
-// incRef grabs a reference.
-func (s *Session) incRef() {
-	s.refs.IncRef()
-}
-
-// decRef drops a reference.
+// DecRef drops a reference.
 //
 // Precondition: callers must hold TaskSet.mu for writing.
-func (s *Session) decRef() {
-	s.refs.DecRefWithDestructor(func() {
+func (s *Session) DecRef() {
+	s.SessionRefs.DecRef(func() {
 		// Remove translations from the leader.
 		for ns := s.leader.pidns; ns != nil; ns = ns.parent {
 			id := ns.sids[s]
@@ -87,7 +80,7 @@ func (s *Session) decRef() {
 //
 // +stateify savable
 type ProcessGroup struct {
-	refs refs.AtomicRefCount // not exported.
+	refs ProcessGroupRefs
 
 	// originator is the originator of the group.
 	//
@@ -120,15 +113,16 @@ type ProcessGroup struct {
 	processGroupEntry
 }
 
-// Originator retuns the originator of the process group.
+// Originator returns the originator of the process group.
 func (pg *ProcessGroup) Originator() *ThreadGroup {
 	return pg.originator
 }
 
 // IsOrphan returns true if this process group is an orphan.
 func (pg *ProcessGroup) IsOrphan() bool {
-	pg.originator.TaskSet().mu.RLock()
-	defer pg.originator.TaskSet().mu.RUnlock()
+	ts := pg.originator.TaskSet()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 	return pg.ancestors == 0
 }
 
@@ -162,7 +156,7 @@ func (pg *ProcessGroup) decRefWithParent(parentPG *ProcessGroup) {
 	}
 
 	alive := true
-	pg.refs.DecRefWithDestructor(func() {
+	pg.refs.DecRef(func() {
 		alive = false // don't bother with handleOrphan.
 
 		// Remove translations from the originator.
@@ -174,7 +168,7 @@ func (pg *ProcessGroup) decRefWithParent(parentPG *ProcessGroup) {
 
 		// Remove the list of process groups.
 		pg.session.processGroups.Remove(pg)
-		pg.session.decRef()
+		pg.session.DecRef()
 	})
 	if alive {
 		pg.handleOrphan()
@@ -208,11 +202,11 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
 		if tg.groupStopComplete {
 			hasStopped = true
 		}
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 	if !hasStopped {
 		return
@@ -223,10 +217,10 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 
 	return
@@ -238,15 +232,15 @@ func (pg *ProcessGroup) Session() *Session {
 }
 
 // SendSignal sends a signal to all processes inside the process group. It is
-// analagous to kernel/signal.c:kill_pgrp.
-func (pg *ProcessGroup) SendSignal(info *arch.SignalInfo) error {
+// analogous to kernel/signal.c:kill_pgrp.
+func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 	tasks := pg.originator.TaskSet()
 	tasks.mu.RLock()
 	defer tasks.mu.RUnlock()
 
 	var lastErr error
 	for tg := range tasks.Root.tgids {
-		if tg.ProcessGroup() == pg {
+		if tg.processGroup == pg {
 			tg.signalHandlers.mu.Lock()
 			infoCopy := *info
 			if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
@@ -262,7 +256,7 @@ func (pg *ProcessGroup) SendSignal(info *arch.SignalInfo) error {
 //
 // EPERM may be returned if either the given ThreadGroup is already a Session
 // leader, or a ProcessGroup already exists for the ThreadGroup's ID.
-func (tg *ThreadGroup) CreateSession() error {
+func (tg *ThreadGroup) CreateSession() (SessionID, error) {
 	tg.pidns.owner.mu.Lock()
 	defer tg.pidns.owner.mu.Unlock()
 	tg.signalHandlers.mu.Lock()
@@ -273,7 +267,7 @@ func (tg *ThreadGroup) CreateSession() error {
 // createSession creates a new session for a threadgroup.
 //
 // Precondition: callers must hold TaskSet.mu and the signal mutex for writing.
-func (tg *ThreadGroup) createSession() error {
+func (tg *ThreadGroup) createSession() (SessionID, error) {
 	// Get the ID for this thread in the current namespace.
 	id := tg.pidns.tgids[tg]
 
@@ -284,24 +278,25 @@ func (tg *ThreadGroup) createSession() error {
 			continue
 		}
 		if s.leader == tg {
-			return syserror.EPERM
+			return -1, linuxerr.EPERM
 		}
 		if s.id == SessionID(id) {
-			return syserror.EPERM
+			return -1, linuxerr.EPERM
 		}
 		for pg := s.processGroups.Front(); pg != nil; pg = pg.Next() {
 			if pg.id == ProcessGroupID(id) {
-				return syserror.EPERM
+				return -1, linuxerr.EPERM
 			}
 		}
 	}
 
 	// Create a new Session, with a single reference.
+	sid := SessionID(id)
 	s := &Session{
-		id:     SessionID(id),
+		id:     sid,
 		leader: tg,
 	}
-	s.refs.EnableLeakCheck("kernel.Session")
+	s.InitRefs()
 
 	// Create a new ProcessGroup, belonging to that Session.
 	// This also has a single reference (assigned below).
@@ -315,7 +310,7 @@ func (tg *ThreadGroup) createSession() error {
 		session:    s,
 		ancestors:  0,
 	}
-	pg.refs.EnableLeakCheck("kernel.ProcessGroup")
+	pg.refs.InitRefs()
 
 	// Tie them and return the result.
 	s.processGroups.PushBack(pg)
@@ -362,7 +357,7 @@ func (tg *ThreadGroup) createSession() error {
 	// Disconnect from the controlling terminal.
 	tg.tty = nil
 
-	return nil
+	return sid, nil
 }
 
 // CreateProcessGroup creates a new process group.
@@ -376,17 +371,22 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 	// Get the ID for this thread in the current namespace.
 	id := tg.pidns.tgids[tg]
 
+	// Check whether a process still exists or not.
+	if id == 0 {
+		return linuxerr.ESRCH
+	}
+
 	// Per above, check for a Session leader or existing group.
 	for s := tg.pidns.owner.sessions.Front(); s != nil; s = s.Next() {
 		if s.leader.pidns != tg.pidns {
 			continue
 		}
 		if s.leader == tg {
-			return syserror.EPERM
+			return linuxerr.EPERM
 		}
 		for pg := s.processGroups.Front(); pg != nil; pg = pg.Next() {
 			if pg.id == ProcessGroupID(id) {
-				return syserror.EPERM
+				return linuxerr.EPERM
 			}
 		}
 	}
@@ -395,13 +395,13 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 	//
 	// We manually adjust the ancestors if the parent is in the same
 	// session.
-	tg.processGroup.session.incRef()
+	tg.processGroup.session.IncRef()
 	pg := ProcessGroup{
 		id:         ProcessGroupID(id),
 		originator: tg,
 		session:    tg.processGroup.session,
 	}
-	pg.refs.EnableLeakCheck("kernel.ProcessGroup")
+	pg.refs.InitRefs()
 
 	if tg.leader.parent != nil && tg.leader.parent.tg.processGroup.session == pg.session {
 		pg.ancestors++
@@ -441,20 +441,25 @@ func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID
 	pidns.owner.mu.Lock()
 	defer pidns.owner.mu.Unlock()
 
+	// Check whether the process still exists or not.
+	if _, ok := pidns.tgids[tg]; !ok {
+		return linuxerr.ESRCH
+	}
+
 	// Lookup the ProcessGroup.
 	pg := pidns.processGroups[pgid]
 	if pg == nil {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	// Disallow the join if an execve has performed, per POSIX.
 	if checkExec && tg.execed {
-		return syserror.EACCES
+		return linuxerr.EACCES
 	}
 
 	// See if it's in the same session as ours.
 	if pg.session != tg.processGroup.session {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	// Join the group; adjust children.
@@ -483,20 +488,20 @@ func (tg *ThreadGroup) Session() *Session {
 //
 // If this group isn't visible in this namespace, zero will be returned. It is
 // the callers responsibility to check that before using this function.
-func (pidns *PIDNamespace) IDOfSession(s *Session) SessionID {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.sids[s]
+func (ns *PIDNamespace) IDOfSession(s *Session) SessionID {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.sids[s]
 }
 
 // SessionWithID returns the Session with the given ID in the PID namespace ns,
 // or nil if that given ID is not defined in this namespace.
 //
 // A reference is not taken on the session.
-func (pidns *PIDNamespace) SessionWithID(id SessionID) *Session {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.sessions[id]
+func (ns *PIDNamespace) SessionWithID(id SessionID) *Session {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.sessions[id]
 }
 
 // ProcessGroup returns the ThreadGroup's ProcessGroup.
@@ -511,18 +516,18 @@ func (tg *ThreadGroup) ProcessGroup() *ProcessGroup {
 // IDOfProcessGroup returns the process group assigned to pg in PID namespace ns.
 //
 // The same constraints apply as IDOfSession.
-func (pidns *PIDNamespace) IDOfProcessGroup(pg *ProcessGroup) ProcessGroupID {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.pgids[pg]
+func (ns *PIDNamespace) IDOfProcessGroup(pg *ProcessGroup) ProcessGroupID {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.pgids[pg]
 }
 
 // ProcessGroupWithID returns the ProcessGroup with the given ID in the PID
 // namespace ns, or nil if that given ID is not defined in this namespace.
 //
 // A reference is not taken on the process group.
-func (pidns *PIDNamespace) ProcessGroupWithID(id ProcessGroupID) *ProcessGroup {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.processGroups[id]
+func (ns *PIDNamespace) ProcessGroupWithID(id ProcessGroupID) *ProcessGroup {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.processGroups[id]
 }

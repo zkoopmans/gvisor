@@ -17,6 +17,7 @@ package kernel
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -36,6 +37,8 @@ import (
 const TasksLimit = (1 << 16)
 
 // ThreadID is a generic thread identifier.
+//
+// +marshal
 type ThreadID int32
 
 // String returns a decimal representation of the ThreadID.
@@ -43,19 +46,19 @@ func (tid ThreadID) String() string {
 	return fmt.Sprintf("%d", tid)
 }
 
-// InitTID is the TID given to the first task added to each PID namespace. The
-// thread group led by InitTID is called the namespace's init process. The
+// initTID is the TID given to the first task added to each PID namespace. The
+// thread group led by initTID is called the namespace's init process. The
 // death of a PID namespace's init process causes all tasks visible in that
 // namespace to be killed.
-const InitTID ThreadID = 1
+const initTID ThreadID = 1
 
 // A TaskSet comprises all tasks in a system.
 //
 // +stateify savable
 type TaskSet struct {
-	// mu protects all relationships betweens tasks and thread groups in the
+	// mu protects all relationships between tasks and thread groups in the
 	// TaskSet. (mu is approximately equivalent to Linux's tasklist_lock.)
-	mu sync.RWMutex `state:"nosave"`
+	mu taskSetRWMutex `state:"nosave"`
 
 	// Root is the root PID namespace, in which all tasks in the TaskSet are
 	// visible. The Root pointer is immutable.
@@ -87,6 +90,13 @@ type TaskSet struct {
 	// at time of save (but note that this is not necessarily the same thing as
 	// sync.WaitGroup's zero value).
 	runningGoroutines sync.WaitGroup `state:"nosave"`
+
+	// aioGoroutines is the number of goroutines running async I/O
+	// callbacks.
+	//
+	// aioGoroutines is not saved but is required to be zero at the time of
+	// save.
+	aioGoroutines sync.WaitGroup `state:"nosave"`
 }
 
 // newTaskSet returns a new, empty TaskSet.
@@ -96,12 +106,28 @@ func newTaskSet(pidns *PIDNamespace) *TaskSet {
 	return ts
 }
 
+// ForEachThreadGroup applies f to each thread group in ts.
+func (ts *TaskSet) ForEachThreadGroup(f func(tg *ThreadGroup)) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	ts.forEachThreadGroupLocked(f)
+}
+
 // forEachThreadGroupLocked applies f to each thread group in ts.
 //
 // Preconditions: ts.mu must be locked (for reading or writing).
 func (ts *TaskSet) forEachThreadGroupLocked(f func(tg *ThreadGroup)) {
 	for tg := range ts.Root.tgids {
 		f(tg)
+	}
+}
+
+// forEachTaskLocked applies f to each Task in ts.
+//
+// Preconditions: ts.mu must be locked (for reading or writing).
+func (ts *TaskSet) forEachTaskLocked(f func(t *Task)) {
+	for t := range ts.Root.tids {
+		f(t)
 	}
 }
 
@@ -129,6 +155,9 @@ type PIDNamespace struct {
 	// associated. Privileged operations on this PID namespace must have
 	// appropriate capabilities in userns. The userns pointer is immutable.
 	userns *auth.UserNamespace
+
+	// id is a unique ID assigned to the PID namespace. id is immutable.
+	id uint64
 
 	// The following fields are protected by owner.mu.
 
@@ -169,6 +198,9 @@ type PIDNamespace struct {
 	// exiting indicates that the namespace's init process is exiting or has
 	// exited.
 	exiting bool
+
+	// pidNamespaceData contains additional per-PID-namespace data.
+	extra pidNamespaceData
 }
 
 func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespace) *PIDNamespace {
@@ -176,6 +208,7 @@ func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespa
 		owner:         ts,
 		parent:        parent,
 		userns:        userns,
+		id:            lastPIDNSID.Add(1),
 		tasks:         make(map[ThreadID]*Task),
 		tids:          make(map[*Task]ThreadID),
 		tgids:         make(map[*ThreadGroup]ThreadID),
@@ -183,8 +216,16 @@ func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespa
 		sids:          make(map[*Session]SessionID),
 		processGroups: make(map[ProcessGroupID]*ProcessGroup),
 		pgids:         make(map[*ProcessGroup]ProcessGroupID),
+		extra:         newPIDNamespaceData(),
 	}
 }
+
+// lastPIDNSID is the last value of PIDNamespace.ID assigned to a PID
+// namespace.
+//
+// This is global rather than being per-TaskSet or Kernel because
+// NewRootPIDNamespace() is called before the Kernel is initialized.
+var lastPIDNSID atomicbitops.Uint64
 
 // NewRootPIDNamespace creates the root PID namespace. 'owner' is not available
 // yet when root namespace is created and must be set by caller.
@@ -207,7 +248,12 @@ func (ns *PIDNamespace) TaskWithID(tid ThreadID) *Task {
 	return t
 }
 
-// ThreadGroupWithID returns the thread group lead by the task with thread ID
+// ID returns a non-zero ID that is unique across PID namespaces.
+func (ns *PIDNamespace) ID() uint64 {
+	return ns.id
+}
+
+// ThreadGroupWithID returns the thread group led by the task with thread ID
 // tid in PID namespace ns. If no task has that TID, or if the task with that
 // TID is not a thread group leader, ThreadGroupWithID returns nil.
 func (ns *PIDNamespace) ThreadGroupWithID(tid ThreadID) *ThreadGroup {
@@ -256,6 +302,27 @@ func (ns *PIDNamespace) Tasks() []*Task {
 	return tasks
 }
 
+// NumTasks returns the number of tasks in ns.
+func (ns *PIDNamespace) NumTasks() int {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return len(ns.tids)
+}
+
+// NumTasksPerContainer returns the number of tasks in ns that belongs to given container.
+func (ns *PIDNamespace) NumTasksPerContainer(cid string) int {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+
+	tasks := 0
+	for t := range ns.tids {
+		if t.ContainerID() == cid {
+			tasks++
+		}
+	}
+	return tasks
+}
+
 // ThreadGroups returns a snapshot of the thread groups in ns.
 func (ns *PIDNamespace) ThreadGroups() []*ThreadGroup {
 	return ns.ThreadGroupsAppend(nil)
@@ -276,6 +343,11 @@ func (ns *PIDNamespace) UserNamespace() *auth.UserNamespace {
 	return ns.userns
 }
 
+// Root returns the root PID namespace of ns.
+func (ns *PIDNamespace) Root() *PIDNamespace {
+	return ns.owner.Root
+}
+
 // A threadGroupNode defines the relationship between a thread group and the
 // rest of the system. Conceptually, threadGroupNode is data belonging to the
 // owning TaskSet, as if TaskSet contained a field `nodes
@@ -291,14 +363,15 @@ type threadGroupNode struct {
 	// member tasks. The pidns pointer is immutable.
 	pidns *PIDNamespace
 
+	// pidWithinNS the thread ID of the leader of this thread group within pidns.
+	// Useful to avoid using locks when determining a thread group leader's own
+	// TID.
+	pidWithinNS atomicbitops.Int32
+
 	// eventQueue is notified whenever a event of interest to Task.Wait occurs
 	// in a child of this thread group, or a ptrace tracee of a task in this
 	// thread group. Events are defined in task_exit.go.
-	//
-	// Note that we cannot check and save this wait queue similarly to other
-	// wait queues, as the queue will not be empty by the time of saving, due
-	// to the wait sourced from Exec().
-	eventQueue waiter.Queue `state:"nosave"`
+	eventQueue waiter.Queue
 
 	// leader is the thread group's leader, which is the oldest task in the
 	// thread group; usually the last task in the thread group to call
@@ -395,13 +468,10 @@ func (tg *ThreadGroup) MemberIDs(pidns *PIDNamespace) []ThreadID {
 	return tasks
 }
 
-// ID returns tg's leader's thread ID in its own PID namespace. If tg's leader
-// is dead, ID returns 0.
+// ID returns tg's leader's thread ID in its own PID namespace.
+// If tg's leader is dead, ID returns 0.
 func (tg *ThreadGroup) ID() ThreadID {
-	tg.pidns.owner.mu.RLock()
-	id := tg.pidns.tgids[tg]
-	tg.pidns.owner.mu.RUnlock()
-	return id
+	return ThreadID(tg.pidWithinNS.Load())
 }
 
 // A taskNode defines the relationship between a task and the rest of the
@@ -464,8 +534,34 @@ func (t *Task) Parent() *Task {
 	return t.parent
 }
 
+// ParentLocked returns t's parent. Caller must ensure t's TaskSet mu
+// is locked for at least reading.
+//
+// +checklocks:t.tg.pidns.owner.mu
+func (t *Task) ParentLocked() *Task {
+	return t.parent
+}
+
 // ThreadID returns t's thread ID in its own PID namespace. If the task is
 // dead, ThreadID returns 0.
 func (t *Task) ThreadID() ThreadID {
 	return t.tg.pidns.IDOfTask(t)
+}
+
+// TGIDInRoot returns t's TGID in the root PID namespace.
+func (t *Task) TGIDInRoot() ThreadID {
+	return t.tg.pidns.owner.Root.IDOfThreadGroup(t.tg)
+}
+
+// Children returns children of this task.
+func (t *Task) Children() map[*Task]struct{} {
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
+
+	children := make(map[*Task]struct{}, len(t.children))
+	for child, val := range t.children {
+		children[child] = val
+	}
+
+	return children
 }

@@ -16,8 +16,11 @@
 package muxed
 
 import (
+	"sync"
+
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -25,8 +28,13 @@ import (
 // trivial routing rules that determine which InjectableEndpoint a given packet
 // will be written to. Note that HandleLocal works differently for this
 // endpoint (see WritePacket).
+//
+// +stateify savable
 type InjectableEndpoint struct {
-	routes     map[tcpip.Address]stack.InjectableLinkEndpoint
+	routes map[tcpip.Address]stack.InjectableLinkEndpoint
+
+	mu sync.RWMutex `state:"nosave"`
+	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
 
@@ -39,6 +47,13 @@ func (m *InjectableEndpoint) MTU() uint32 {
 		}
 	}
 	return minMTU
+}
+
+// SetMTU implements stack.LinkEndpoint.
+func (m *InjectableEndpoint) SetMTU(mtu uint32) {
+	for _, endpoint := range m.routes {
+		endpoint.SetMTU(mtu)
+	}
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -66,58 +81,65 @@ func (m *InjectableEndpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (m *InjectableEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
+
 // Attach implements stack.LinkEndpoint.
 func (m *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	for _, endpoint := range m.routes {
 		endpoint.Attach(dispatcher)
 	}
+	m.mu.Lock()
 	m.dispatcher = dispatcher
+	m.mu.Unlock()
 }
 
 // IsAttached implements stack.LinkEndpoint.
 func (m *InjectableEndpoint) IsAttached() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.dispatcher != nil
 }
 
 // InjectInbound implements stack.InjectableLinkEndpoint.
-func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) {
-	m.dispatcher.DeliverNetworkPacket(m, "" /* remote */, "" /* local */, protocol, pkt)
+func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	m.mu.RLock()
+	d := m.dispatcher
+	m.mu.RUnlock()
+	d.DeliverNetworkPacket(protocol, pkt)
 }
 
 // WritePackets writes outbound packets to the appropriate
 // LinkInjectableEndpoint based on the RemoteAddress. HandleLocal only works if
-// r.RemoteAddress has a route registered in this endpoint.
-func (m *InjectableEndpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts []tcpip.PacketBuffer, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
-	endpoint, ok := m.routes[r.RemoteAddress]
-	if !ok {
-		return 0, tcpip.ErrNoRoute
-	}
-	return endpoint.WritePackets(r, gso, pkts, protocol)
-}
+// pkt.EgressRoute.RemoteAddress has a route registered in this endpoint.
+func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	i := 0
+	for _, pkt := range pkts.AsSlice() {
+		endpoint, ok := m.routes[pkt.EgressRoute.RemoteAddress]
+		if !ok {
+			return i, &tcpip.ErrHostUnreachable{}
+		}
 
-// WritePacket writes outbound packets to the appropriate LinkInjectableEndpoint
-// based on the RemoteAddress. HandleLocal only works if r.RemoteAddress has a
-// route registered in this endpoint.
-func (m *InjectableEndpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) *tcpip.Error {
-	if endpoint, ok := m.routes[r.RemoteAddress]; ok {
-		return endpoint.WritePacket(r, gso, protocol, pkt)
-	}
-	return tcpip.ErrNoRoute
-}
+		var tmpPkts stack.PacketBufferList
+		tmpPkts.PushBack(pkt)
 
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (m *InjectableEndpoint) WriteRawPacket(buffer.VectorisedView) *tcpip.Error {
-	// WriteRawPacket doesn't get a route or network address, so there's
-	// nowhere to write this.
-	return tcpip.ErrNoRoute
+		n, err := endpoint.WritePackets(tmpPkts)
+		if err != nil {
+			return i, err
+		}
+
+		i += n
+	}
+
+	return i, nil
 }
 
 // InjectOutbound writes outbound packets to the appropriate
 // LinkInjectableEndpoint based on the dest address.
-func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet []byte) *tcpip.Error {
+func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip.Error {
 	endpoint, ok := m.routes[dest]
 	if !ok {
-		return tcpip.ErrNoRoute
+		return &tcpip.ErrHostUnreachable{}
 	}
 	return endpoint.InjectOutbound(dest, packet)
 }
@@ -128,6 +150,23 @@ func (m *InjectableEndpoint) Wait() {
 		ep.Wait()
 	}
 }
+
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (*InjectableEndpoint) ARPHardwareType() header.ARPHardwareType {
+	panic("unsupported operation")
+}
+
+// AddHeader implements stack.LinkEndpoint.AddHeader.
+func (*InjectableEndpoint) AddHeader(*stack.PacketBuffer) {}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (*InjectableEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (*InjectableEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*InjectableEndpoint) SetOnCloseAction(func()) {}
 
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {

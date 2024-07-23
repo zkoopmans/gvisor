@@ -69,6 +69,15 @@ func executeHook(h specs.Hook, s specs.State) error {
 		return fmt.Errorf("path for hook is not absolute: %q", h.Path)
 	}
 
+	// Don't invoke nvidia-container-runtime-hook at prestart, which may be
+	// configured by e.g. Docker's --gpus flag, since
+	// nvidia-container-runtime-hook doesn't understand gVisor's bifurcation
+	// between sentry and application filesystems.
+	if strings.HasSuffix(h.Path, "/nvidia-container-runtime-hook") {
+		log.Infof("Skipping nvidia-container-runtime-hook")
+		return nil
+	}
+
 	b, err := json.Marshal(s)
 	if err != nil {
 		return err
@@ -101,8 +110,8 @@ func executeHook(h specs.Hook, s specs.State) error {
 			return fmt.Errorf("failure executing hook %q, err: %v\nstdout: %s\nstderr: %s", h.Path, err, stdout.String(), stderr.String())
 		}
 	case <-timer:
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return fmt.Errorf("timeout executing hook %q\nstdout: %s\nstderr: %s", h.Path, stdout.String(), stderr.String())
 	}
 

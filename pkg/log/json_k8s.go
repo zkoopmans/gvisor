@@ -17,6 +17,8 @@ package log
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -29,13 +31,20 @@ type k8sJSONLog struct {
 // K8sJSONEmitter logs messages in json format that is compatible with
 // Kubernetes fluent configuration.
 type K8sJSONEmitter struct {
-	Writer
+	*Writer
 }
 
 // Emit implements Emitter.Emit.
-func (e *K8sJSONEmitter) Emit(level Level, timestamp time.Time, format string, v ...interface{}) {
+func (e K8sJSONEmitter) Emit(depth int, level Level, timestamp time.Time, format string, v ...any) {
+	logLine := fmt.Sprintf(format, v...)
+	if _, file, line, ok := runtime.Caller(depth + 1); ok {
+		if slash := strings.LastIndexByte(file, byte('/')); slash >= 0 {
+			file = file[slash+1:] // Trim any directory path from the file.
+		}
+		logLine = fmt.Sprintf("%s:%d] %s", file, line, logLine)
+	}
 	j := k8sJSONLog{
-		Log:   fmt.Sprintf(format, v...),
+		Log:   logLine,
 		Level: level,
 		Time:  timestamp,
 	}

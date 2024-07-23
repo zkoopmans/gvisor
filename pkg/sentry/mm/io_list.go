@@ -21,9 +21,10 @@ func (ioElementMapper) linkerFor(elem *ioResult) *ioResult { return elem }
 // The zero value for List is an empty list ready to use.
 //
 // To iterate over a list (where l is a List):
-//      for e := l.Front(); e != nil; e = e.Next() {
-// 		// do something with e.
-//      }
+//
+//	for e := l.Front(); e != nil; e = e.Next() {
+//		// do something with e.
+//	}
 //
 // +stateify savable
 type ioList struct {
@@ -38,25 +39,45 @@ func (l *ioList) Reset() {
 }
 
 // Empty returns true iff the list is empty.
+//
+//go:nosplit
 func (l *ioList) Empty() bool {
 	return l.head == nil
 }
 
 // Front returns the first element of list l or nil.
+//
+//go:nosplit
 func (l *ioList) Front() *ioResult {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
+//
+//go:nosplit
 func (l *ioList) Back() *ioResult {
 	return l.tail
 }
 
-// PushFront inserts the element e at the front of list l.
-func (l *ioList) PushFront(e *ioResult) {
-	ioElementMapper{}.linkerFor(e).SetNext(l.head)
-	ioElementMapper{}.linkerFor(e).SetPrev(nil)
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+//
+//go:nosplit
+func (l *ioList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (ioElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
 
+// PushFront inserts the element e at the front of list l.
+//
+//go:nosplit
+func (l *ioList) PushFront(e *ioResult) {
+	linker := ioElementMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
 		ioElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -66,11 +87,30 @@ func (l *ioList) PushFront(e *ioResult) {
 	l.head = e
 }
 
-// PushBack inserts the element e at the back of list l.
-func (l *ioList) PushBack(e *ioResult) {
-	ioElementMapper{}.linkerFor(e).SetNext(nil)
-	ioElementMapper{}.linkerFor(e).SetPrev(l.tail)
+// PushFrontList inserts list m at the start of list l, emptying m.
+//
+//go:nosplit
+func (l *ioList) PushFrontList(m *ioList) {
+	if l.head == nil {
+		l.head = m.head
+		l.tail = m.tail
+	} else if m.head != nil {
+		ioElementMapper{}.linkerFor(l.head).SetPrev(m.tail)
+		ioElementMapper{}.linkerFor(m.tail).SetNext(l.head)
 
+		l.head = m.head
+	}
+	m.head = nil
+	m.tail = nil
+}
+
+// PushBack inserts the element e at the back of list l.
+//
+//go:nosplit
+func (l *ioList) PushBack(e *ioResult) {
+	linker := ioElementMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
 		ioElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -81,6 +121,8 @@ func (l *ioList) PushBack(e *ioResult) {
 }
 
 // PushBackList inserts list m at the end of list l, emptying m.
+//
+//go:nosplit
 func (l *ioList) PushBackList(m *ioList) {
 	if l.head == nil {
 		l.head = m.head
@@ -91,17 +133,22 @@ func (l *ioList) PushBackList(m *ioList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
+//
+//go:nosplit
 func (l *ioList) InsertAfter(b, e *ioResult) {
-	a := ioElementMapper{}.linkerFor(b).Next()
-	ioElementMapper{}.linkerFor(e).SetNext(a)
-	ioElementMapper{}.linkerFor(e).SetPrev(b)
-	ioElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := ioElementMapper{}.linkerFor(b)
+	eLinker := ioElementMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
 		ioElementMapper{}.linkerFor(a).SetPrev(e)
@@ -111,11 +158,16 @@ func (l *ioList) InsertAfter(b, e *ioResult) {
 }
 
 // InsertBefore inserts e before a.
+//
+//go:nosplit
 func (l *ioList) InsertBefore(a, e *ioResult) {
-	b := ioElementMapper{}.linkerFor(a).Prev()
-	ioElementMapper{}.linkerFor(e).SetNext(a)
-	ioElementMapper{}.linkerFor(e).SetPrev(b)
-	ioElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := ioElementMapper{}.linkerFor(a)
+	eLinker := ioElementMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
 		ioElementMapper{}.linkerFor(b).SetNext(e)
@@ -125,21 +177,27 @@ func (l *ioList) InsertBefore(a, e *ioResult) {
 }
 
 // Remove removes e from l.
+//
+//go:nosplit
 func (l *ioList) Remove(e *ioResult) {
-	prev := ioElementMapper{}.linkerFor(e).Prev()
-	next := ioElementMapper{}.linkerFor(e).Next()
+	linker := ioElementMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
 		ioElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		ioElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields
@@ -153,21 +211,29 @@ type ioEntry struct {
 }
 
 // Next returns the entry that follows e in the list.
+//
+//go:nosplit
 func (e *ioEntry) Next() *ioResult {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *ioEntry) Prev() *ioResult {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
+//
+//go:nosplit
 func (e *ioEntry) SetNext(elem *ioResult) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *ioEntry) SetPrev(elem *ioResult) {
 	e.prev = elem
 }

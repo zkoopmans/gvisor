@@ -3,61 +3,117 @@
 package memmap
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *MappingSet) beforeSave() {}
-func (x *MappingSet) save(m state.Map) {
-	x.beforeSave()
-	var root *MappingSegmentDataSlices = x.saveRoot()
-	m.SaveValue("root", root)
+func (s *MappingSet) StateTypeName() string {
+	return "pkg/sentry/memmap.MappingSet"
 }
 
-func (x *MappingSet) afterLoad() {}
-func (x *MappingSet) load(m state.Map) {
-	m.LoadValue("root", new(*MappingSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*MappingSegmentDataSlices)) })
+func (s *MappingSet) StateFields() []string {
+	return []string{
+		"root",
+	}
 }
 
-func (x *Mappingnode) beforeSave() {}
-func (x *Mappingnode) save(m state.Map) {
-	x.beforeSave()
-	m.Save("nrSegments", &x.nrSegments)
-	m.Save("parent", &x.parent)
-	m.Save("parentIndex", &x.parentIndex)
-	m.Save("hasChildren", &x.hasChildren)
-	m.Save("keys", &x.keys)
-	m.Save("values", &x.values)
-	m.Save("children", &x.children)
+func (s *MappingSet) beforeSave() {}
+
+// +checklocksignore
+func (s *MappingSet) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var rootValue []MappingFlatSegment
+	rootValue = s.saveRoot()
+	stateSinkObject.SaveValue(0, rootValue)
 }
 
-func (x *Mappingnode) afterLoad() {}
-func (x *Mappingnode) load(m state.Map) {
-	m.Load("nrSegments", &x.nrSegments)
-	m.Load("parent", &x.parent)
-	m.Load("parentIndex", &x.parentIndex)
-	m.Load("hasChildren", &x.hasChildren)
-	m.Load("keys", &x.keys)
-	m.Load("values", &x.values)
-	m.Load("children", &x.children)
+func (s *MappingSet) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *MappingSet) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadValue(0, new([]MappingFlatSegment), func(y any) { s.loadRoot(ctx, y.([]MappingFlatSegment)) })
 }
 
-func (x *MappingSegmentDataSlices) beforeSave() {}
-func (x *MappingSegmentDataSlices) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
-	m.Save("Values", &x.Values)
+func (n *Mappingnode) StateTypeName() string {
+	return "pkg/sentry/memmap.Mappingnode"
 }
 
-func (x *MappingSegmentDataSlices) afterLoad() {}
-func (x *MappingSegmentDataSlices) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
-	m.Load("Values", &x.Values)
+func (n *Mappingnode) StateFields() []string {
+	return []string{
+		"nrSegments",
+		"parent",
+		"parentIndex",
+		"hasChildren",
+		"maxGap",
+		"keys",
+		"values",
+		"children",
+	}
+}
+
+func (n *Mappingnode) beforeSave() {}
+
+// +checklocksignore
+func (n *Mappingnode) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.nrSegments)
+	stateSinkObject.Save(1, &n.parent)
+	stateSinkObject.Save(2, &n.parentIndex)
+	stateSinkObject.Save(3, &n.hasChildren)
+	stateSinkObject.Save(4, &n.maxGap)
+	stateSinkObject.Save(5, &n.keys)
+	stateSinkObject.Save(6, &n.values)
+	stateSinkObject.Save(7, &n.children)
+}
+
+func (n *Mappingnode) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (n *Mappingnode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.nrSegments)
+	stateSourceObject.Load(1, &n.parent)
+	stateSourceObject.Load(2, &n.parentIndex)
+	stateSourceObject.Load(3, &n.hasChildren)
+	stateSourceObject.Load(4, &n.maxGap)
+	stateSourceObject.Load(5, &n.keys)
+	stateSourceObject.Load(6, &n.values)
+	stateSourceObject.Load(7, &n.children)
+}
+
+func (m *MappingFlatSegment) StateTypeName() string {
+	return "pkg/sentry/memmap.MappingFlatSegment"
+}
+
+func (m *MappingFlatSegment) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+		"Value",
+	}
+}
+
+func (m *MappingFlatSegment) beforeSave() {}
+
+// +checklocksignore
+func (m *MappingFlatSegment) StateSave(stateSinkObject state.Sink) {
+	m.beforeSave()
+	stateSinkObject.Save(0, &m.Start)
+	stateSinkObject.Save(1, &m.End)
+	stateSinkObject.Save(2, &m.Value)
+}
+
+func (m *MappingFlatSegment) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (m *MappingFlatSegment) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &m.Start)
+	stateSourceObject.Load(1, &m.End)
+	stateSourceObject.Load(2, &m.Value)
 }
 
 func init() {
-	state.Register("pkg/sentry/memmap.MappingSet", (*MappingSet)(nil), state.Fns{Save: (*MappingSet).save, Load: (*MappingSet).load})
-	state.Register("pkg/sentry/memmap.Mappingnode", (*Mappingnode)(nil), state.Fns{Save: (*Mappingnode).save, Load: (*Mappingnode).load})
-	state.Register("pkg/sentry/memmap.MappingSegmentDataSlices", (*MappingSegmentDataSlices)(nil), state.Fns{Save: (*MappingSegmentDataSlices).save, Load: (*MappingSegmentDataSlices).load})
+	state.Register((*MappingSet)(nil))
+	state.Register((*Mappingnode)(nil))
+	state.Register((*MappingFlatSegment)(nil))
 }

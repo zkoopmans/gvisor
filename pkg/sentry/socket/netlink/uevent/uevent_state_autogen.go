@@ -3,18 +3,32 @@
 package uevent
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Protocol) beforeSave() {}
-func (x *Protocol) save(m state.Map) {
-	x.beforeSave()
+func (p *Protocol) StateTypeName() string {
+	return "pkg/sentry/socket/netlink/uevent.Protocol"
 }
 
-func (x *Protocol) afterLoad() {}
-func (x *Protocol) load(m state.Map) {
+func (p *Protocol) StateFields() []string {
+	return []string{}
+}
+
+func (p *Protocol) beforeSave() {}
+
+// +checklocksignore
+func (p *Protocol) StateSave(stateSinkObject state.Sink) {
+	p.beforeSave()
+}
+
+func (p *Protocol) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (p *Protocol) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 }
 
 func init() {
-	state.Register("pkg/sentry/socket/netlink/uevent.Protocol", (*Protocol)(nil), state.Fns{Save: (*Protocol).save, Load: (*Protocol).load})
+	state.Register((*Protocol)(nil))
 }

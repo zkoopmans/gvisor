@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,156 +15,156 @@
 package kernel
 
 import (
-	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
-	"gvisor.dev/gvisor/pkg/sentry/loader"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
-	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/devutil"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/shm"
+	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/limits"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/unimpl"
+	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
-var errNoSyscalls = syserr.New("no syscall table found", linux.ENOEXEC)
+// Deadline implements context.Context.Deadline.
+func (*Task) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
 
-// Auxmap contains miscellaneous data for the task.
-type Auxmap map[string]interface{}
+// Done implements context.Context.Done.
+func (*Task) Done() <-chan struct{} {
+	return nil
+}
 
-// TaskContext is the subset of a task's data that is provided by the loader.
+// Err implements context.Context.Err.
+func (*Task) Err() error {
+	return nil
+}
+
+// Value implements context.Context.Value.
 //
-// +stateify savable
-type TaskContext struct {
-	// Name is the thread name set by the prctl(PR_SET_NAME) system call.
-	Name string
-
-	// Arch is the architecture-specific context (registers, etc.)
-	Arch arch.Context
-
-	// MemoryManager is the task's address space.
-	MemoryManager *mm.MemoryManager
-
-	// fu implements futexes in the address space.
-	fu *futex.Manager
-
-	// st is the task's syscall table.
-	st *SyscallTable
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) Value(key any) any {
+	// This function is very hot; skip this check outside of +race builds.
+	if sync.RaceEnabled {
+		t.assertTaskGoroutine()
+	}
+	return t.contextValue(key, true /* isTaskGoroutine */)
 }
 
-// release releases all resources held by the TaskContext. release is called by
-// the task when it execs into a new TaskContext or exits.
-func (tc *TaskContext) release() {
-	// Nil out pointers so that if the task is saved after release, it doesn't
-	// follow the pointers to possibly now-invalid objects.
-	if tc.MemoryManager != nil {
-		// TODO(b/38173783)
-		tc.MemoryManager.DecUsers(context.Background())
-		tc.MemoryManager = nil
-	}
-	tc.fu = nil
-}
-
-// Fork returns a duplicate of tc. The copied TaskContext always has an
-// independent arch.Context. If shareAddressSpace is true, the copied
-// TaskContext shares an address space with the original; otherwise, the copied
-// TaskContext has an independent address space that is initially a duplicate
-// of the original's.
-func (tc *TaskContext) Fork(ctx context.Context, k *Kernel, shareAddressSpace bool) (*TaskContext, error) {
-	newTC := &TaskContext{
-		Name: tc.Name,
-		Arch: tc.Arch.Fork(),
-		st:   tc.st,
-	}
-	if shareAddressSpace {
-		newTC.MemoryManager = tc.MemoryManager
-		if newTC.MemoryManager != nil {
-			if !newTC.MemoryManager.IncUsers() {
-				// Shouldn't be possible since tc.MemoryManager should be a
-				// counted user.
-				panic(fmt.Sprintf("TaskContext.Fork called with userless TaskContext.MemoryManager"))
-			}
+func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
+	switch key {
+	case CtxCanTrace:
+		return t.CanTrace
+	case CtxKernel:
+		return t.k
+	case CtxPIDNamespace:
+		return t.tg.pidns
+	case CtxUTSNamespace:
+		if !isTaskGoroutine {
+			t.mu.Lock()
+			defer t.mu.Unlock()
 		}
-		newTC.fu = tc.fu
-	} else {
-		newMM, err := tc.MemoryManager.Fork(ctx)
-		if err != nil {
-			return nil, err
+		utsns := t.utsns
+		utsns.IncRef()
+		return utsns
+	case ipc.CtxIPCNamespace:
+		if !isTaskGoroutine {
+			t.mu.Lock()
+			defer t.mu.Unlock()
 		}
-		newTC.MemoryManager = newMM
-		newTC.fu = k.futexes.Fork()
+		ipcns := t.ipcns
+		ipcns.IncRef()
+		return ipcns
+	case CtxTask:
+		return t
+	case auth.CtxCredentials:
+		return t.creds.Load()
+	case auth.CtxThreadGroupID:
+		return int32(t.tg.ID())
+	case vfs.CtxRoot:
+		if !isTaskGoroutine {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+		}
+		return t.fsContext.RootDirectory()
+	case vfs.CtxMountNamespace:
+		if !isTaskGoroutine {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+		}
+		t.mountNamespace.IncRef()
+		return t.mountNamespace
+	case devutil.CtxDevGoferClient:
+		return t.k.GetDevGoferClient(t.k.ContainerName(t.containerID))
+	case inet.CtxStack:
+		return t.NetworkContext()
+	case inet.CtxNamespaceByFD:
+		return t.NetworkNamespaceByFD
+	case ktime.CtxRealtimeClock:
+		return t.k.RealtimeClock()
+	case limits.CtxLimits:
+		return t.tg.limits
+	case linux.CtxSignalNoInfoFunc:
+		return func(sig linux.Signal) error {
+			return t.SendSignal(SignalInfoNoInfo(sig, t, t))
+		}
+	case pgalloc.CtxMemoryCgroupID:
+		return t.memCgID.Load()
+	case pgalloc.CtxMemoryFile:
+		return t.k.mf
+	case platform.CtxPlatform:
+		return t.k
+	case shm.CtxDeviceID:
+		return t.k.sysVShmDevID
+	case uniqueid.CtxGlobalUniqueID:
+		return t.k.UniqueID()
+	case uniqueid.CtxGlobalUniqueIDProvider:
+		return t.k
+	case uniqueid.CtxInotifyCookie:
+		return t.k.GenerateInotifyCookie()
+	case unimpl.CtxEvents:
+		return t.k
+	case cpuid.CtxFeatureSet:
+		return t.k.featureSet
+	default:
+		return nil
 	}
-	return newTC, nil
 }
 
-// Arch returns t's arch.Context.
-//
-// Preconditions: The caller must be running on the task goroutine, or t.mu
-// must be locked.
-func (t *Task) Arch() arch.Context {
-	return t.tc.Arch
+// fallbackContext adds a level of indirection for embedding to resolve
+// ambiguity for method resolution. We favor context.NoTask.
+type fallbackTask struct {
+	*Task
 }
 
-// MemoryManager returns t's MemoryManager. MemoryManager does not take an
-// additional reference on the returned MM.
-//
-// Preconditions: The caller must be running on the task goroutine, or t.mu
-// must be locked.
-func (t *Task) MemoryManager() *mm.MemoryManager {
-	return t.tc.MemoryManager
+// taskAsyncContext implements context.Context for a goroutine that performs
+// work on behalf of a Task, but is not the task goroutine.
+type taskAsyncContext struct {
+	context.NoTask
+	fallbackTask
 }
 
-// SyscallTable returns t's syscall table.
-//
-// Preconditions: The caller must be running on the task goroutine, or t.mu
-// must be locked.
-func (t *Task) SyscallTable() *SyscallTable {
-	return t.tc.st
+// Value implements context.Context.Value.
+func (t *taskAsyncContext) Value(key any) any {
+	return t.fallbackTask.contextValue(key, false /* isTaskGoroutine */)
 }
 
-// Stack returns the userspace stack.
-//
-// Preconditions: The caller must be running on the task goroutine, or t.mu
-// must be locked.
-func (t *Task) Stack() *arch.Stack {
-	return &arch.Stack{t.Arch(), t.MemoryManager(), usermem.Addr(t.Arch().Stack())}
-}
-
-// LoadTaskImage loads a specified file into a new TaskContext.
-//
-// args.MemoryManager does not need to be set by the caller.
-func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskContext, *syserr.Error) {
-	// If File is not nil, we should load that instead of resolving Filename.
-	if args.File != nil {
-		args.Filename = args.File.PathnameWithDeleted(ctx)
+// AsyncContext returns a context.Context representing t. The returned
+// context.Context is intended for use by goroutines other than t's task
+// goroutine; for example, signal delivery to t will not interrupt goroutines
+// that are blocking using the returned context.Context.
+func (t *Task) AsyncContext() context.Context {
+	return &taskAsyncContext{
+		fallbackTask: fallbackTask{t},
 	}
-
-	// Prepare a new user address space to load into.
-	m := mm.NewMemoryManager(k, k)
-	defer m.DecUsers(ctx)
-	args.MemoryManager = m
-
-	os, ac, name, err := loader.Load(ctx, args, k.extraAuxv, k.vdso)
-	if err != nil {
-		return nil, err
-	}
-
-	// Lookup our new syscall table.
-	st, ok := LookupSyscallTable(os, ac.Arch())
-	if !ok {
-		// No syscall table found. This means that the ELF binary does not match
-		// the architecture.
-		return nil, errNoSyscalls
-	}
-
-	if !m.IncUsers() {
-		panic("Failed to increment users count on new MM")
-	}
-	return &TaskContext{
-		Name:          name,
-		Arch:          ac,
-		MemoryManager: m,
-		fu:            k.futexes.Fork(),
-		st:            st,
-	}, nil
 }

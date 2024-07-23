@@ -15,23 +15,24 @@
 package ptrace
 
 import (
-	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
 // getRegs gets the general purpose register set.
-func (t *thread) getRegs(regs *syscall.PtraceRegs) error {
-	iovec := syscall.Iovec{
+func (t *thread) getRegs(regs *arch.Registers) error {
+	iovec := unix.Iovec{
 		Base: (*byte)(unsafe.Pointer(regs)),
 		Len:  uint64(unsafe.Sizeof(*regs)),
 	}
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_GETREGSET,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_GETREGSET,
 		uintptr(t.tid),
 		linux.NT_PRSTATUS,
 		uintptr(unsafe.Pointer(&iovec)),
@@ -43,14 +44,14 @@ func (t *thread) getRegs(regs *syscall.PtraceRegs) error {
 }
 
 // setRegs sets the general purpose register set.
-func (t *thread) setRegs(regs *syscall.PtraceRegs) error {
-	iovec := syscall.Iovec{
+func (t *thread) setRegs(regs *arch.Registers) error {
+	iovec := unix.Iovec{
 		Base: (*byte)(unsafe.Pointer(regs)),
 		Len:  uint64(unsafe.Sizeof(*regs)),
 	}
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_SETREGSET,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_SETREGSET,
 		uintptr(t.tid),
 		linux.NT_PRSTATUS,
 		uintptr(unsafe.Pointer(&iovec)),
@@ -61,17 +62,17 @@ func (t *thread) setRegs(regs *syscall.PtraceRegs) error {
 	return nil
 }
 
-// getFPRegs gets the floating-point data via the GETREGSET ptrace syscall.
-func (t *thread) getFPRegs(fpState *arch.FloatingPointData, fpLen uint64, useXsave bool) error {
-	iovec := syscall.Iovec{
-		Base: (*byte)(fpState),
-		Len:  fpLen,
+// getFPRegs gets the floating-point data via the GETREGSET ptrace unix.
+func (t *thread) getFPRegs(fpState *fpu.State, ac *archContext) error {
+	iovec := unix.Iovec{
+		Base: fpState.BytePointer(),
+		Len:  ac.floatingPointLength(),
 	}
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_GETREGSET,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_GETREGSET,
 		uintptr(t.tid),
-		fpRegSet(useXsave),
+		ac.floatingPointRegSet(),
 		uintptr(unsafe.Pointer(&iovec)),
 		0, 0)
 	if errno != 0 {
@@ -80,17 +81,17 @@ func (t *thread) getFPRegs(fpState *arch.FloatingPointData, fpLen uint64, useXsa
 	return nil
 }
 
-// setFPRegs sets the floating-point data via the SETREGSET ptrace syscall.
-func (t *thread) setFPRegs(fpState *arch.FloatingPointData, fpLen uint64, useXsave bool) error {
-	iovec := syscall.Iovec{
-		Base: (*byte)(fpState),
-		Len:  fpLen,
+// setFPRegs sets the floating-point data via the SETREGSET ptrace unix.
+func (t *thread) setFPRegs(fpState *fpu.State, ac *archContext) error {
+	iovec := unix.Iovec{
+		Base: fpState.BytePointer(),
+		Len:  ac.floatingPointLength(),
 	}
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_SETREGSET,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_SETREGSET,
 		uintptr(t.tid),
-		fpRegSet(useXsave),
+		ac.floatingPointRegSet(),
 		uintptr(unsafe.Pointer(&iovec)),
 		0, 0)
 	if errno != 0 {
@@ -100,10 +101,10 @@ func (t *thread) setFPRegs(fpState *arch.FloatingPointData, fpLen uint64, useXsa
 }
 
 // getSignalInfo retrieves information about the signal that caused the stop.
-func (t *thread) getSignalInfo(si *arch.SignalInfo) error {
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_GETSIGINFO,
+func (t *thread) getSignalInfo(si *linux.SignalInfo) error {
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_GETSIGINFO,
 		uintptr(t.tid),
 		0,
 		uintptr(unsafe.Pointer(si)),
@@ -121,20 +122,20 @@ func (t *thread) getSignalInfo(si *arch.SignalInfo) error {
 //
 // Precondition: the OS thread must be locked and own t.
 func (t *thread) clone() (*thread, error) {
-	r, ok := usermem.Addr(stackPointer(&t.initRegs)).RoundUp()
+	r, ok := hostarch.Addr(stackPointer(&t.initRegs)).RoundUp()
 	if !ok {
-		return nil, syscall.EINVAL
+		return nil, unix.EINVAL
 	}
 	rval, err := t.syscallIgnoreInterrupt(
 		&t.initRegs,
-		syscall.SYS_CLONE,
+		unix.SYS_CLONE,
 		arch.SyscallArgument{Value: uintptr(
-			syscall.CLONE_FILES |
-				syscall.CLONE_FS |
-				syscall.CLONE_SIGHAND |
-				syscall.CLONE_THREAD |
-				syscall.CLONE_PTRACE |
-				syscall.CLONE_VM)},
+			unix.CLONE_FILES |
+				unix.CLONE_FS |
+				unix.CLONE_SIGHAND |
+				unix.CLONE_THREAD |
+				unix.CLONE_PTRACE |
+				unix.CLONE_VM)},
 		// The stack pointer is just made up, but we have it be
 		// something sensible so the kernel doesn't think we're
 		// up to no good. Which we are.
@@ -158,9 +159,9 @@ func (t *thread) clone() (*thread, error) {
 // getEventMessage retrieves a message about the ptrace event that just happened.
 func (t *thread) getEventMessage() (uintptr, error) {
 	var msg uintptr
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PTRACE,
-		syscall.PTRACE_GETEVENTMSG,
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_PTRACE,
+		unix.PTRACE_GETEVENTMSG,
 		uintptr(t.tid),
 		0,
 		uintptr(unsafe.Pointer(&msg)),

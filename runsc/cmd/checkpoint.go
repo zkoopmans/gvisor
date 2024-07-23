@@ -16,25 +16,31 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"path/filepath"
-	"syscall"
 
 	"github.com/google/subcommands"
-	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
-	"gvisor.dev/gvisor/runsc/specutils"
 )
-
-// File containing the container's saved image/state within the given image-path's directory.
-const checkpointFileName = "checkpoint.img"
 
 // Checkpoint implements subcommands.Command for the "checkpoint" command.
 type Checkpoint struct {
-	imagePath    string
-	leaveRunning bool
+	imagePath                 string
+	leaveRunning              bool
+	compression               CheckpointCompression
+	excludeCommittedZeroPages bool
+
+	// direct indicates whether O_DIRECT should be used for writing the
+	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
+	// if the checkpoint files are not expected to be read again on this host.
+	// For example, if the checkpoint files will be stored on a network block
+	// device, which will be detached after the checkpoint is done.
+	direct bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -57,6 +63,9 @@ func (*Checkpoint) Usage() string {
 func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved container image")
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
+	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
+	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
+	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
@@ -64,92 +73,80 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-
+func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
-	waitStatus := args[1].(*syscall.WaitStatus)
+	conf := args[0].(*config.Config)
 
-	cont, err := container.Load(conf.RootDir, id)
+	cont, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		util.Fatalf("loading container: %v", err)
 	}
 
 	if c.imagePath == "" {
-		Fatalf("image-path flag must be provided")
+		util.Fatalf("image-path flag must be provided")
 	}
 
 	if err := os.MkdirAll(c.imagePath, 0755); err != nil {
-		Fatalf("making directories at path provided: %v", err)
+		util.Fatalf("making directories at path provided: %v", err)
 	}
 
-	fullImagePath := filepath.Join(c.imagePath, checkpointFileName)
-
-	// Create the image file and open for writing.
-	file, err := os.OpenFile(fullImagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
-	if err != nil {
-		Fatalf("os.OpenFile(%q) failed: %v", fullImagePath, err)
+	sOpts := statefile.Options{
+		Compression: c.compression.Level(),
 	}
-	defer file.Close()
-
-	if err := cont.Checkpoint(file); err != nil {
-		Fatalf("checkpoint failed: %v", err)
+	mfOpts := pgalloc.SaveOpts{
+		ExcludeCommittedZeroPages: c.excludeCommittedZeroPages,
 	}
 
-	if !c.leaveRunning {
-		return subcommands.ExitSuccess
+	if c.leaveRunning {
+		// Do not destroy the sandbox after saving.
+		sOpts.Resume = true
 	}
 
-	// TODO(b/110843694): Make it possible to restore into same container.
-	// For now, we can fake it by destroying the container and making a
-	// new container with the same ID. This hack does not work with docker
-	// which uses the container pid to ensure that the restore-container is
-	// actually the same as the checkpoint-container. By restoring into
-	// the same container, we will solve the docker incompatibility.
-
-	// Restore into new container with same ID.
-	bundleDir := cont.BundleDir
-	if bundleDir == "" {
-		Fatalf("setting bundleDir")
+	if err := cont.Checkpoint(c.imagePath, c.direct, sOpts, mfOpts); err != nil {
+		util.Fatalf("checkpoint failed: %v", err)
 	}
-
-	spec, err := specutils.ReadSpec(bundleDir)
-	if err != nil {
-		Fatalf("reading spec: %v", err)
-	}
-
-	specutils.LogSpec(spec)
-
-	if cont.ConsoleSocket != "" {
-		log.Warningf("ignoring console socket since it cannot be restored")
-	}
-
-	if err := cont.Destroy(); err != nil {
-		Fatalf("destroying container: %v", err)
-	}
-
-	contArgs := container.Args{
-		ID:        id,
-		Spec:      spec,
-		BundleDir: bundleDir,
-	}
-	cont, err = container.New(conf, contArgs)
-	if err != nil {
-		Fatalf("restoring container: %v", err)
-	}
-	defer cont.Destroy()
-
-	if err := cont.Restore(spec, conf, fullImagePath); err != nil {
-		Fatalf("starting container: %v", err)
-	}
-
-	ws, err := cont.Wait()
-	*waitStatus = ws
 
 	return subcommands.ExitSuccess
+}
+
+// CheckpointCompression represents checkpoint image writer behavior. The
+// default behavior is to compress because the default behavior used to be to
+// always compress.
+type CheckpointCompression statefile.CompressionLevel
+
+func newCheckpointCompressionValue(val statefile.CompressionLevel, p *CheckpointCompression) *CheckpointCompression {
+	*p = CheckpointCompression(val)
+	return (*CheckpointCompression)(p)
+}
+
+// Set implements flag.Value.
+func (g *CheckpointCompression) Set(v string) error {
+	t, err := statefile.CompressionLevelFromString(v)
+	if err != nil {
+		return fmt.Errorf("invalid checkpoint compression type %q", v)
+	}
+
+	*g = CheckpointCompression(t)
+
+	return nil
+}
+
+// Get implements flag.Getter.
+func (g *CheckpointCompression) Get() any {
+	return *g
+}
+
+// String implements flag.Value.
+func (g CheckpointCompression) String() string {
+	return string(g)
+}
+
+// Level returns corresponding statefile.CompressionLevel value.
+func (g CheckpointCompression) Level() statefile.CompressionLevel {
+	return statefile.CompressionLevel(g)
 }

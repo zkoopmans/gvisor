@@ -58,23 +58,17 @@ func (*Help) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (h *Help) SetFlags(f *flag.FlagSet) {}
+func (h *Help) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.Execute.
-func (h *Help) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (h *Help) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	switch f.NArg() {
 	case 0:
 		fmt.Fprintf(h.cdr.Output, "Usage: %s <flags> <subcommand> <subcommand args>\n\n", h.cdr.Name())
-		fmt.Fprintf(h.cdr.Output, `runsc is a command line client for running applications packaged in the Open
-Container Initiative (OCI) format. Applications run by runsc are run in an
-isolated gVisor sandbox that emulates a Linux environment.
+		fmt.Fprintf(h.cdr.Output, `runsc is the gVisor container runtime.
 
-gVisor is a user-space kernel, written in Go, that implements a substantial
-portion of the Linux system call interface. It provides an additional layer
-of isolation between running applications and the host operating system.
-
-Functionality is provided by subcommands. For additonal help on individual
-subcommands use "%s %s <subcommand>".
+Functionality is provided by subcommands. For help with a specific subcommand,
+use "%s %s <subcommand>".
 
 `, h.cdr.Name(), h.Name())
 		h.cdr.VisitGroups(func(g *subcommands.CommandGroup) {

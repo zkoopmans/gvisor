@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package rand implements a cryptographically secure pseudorandom number
-// generator.
 package rand
 
 import (
+	"bufio"
 	"crypto/rand"
 	"io"
 
@@ -45,8 +44,29 @@ func (r *reader) Read(p []byte) (int, error) {
 	return rand.Read(p)
 }
 
+// bufferedReader implements a threadsafe buffered io.Reader.
+type bufferedReader struct {
+	mu sync.Mutex
+	r  *bufio.Reader
+}
+
+// Read implements io.Reader.Read.
+func (b *bufferedReader) Read(p []byte) (int, error) {
+	// In Linux, reads of up to page size bytes will always complete fully.
+	// See drivers/char/random.c:get_random_bytes_user().
+	// NOTE(gvisor.dev/issue/9445): Some applications rely on this behavior.
+	const pageSize = 4096
+	min := len(p)
+	if min > pageSize {
+		min = pageSize
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return io.ReadAtLeast(b.r, p, min)
+}
+
 // Reader is the default reader.
-var Reader io.Reader = &reader{}
+var Reader io.Reader = &bufferedReader{r: bufio.NewReader(&reader{})}
 
 // Read reads from the default reader.
 func Read(b []byte) (int, error) {

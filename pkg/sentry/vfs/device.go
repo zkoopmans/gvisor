@@ -18,10 +18,12 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
 // DeviceKind indicates whether a device is a block or character device.
+//
+// +stateify savable
 type DeviceKind uint32
 
 const (
@@ -44,6 +46,7 @@ func (kind DeviceKind) String() string {
 	}
 }
 
+// +stateify savable
 type devTuple struct {
 	kind  DeviceKind
 	major uint32
@@ -71,6 +74,12 @@ type RegisterDeviceOptions struct {
 	// /proc/devices. If GroupName is empty, this registration will not be
 	// shown in /proc/devices.
 	GroupName string
+	// Pathname is the name for the device file of this device in /dev directory.
+	// If Pathname is empty, then no device file is created.
+	Pathname string
+	// FilePerms are the permission bits to create the device file with. Only
+	// used if Pathname is provided.
+	FilePerms uint16
 }
 
 // RegisterDevice registers the given Device in vfs with the given major and
@@ -89,6 +98,18 @@ func (vfs *VirtualFilesystem) RegisterDevice(kind DeviceKind, major, minor uint3
 	return nil
 }
 
+// ForEachDevice calls the given callback for each registered device.
+func (vfs *VirtualFilesystem) ForEachDevice(cb func(pathname string, kind DeviceKind, major, minor uint32, perms uint16) error) error {
+	vfs.devicesMu.Lock()
+	defer vfs.devicesMu.Unlock()
+	for tup, dev := range vfs.devices {
+		if err := cb(dev.opts.Pathname, tup.kind, tup.major, tup.minor, dev.opts.FilePerms); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // OpenDeviceSpecialFile returns a FileDescription representing the given
 // device.
 func (vfs *VirtualFilesystem) OpenDeviceSpecialFile(ctx context.Context, mnt *Mount, d *Dentry, kind DeviceKind, major, minor uint32, opts *OpenOptions) (*FileDescription, error) {
@@ -97,13 +118,42 @@ func (vfs *VirtualFilesystem) OpenDeviceSpecialFile(ctx context.Context, mnt *Mo
 	defer vfs.devicesMu.RUnlock()
 	rd, ok := vfs.devices[tup]
 	if !ok {
-		return nil, syserror.ENXIO
+		return nil, linuxerr.ENXIO
 	}
 	return rd.dev.Open(ctx, mnt, d, *opts)
 }
 
+// GetDynamicCharDevMajor allocates and returns an unused major device number
+// for a character device or set of character devices.
+func (vfs *VirtualFilesystem) GetDynamicCharDevMajor() (uint32, error) {
+	vfs.dynCharDevMajorMu.Lock()
+	defer vfs.dynCharDevMajorMu.Unlock()
+	// Compare Linux's fs/char_dev.c:find_dynamic_major().
+	for major := uint32(254); major >= 234; major-- {
+		if _, ok := vfs.dynCharDevMajorUsed[major]; !ok {
+			vfs.dynCharDevMajorUsed[major] = struct{}{}
+			return major, nil
+		}
+	}
+	for major := uint32(511); major >= 384; major-- {
+		if _, ok := vfs.dynCharDevMajorUsed[major]; !ok {
+			vfs.dynCharDevMajorUsed[major] = struct{}{}
+			return major, nil
+		}
+	}
+	return 0, linuxerr.EBUSY
+}
+
+// PutDynamicCharDevMajor deallocates a major device number returned by a
+// previous call to GetDynamicCharDevMajor.
+func (vfs *VirtualFilesystem) PutDynamicCharDevMajor(major uint32) {
+	vfs.dynCharDevMajorMu.Lock()
+	defer vfs.dynCharDevMajorMu.Unlock()
+	delete(vfs.dynCharDevMajorUsed, major)
+}
+
 // GetAnonBlockDevMinor allocates and returns an unused minor device number for
-// an "anonymous" block device with major number 0.
+// an "anonymous" block device with major number UNNAMED_MAJOR.
 func (vfs *VirtualFilesystem) GetAnonBlockDevMinor() (uint32, error) {
 	vfs.anonBlockDevMinorMu.Lock()
 	defer vfs.anonBlockDevMinorMu.Unlock()
@@ -117,7 +167,7 @@ func (vfs *VirtualFilesystem) GetAnonBlockDevMinor() (uint32, error) {
 		}
 		minor++
 	}
-	return 0, syserror.EMFILE
+	return 0, linuxerr.EMFILE
 }
 
 // PutAnonBlockDevMinor deallocates a minor device number returned by a

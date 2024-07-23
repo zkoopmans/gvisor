@@ -18,88 +18,70 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 const nsecPerSec = int64(time.Second)
 
-// copyItimerValIn copies an ItimerVal from the untrusted app range to the
-// kernel.  The ItimerVal may be either 32 or 64 bits.
-// A NULL address is allowed because because Linux allows
-// setitimer(which, NULL, &old_value) which disables the timer.
-// There is a KERN_WARN message saying this misfeature will be removed.
-// However, that hasn't happened as of 3.19, so we continue to support it.
-func copyItimerValIn(t *kernel.Task, addr usermem.Addr) (linux.ItimerVal, error) {
-	if addr == usermem.Addr(0) {
-		return linux.ItimerVal{}, nil
-	}
-
-	switch t.Arch().Width() {
-	case 8:
-		// Native size, just copy directly.
-		var itv linux.ItimerVal
-		if _, err := t.CopyIn(addr, &itv); err != nil {
-			return linux.ItimerVal{}, err
-		}
-
-		return itv, nil
-	default:
-		return linux.ItimerVal{}, syserror.ENOSYS
-	}
-}
-
-// copyItimerValOut copies an ItimerVal to the untrusted app range.
-// The ItimerVal may be either 32 or 64 bits.
-// A NULL address is allowed, in which case no copy takes place
-func copyItimerValOut(t *kernel.Task, addr usermem.Addr, itv *linux.ItimerVal) error {
-	if addr == usermem.Addr(0) {
-		return nil
-	}
-
-	switch t.Arch().Width() {
-	case 8:
-		// Native size, just copy directly.
-		_, err := t.CopyOut(addr, itv)
-		return err
-	default:
-		return syserror.ENOSYS
-	}
-}
-
 // Getitimer implements linux syscall getitimer(2).
-func Getitimer(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Getitimer(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	if t.Arch().Width() != 8 {
+		// Definition of linux.ItimerVal assumes 64-bit architecture.
+		return 0, nil, linuxerr.ENOSYS
+	}
+
 	timerID := args[0].Int()
-	val := args[1].Pointer()
+	addr := args[1].Pointer()
 
 	olditv, err := t.Getitimer(timerID)
 	if err != nil {
 		return 0, nil, err
 	}
-	return 0, nil, copyItimerValOut(t, val, &olditv)
+	// A NULL address is allowed, in which case no copy out takes place.
+	if addr == 0 {
+		return 0, nil, nil
+	}
+	_, err = olditv.CopyOut(t, addr)
+	return 0, nil, err
 }
 
 // Setitimer implements linux syscall setitimer(2).
-func Setitimer(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	timerID := args[0].Int()
-	newVal := args[1].Pointer()
-	oldVal := args[2].Pointer()
+func Setitimer(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	if t.Arch().Width() != 8 {
+		// Definition of linux.ItimerVal assumes 64-bit architecture.
+		return 0, nil, linuxerr.ENOSYS
+	}
 
-	newitv, err := copyItimerValIn(t, newVal)
-	if err != nil {
-		return 0, nil, err
+	timerID := args[0].Int()
+	newAddr := args[1].Pointer()
+	oldAddr := args[2].Pointer()
+
+	var newitv linux.ItimerVal
+	// A NULL address is allowed because because Linux allows
+	// setitimer(which, NULL, &old_value) which disables the timer. There is a
+	// KERN_WARN message saying this misfeature will be removed. However, that
+	// hasn't happened as of 3.19, so we continue to support it.
+	if newAddr != 0 {
+		if _, err := newitv.CopyIn(t, newAddr); err != nil {
+			return 0, nil, err
+		}
 	}
 	olditv, err := t.Setitimer(timerID, newitv)
 	if err != nil {
 		return 0, nil, err
 	}
-	return 0, nil, copyItimerValOut(t, oldVal, &olditv)
+	// A NULL address is allowed, in which case no copy out takes place.
+	if oldAddr == 0 {
+		return 0, nil, nil
+	}
+	_, err = olditv.CopyOut(t, oldAddr)
+	return 0, nil, err
 }
 
 // Alarm implements linux syscall alarm(2).
-func Alarm(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Alarm(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	duration := time.Duration(args[0].Uint()) * time.Second
 
 	olditv, err := t.Setitimer(linux.ITIMER_REAL, linux.ItimerVal{
@@ -118,7 +100,7 @@ func Alarm(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 }
 
 // TimerCreate implements linux syscall timer_create(2).
-func TimerCreate(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func TimerCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	clockID := args[0].Int()
 	sevp := args[1].Pointer()
 	timerIDp := args[2].Pointer()
@@ -131,7 +113,7 @@ func TimerCreate(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 	var sev *linux.Sigevent
 	if sevp != 0 {
 		sev = &linux.Sigevent{}
-		if _, err = t.CopyIn(sevp, sev); err != nil {
+		if _, err = sev.CopyIn(t, sevp); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -141,7 +123,7 @@ func TimerCreate(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 		return 0, nil, err
 	}
 
-	if _, err := t.CopyOut(timerIDp, &id); err != nil {
+	if _, err := id.CopyOut(t, timerIDp); err != nil {
 		t.IntervalTimerDelete(id)
 		return 0, nil, err
 	}
@@ -150,14 +132,14 @@ func TimerCreate(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 }
 
 // TimerSettime implements linux syscall timer_settime(2).
-func TimerSettime(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func TimerSettime(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	timerID := linux.TimerID(args[0].Value)
 	flags := args[1].Int()
 	newValAddr := args[2].Pointer()
 	oldValAddr := args[3].Pointer()
 
 	var newVal linux.Itimerspec
-	if _, err := t.CopyIn(newValAddr, &newVal); err != nil {
+	if _, err := newVal.CopyIn(t, newValAddr); err != nil {
 		return 0, nil, err
 	}
 	oldVal, err := t.IntervalTimerSettime(timerID, newVal, flags&linux.TIMER_ABSTIME != 0)
@@ -165,15 +147,14 @@ func TimerSettime(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 		return 0, nil, err
 	}
 	if oldValAddr != 0 {
-		if _, err := t.CopyOut(oldValAddr, &oldVal); err != nil {
-			return 0, nil, err
-		}
+		_, err = oldVal.CopyOut(t, oldValAddr)
+		return 0, nil, err
 	}
 	return 0, nil, nil
 }
 
 // TimerGettime implements linux syscall timer_gettime(2).
-func TimerGettime(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func TimerGettime(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	timerID := linux.TimerID(args[0].Value)
 	curValAddr := args[1].Pointer()
 
@@ -181,12 +162,12 @@ func TimerGettime(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 	if err != nil {
 		return 0, nil, err
 	}
-	_, err = t.CopyOut(curValAddr, &curVal)
+	_, err = curVal.CopyOut(t, curValAddr)
 	return 0, nil, err
 }
 
 // TimerGetoverrun implements linux syscall timer_getoverrun(2).
-func TimerGetoverrun(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func TimerGetoverrun(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	timerID := linux.TimerID(args[0].Value)
 
 	o, err := t.IntervalTimerGetoverrun(timerID)
@@ -197,7 +178,7 @@ func TimerGetoverrun(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kern
 }
 
 // TimerDelete implements linux syscall timer_delete(2).
-func TimerDelete(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func TimerDelete(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	timerID := linux.TimerID(args[0].Value)
 	return 0, nil, t.IntervalTimerDelete(timerID)
 }

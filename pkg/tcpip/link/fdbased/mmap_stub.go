@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !linux || (!amd64 && !arm64)
 // +build !linux !amd64,!arm64
 
 package fdbased
 
 // Stubbed out version for non-linux/non-amd64/non-arm64 platforms.
 
-func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
+func newPacketMMapDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
 	return nil, nil
 }

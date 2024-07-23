@@ -12,71 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
 // +build linux
 
 package ptrace
 
 import (
 	"fmt"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
-const syscallEvent syscall.Signal = 0x80
-
-// probeSeccomp returns true iff seccomp is run after ptrace notifications,
-// which is generally the case for kernel version >= 4.8. This check is dynamic
-// because kernels have be backported behavior.
-//
-// See createStub for more information.
-//
-// Precondition: the runtime OS thread must be locked.
-func probeSeccomp() bool {
-	// Create a completely new, destroyable process.
-	t, err := attachedThread(0, linux.SECCOMP_RET_ERRNO)
-	if err != nil {
-		panic(fmt.Sprintf("seccomp probe failed: %v", err))
-	}
-	defer t.destroy()
-
-	// Set registers to the yield system call. This call is not allowed
-	// by the filters specified in the attachThread function.
-	regs := createSyscallRegs(&t.initRegs, syscall.SYS_SCHED_YIELD)
-	if err := t.setRegs(&regs); err != nil {
-		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
-	}
-
-	for {
-		// Attempt an emulation.
-		if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, unix.PTRACE_SYSEMU, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
-			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
-		}
-
-		sig := t.wait(stopped)
-		if sig == (syscallEvent | syscall.SIGTRAP) {
-			// Did the seccomp errno hook already run? This would
-			// indicate that seccomp is first in line and we're
-			// less than 4.8.
-			if err := t.getRegs(&regs); err != nil {
-				panic(fmt.Sprintf("ptrace get-regs failed: %v", err))
-			}
-			if _, err := syscallReturnValue(&regs); err == nil {
-				// The seccomp errno mode ran first, and reset
-				// the error in the registers.
-				return false
-			}
-			// The seccomp hook did not run yet, and therefore it
-			// is safe to use RET_KILL mode for dispatched calls.
-			return true
-		}
-	}
-}
+const syscallEvent unix.Signal = 0x80
 
 // createStub creates a fresh stub processes.
 //
@@ -112,7 +65,7 @@ func createStub() (*thread, error) {
 	//
 	// In addition, we set the PTRACE_O_TRACEEXIT option to log more
 	// information about a stub process when it receives a fatal signal.
-	return attachedThread(uintptr(syscall.SIGKILL)|syscall.CLONE_FILES, defaultAction)
+	return attachedThread(uintptr(unix.SIGKILL)|unix.CLONE_FILES, defaultAction)
 }
 
 // attachedThread returns a new attached thread.
@@ -123,80 +76,78 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	// stub and all its children. This is used to create child stubs
 	// (below), so we must include the ability to fork, but otherwise lock
 	// down available calls only to what is needed.
-	rules := []seccomp.RuleSet{
-		// Rules for trapping vsyscall access.
-		{
-			Rules: seccomp.SyscallRules{
-				syscall.SYS_GETTIMEOFDAY: {},
-				syscall.SYS_TIME:         {},
-				unix.SYS_GETCPU:          {}, // SYS_GETCPU was not defined in package syscall on amd64.
-			},
-			Action:   linux.SECCOMP_RET_TRAP,
-			Vsyscall: true,
-		},
-	}
+	rules := []seccomp.RuleSet{}
 	if defaultAction != linux.SECCOMP_RET_ALLOW {
 		rules = append(rules, seccomp.RuleSet{
-			Rules: seccomp.SyscallRules{
-				syscall.SYS_CLONE: []seccomp.Rule{
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+				unix.SYS_CLONE: seccomp.Or{
 					// Allow creation of new subprocesses (used by the master).
-					{seccomp.AllowValue(syscall.CLONE_FILES | syscall.SIGKILL)},
-					// Allow creation of new threads within a single address space (used by addresss spaces).
-					{seccomp.AllowValue(
-						syscall.CLONE_FILES |
-							syscall.CLONE_FS |
-							syscall.CLONE_SIGHAND |
-							syscall.CLONE_THREAD |
-							syscall.CLONE_PTRACE |
-							syscall.CLONE_VM)},
+					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGKILL)},
+					// Allow creation of new threads within a single address space (used by address spaces).
+					seccomp.PerArg{
+						seccomp.EqualTo(
+							unix.CLONE_FILES |
+								unix.CLONE_FS |
+								unix.CLONE_SIGHAND |
+								unix.CLONE_THREAD |
+								unix.CLONE_PTRACE |
+								unix.CLONE_VM)},
 				},
 
 				// For the initial process creation.
-				syscall.SYS_WAIT4: {},
-				syscall.SYS_EXIT:  {},
+				unix.SYS_WAIT4: seccomp.MatchAll{},
+				unix.SYS_EXIT:  seccomp.MatchAll{},
 
 				// For the stub prctl dance (all).
-				syscall.SYS_PRCTL: []seccomp.Rule{
-					{seccomp.AllowValue(syscall.PR_SET_PDEATHSIG), seccomp.AllowValue(syscall.SIGKILL)},
-				},
-				syscall.SYS_GETPPID: {},
+				unix.SYS_PRCTL:   seccomp.PerArg{seccomp.EqualTo(unix.PR_SET_PDEATHSIG), seccomp.EqualTo(unix.SIGKILL)},
+				unix.SYS_GETPPID: seccomp.MatchAll{},
 
 				// For the stub to stop itself (all).
-				syscall.SYS_GETPID: {},
-				syscall.SYS_KILL: []seccomp.Rule{
-					{seccomp.AllowAny{}, seccomp.AllowValue(syscall.SIGSTOP)},
-				},
+				unix.SYS_GETPID: seccomp.MatchAll{},
+				unix.SYS_KILL:   seccomp.PerArg{seccomp.AnyValue{}, seccomp.EqualTo(unix.SIGSTOP)},
 
 				// Injected to support the address space operations.
-				syscall.SYS_MMAP:   {},
-				syscall.SYS_MUNMAP: {},
-			},
+				unix.SYS_MMAP:   seccomp.MatchAll{},
+				unix.SYS_MUNMAP: seccomp.MatchAll{},
+			}),
 			Action: linux.SECCOMP_RET_ALLOW,
 		})
-
-		rules = appendArchSeccompRules(rules)
 	}
-	instrs, err := seccomp.BuildProgram(rules, defaultAction)
+	rules = appendArchSeccompRules(rules, defaultAction)
+	instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+		DefaultAction: defaultAction,
+		BadArchAction: defaultAction,
+	})
 	if err != nil {
 		return nil, err
 	}
 
+	return forkStub(flags, instrs)
+}
+
+// In the child, this function must not acquire any locks, because they might
+// have been locked at the time of the fork. This means no rescheduling, no
+// malloc calls, and no new stack segments.  For the same reason compiler does
+// not race instrument it.
+//
+//go:norace
+func forkStub(flags uintptr, instrs []bpf.Instruction) (*thread, error) {
 	// Declare all variables up front in order to ensure that there's no
 	// need for allocations between beforeFork & afterFork.
 	var (
 		pid   uintptr
 		ppid  uintptr
-		errno syscall.Errno
+		errno unix.Errno
 	)
 
 	// Remember the current ppid for the pdeathsig race.
-	ppid, _, _ = syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0)
+	ppid, _, _ = unix.RawSyscall(unix.SYS_GETPID, 0, 0, 0)
 
 	// Among other things, beforeFork masks all signals.
 	beforeFork()
 
 	// Do the clone.
-	pid, _, errno = syscall.RawSyscall6(syscall.SYS_CLONE, flags, 0, 0, 0, 0, 0)
+	pid, _, errno = unix.RawSyscall6(unix.SYS_CLONE, flags, 0, 0, 0, 0, 0)
 	if errno != 0 {
 		afterFork()
 		return nil, errno
@@ -213,7 +164,7 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 			tid:  int32(pid),
 			cpu:  ^uint32(0),
 		}
-		if sig := t.wait(stopped); sig != syscall.SIGSTOP {
+		if sig := t.wait(stopped); sig != unix.SIGSTOP {
 			return nil, fmt.Errorf("wait failed: expected SIGSTOP, got %v", sig)
 		}
 		t.attach()
@@ -226,8 +177,8 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	// prevents the stub from getting PTY job control signals intended only
 	// for the sentry process. We must call this before restoring signal
 	// mask.
-	if _, _, errno := syscall.RawSyscall(syscall.SYS_SETSID, 0, 0, 0); errno != 0 {
-		syscall.RawSyscall(syscall.SYS_EXIT, uintptr(errno), 0, 0)
+	if _, _, errno := unix.RawSyscall(unix.SYS_SETSID, 0, 0, 0); errno != 0 {
+		unix.RawSyscall(unix.SYS_EXIT, uintptr(errno), 0, 0)
 	}
 
 	// afterForkInChild resets all signals to their default dispositions
@@ -237,13 +188,13 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	// Explicitly unmask all signals to ensure that the tracer can see
 	// them.
 	if errno := unmaskAllSignals(); errno != 0 {
-		syscall.RawSyscall(syscall.SYS_EXIT, uintptr(errno), 0, 0)
+		unix.RawSyscall(unix.SYS_EXIT, uintptr(errno), 0, 0)
 	}
 
 	// Set an aggressive BPF filter for the stub and all it's children. See
 	// the description of the BPF program built above.
-	if errno := seccomp.SetFilter(instrs); errno != 0 {
-		syscall.RawSyscall(syscall.SYS_EXIT, uintptr(errno), 0, 0)
+	if errno := seccomp.SetFilterInChild(instrs); errno != 0 {
+		unix.RawSyscall(unix.SYS_EXIT, uintptr(errno), 0, 0)
 	}
 
 	// Enable cpuid-faulting.
@@ -260,7 +211,7 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 func (s *subprocess) createStub() (*thread, error) {
 	// There's no need to lock the runtime thread here, as this can only be
 	// called from a context that is already locked.
-	currentTID := int32(procid.Current())
+	currentTID := int32(hosttid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
 
 	// Pass the expected PPID to the child via R15.
@@ -279,8 +230,8 @@ func (s *subprocess) createStub() (*thread, error) {
 	// See above re: SIGKILL.
 	pid, err := t.syscallIgnoreInterrupt(
 		&regs,
-		syscall.SYS_CLONE,
-		arch.SyscallArgument{Value: uintptr(syscall.SIGKILL | syscall.CLONE_FILES)},
+		unix.SYS_CLONE,
+		arch.SyscallArgument{Value: uintptr(unix.SIGKILL | unix.CLONE_FILES)},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
@@ -298,10 +249,10 @@ func (s *subprocess) createStub() (*thread, error) {
 	// If the child actually exited, the attach below will fail.
 	_, err = t.syscallIgnoreInterrupt(
 		&t.initRegs,
-		syscall.SYS_WAIT4,
+		unix.SYS_WAIT4,
 		arch.SyscallArgument{Value: uintptr(pid)},
 		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: syscall.WALL | syscall.WUNTRACED},
+		arch.SyscallArgument{Value: unix.WALL | unix.WUNTRACED},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0})

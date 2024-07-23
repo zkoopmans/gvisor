@@ -16,13 +16,10 @@ package mm
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // SpecialMappable implements memmap.MappingIdentity and memmap.Mappable with
@@ -32,10 +29,10 @@ import (
 //
 // +stateify savable
 type SpecialMappable struct {
-	refs.AtomicRefCount
+	SpecialMappableRefs
 
-	mfp  pgalloc.MemoryFileProvider
-	fr   platform.FileRange
+	mf   *pgalloc.MemoryFile `state:"nosave"`
+	fr   memmap.FileRange
 	name string
 }
 
@@ -44,16 +41,16 @@ type SpecialMappable struct {
 // SpecialMappable will use the given name in /proc/[pid]/maps.
 //
 // Preconditions: fr.Length() != 0.
-func NewSpecialMappable(name string, mfp pgalloc.MemoryFileProvider, fr platform.FileRange) *SpecialMappable {
-	m := SpecialMappable{mfp: mfp, fr: fr, name: name}
-	m.EnableLeakCheck("mm.SpecialMappable")
+func NewSpecialMappable(name string, mf *pgalloc.MemoryFile, fr memmap.FileRange) *SpecialMappable {
+	m := SpecialMappable{mf: mf, fr: fr, name: name}
+	m.InitRefs()
 	return &m
 }
 
 // DecRef implements refs.RefCounter.DecRef.
-func (m *SpecialMappable) DecRef() {
-	m.AtomicRefCount.DecRefWithDestructor(func() {
-		m.mfp.MemoryFile().DecRef(m.fr)
+func (m *SpecialMappable) DecRef(ctx context.Context) {
+	m.SpecialMappableRefs.DecRef(func() {
+		m.mf.DecRef(m.fr)
 	})
 }
 
@@ -79,32 +76,32 @@ func (m *SpecialMappable) Msync(ctx context.Context, mr memmap.MappableRange) er
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (*SpecialMappable) AddMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) error {
+func (*SpecialMappable) AddMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, uint64, bool) error {
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (*SpecialMappable) RemoveMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) {
+func (*SpecialMappable) RemoveMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, uint64, bool) {
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (*SpecialMappable) CopyMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, usermem.AddrRange, uint64, bool) error {
+func (*SpecialMappable) CopyMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, hostarch.AddrRange, uint64, bool) error {
 	return nil
 }
 
 // Translate implements memmap.Mappable.Translate.
-func (m *SpecialMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at usermem.AccessType) ([]memmap.Translation, error) {
+func (m *SpecialMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	var err error
 	if required.End > m.fr.Length() {
-		err = &memmap.BusError{syserror.EFAULT}
+		err = &memmap.BusError{linuxerr.EFAULT}
 	}
 	if source := optional.Intersect(memmap.MappableRange{0, m.fr.Length()}); source.Length() != 0 {
 		return []memmap.Translation{
 			{
 				Source: source,
-				File:   m.mfp.MemoryFile(),
+				File:   m.mf,
 				Offset: m.fr.Start + source.Start,
-				Perms:  usermem.AnyAccess,
+				Perms:  hostarch.AnyAccess,
 			},
 		}, err
 	}
@@ -118,40 +115,13 @@ func (m *SpecialMappable) InvalidateUnsavable(ctx context.Context) error {
 	return nil
 }
 
-// MemoryFileProvider returns the MemoryFileProvider whose MemoryFile stores
-// the SpecialMappable's contents.
-func (m *SpecialMappable) MemoryFileProvider() pgalloc.MemoryFileProvider {
-	return m.mfp
-}
-
-// FileRange returns the offsets into MemoryFileProvider().MemoryFile() that
-// store the SpecialMappable's contents.
-func (m *SpecialMappable) FileRange() platform.FileRange {
+// FileRange returns the offsets into m.mf that stores the SpecialMappable's
+// contents.
+func (m *SpecialMappable) FileRange() memmap.FileRange {
 	return m.fr
 }
 
 // Length returns the length of the SpecialMappable.
 func (m *SpecialMappable) Length() uint64 {
 	return m.fr.Length()
-}
-
-// NewSharedAnonMappable returns a SpecialMappable that implements the
-// semantics of mmap(MAP_SHARED|MAP_ANONYMOUS) and mappings of /dev/zero.
-//
-// TODO(jamieliu): The use of SpecialMappable is a lazy code reuse hack. Linux
-// uses an ephemeral file created by mm/shmem.c:shmem_zero_setup(); we should
-// do the same to get non-zero device and inode IDs.
-func NewSharedAnonMappable(length uint64, mfp pgalloc.MemoryFileProvider) (*SpecialMappable, error) {
-	if length == 0 {
-		return nil, syserror.EINVAL
-	}
-	alignedLen, ok := usermem.Addr(length).RoundUp()
-	if !ok {
-		return nil, syserror.EINVAL
-	}
-	fr, err := mfp.MemoryFile().Allocate(uint64(alignedLen), usage.Anonymous)
-	if err != nil {
-		return nil, err
-	}
-	return NewSpecialMappable("/dev/zero (deleted)", mfp, fr), nil
 }

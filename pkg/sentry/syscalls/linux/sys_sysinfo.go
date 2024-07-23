@@ -21,23 +21,32 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
-// Sysinfo implements the sysinfo syscall as described in man 2 sysinfo.
-func Sysinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+// Sysinfo implements Linux syscall sysinfo(2).
+func Sysinfo(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 
 	mf := t.Kernel().MemoryFile()
-	mf.UpdateUsage()
-	_, totalUsage := usage.MemoryAccounting.Copy()
+	mfUsage, err := mf.TotalUsage()
+	if err != nil {
+		return 0, nil, err
+	}
+	memStats, _ := usage.MemoryAccounting.Copy()
+	totalUsage := mfUsage + memStats.Mapped
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
+	memFree := totalSize - totalUsage
+	if memFree > totalSize {
+		// Underflow.
+		memFree = 0
+	}
 
 	// Only a subset of the fields in sysinfo_t make sense to return.
 	si := linux.Sysinfo{
-		Procs:    uint16(len(t.PIDNamespace().Tasks())),
+		Procs:    uint16(t.Kernel().TaskSet().Root.NumTasks()),
 		Uptime:   t.Kernel().MonotonicClock().Now().Seconds(),
 		TotalRAM: totalSize,
-		FreeRAM:  totalSize - totalUsage,
+		FreeRAM:  memFree,
 		Unit:     1,
 	}
-	_, err := t.CopyOut(addr, si)
+	_, err = si.CopyOut(t, addr)
 	return 0, nil, err
 }

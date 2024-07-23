@@ -18,12 +18,12 @@ import (
 	"fmt"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/log"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
 // Timekeeper manages all of the kernel clocks.
@@ -38,6 +38,12 @@ type Timekeeper struct {
 	// It is set only once, by SetClocks.
 	clocks sentrytime.Clocks `state:"nosave"`
 
+	// realtimeClock is a ktime.Clock based on timekeeper's Realtime.
+	realtimeClock *timekeeperClock
+
+	// monotonicClock is a ktime.Clock based on timekeeper's Monotonic.
+	monotonicClock *timekeeperClock
+
 	// bootTime is the realtime when the system "booted". i.e., when
 	// SetClocks was called in the initial (not restored) run.
 	bootTime ktime.Time
@@ -47,6 +53,9 @@ type Timekeeper struct {
 	//
 	// It is set only once, by SetClocks.
 	monotonicOffset int64 `state:"nosave"`
+
+	// monotonicLowerBound is the lowerBound for monotonic time.
+	monotonicLowerBound atomicbitops.Int64 `state:"nosave"`
 
 	// restored, if non-nil, indicates that this Timekeeper was restored
 	// from a state file. The clocks are not set until restored is closed.
@@ -69,9 +78,6 @@ type Timekeeper struct {
 	// monotonicOffset.
 	saveRealtime int64
 
-	// params manages the parameter page.
-	params *VDSOParamPage
-
 	// mu protects destruction with stop and wg.
 	mu sync.Mutex `state:"nosave"`
 
@@ -86,10 +92,11 @@ type Timekeeper struct {
 // NewTimekeeper does not take ownership of paramPage.
 //
 // SetClocks must be called on the returned Timekeeper before it is usable.
-func NewTimekeeper(mfp pgalloc.MemoryFileProvider, paramPage platform.FileRange) (*Timekeeper, error) {
-	return &Timekeeper{
-		params: NewVDSOParamPage(mfp, paramPage),
-	}, nil
+func NewTimekeeper() *Timekeeper {
+	t := Timekeeper{}
+	t.realtimeClock = &timekeeperClock{tk: &t, c: sentrytime.Realtime}
+	t.monotonicClock = &timekeeperClock{tk: &t, c: sentrytime.Monotonic}
+	return &t
 }
 
 // SetClocks the backing clock source.
@@ -99,11 +106,11 @@ func NewTimekeeper(mfp pgalloc.MemoryFileProvider, paramPage platform.FileRange)
 // could cause time discontinuities.
 //
 // It must also be called after Load.
-func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
+func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 	// Update the params, marking them "not ready", as we may need to
 	// restart calibration on this new machine.
 	if t.restored != nil {
-		if err := t.params.Write(func() vdsoParams {
+		if err := params.Write(func() vdsoParams {
 			return vdsoParams{}
 		}); err != nil {
 			panic("unable to reset VDSO params: " + err.Error())
@@ -156,17 +163,43 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.startUpdater()
+	t.startUpdater(params)
 
 	if t.restored != nil {
 		close(t.restored)
 	}
 }
 
+var _ tcpip.Clock = (*Timekeeper)(nil)
+
+// Now implements tcpip.Clock.
+func (t *Timekeeper) Now() time.Time {
+	nsec, err := t.GetTime(sentrytime.Realtime)
+	if err != nil {
+		panic("timekeeper.GetTime(sentrytime.Realtime): " + err.Error())
+	}
+	return time.Unix(0, nsec)
+}
+
+// NowMonotonic implements tcpip.Clock.
+func (t *Timekeeper) NowMonotonic() tcpip.MonotonicTime {
+	nsec, err := t.GetTime(sentrytime.Monotonic)
+	if err != nil {
+		panic("timekeeper.GetTime(sentrytime.Monotonic): " + err.Error())
+	}
+	var mt tcpip.MonotonicTime
+	return mt.Add(time.Duration(nsec) * time.Nanosecond)
+}
+
+// AfterFunc implements tcpip.Clock.
+func (t *Timekeeper) AfterFunc(d time.Duration, f func()) tcpip.Timer {
+	return ktime.AfterFunc(t.realtimeClock, d, f)
+}
+
 // startUpdater starts an update goroutine that keeps the clocks updated.
 //
 // mu must be held.
-func (t *Timekeeper) startUpdater() {
+func (t *Timekeeper) startUpdater(params *VDSOParamPage) {
 	if t.stop != nil {
 		// Timekeeper already started
 		return
@@ -182,6 +215,7 @@ func (t *Timekeeper) startUpdater() {
 	timer := time.NewTicker(sentrytime.ApproxUpdateInterval)
 	t.wg.Add(1)
 	go func() { // S/R-SAFE: stopped during save.
+		defer t.wg.Done()
 		for {
 			// Start with an update immediately, so the clocks are
 			// ready ASAP.
@@ -189,7 +223,7 @@ func (t *Timekeeper) startUpdater() {
 			// Call Update within a Write block to prevent the VDSO
 			// from using the old params between Update and
 			// Write.
-			if err := t.params.Write(func() vdsoParams {
+			if err := params.Write(func() vdsoParams {
 				monotonicParams, monotonicOk, realtimeParams, realtimeOk := t.clocks.Update()
 
 				var p vdsoParams
@@ -205,9 +239,6 @@ func (t *Timekeeper) startUpdater() {
 					p.realtimeBaseRef = int64(realtimeParams.BaseRef)
 					p.realtimeFrequency = realtimeParams.Frequency
 				}
-
-				log.Debugf("Updating VDSO parameters: %+v", p)
-
 				return p
 			}); err != nil {
 				log.Warningf("Unable to update VDSO parameter page: %v", err)
@@ -216,7 +247,6 @@ func (t *Timekeeper) startUpdater() {
 			select {
 			case <-timer.C:
 			case <-t.stop:
-				t.wg.Done()
 				return
 			}
 		}
@@ -254,10 +284,10 @@ func (t *Timekeeper) PauseUpdates() {
 }
 
 // ResumeUpdates restarts clock parameter updates stopped by PauseUpdates.
-func (t *Timekeeper) ResumeUpdates() {
+func (t *Timekeeper) ResumeUpdates(params *VDSOParamPage) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.startUpdater()
+	t.startUpdater(params)
 }
 
 // GetTime returns the current time in nanoseconds.
@@ -271,6 +301,21 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 	now, err := t.clocks.GetTime(c)
 	if err == nil && c == sentrytime.Monotonic {
 		now += t.monotonicOffset
+		for {
+			// It's possible that the clock is shaky. This may be due to
+			// platform issues, e.g. the KVM platform relies on the guest
+			// TSC and host TSC, which may not be perfectly in sync. To
+			// work around this issue, ensure that the monotonic time is
+			// always bounded by the last time read.
+			oldLowerBound := t.monotonicLowerBound.Load()
+			if now < oldLowerBound {
+				now = oldLowerBound
+				break
+			}
+			if t.monotonicLowerBound.CompareAndSwap(oldLowerBound, now) {
+				break
+			}
+		}
 	}
 	return now, err
 }

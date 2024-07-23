@@ -16,13 +16,13 @@ package vfs
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 var fspathBuilderPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &fspath.Builder{}
 	},
 }
@@ -47,7 +47,7 @@ func (vfs *VirtualFilesystem) PathnameWithDeleted(ctx context.Context, vfsroot, 
 	haveRef := false
 	defer func() {
 		if haveRef {
-			vd.DecRef()
+			vd.DecRef(ctx)
 		}
 	}()
 
@@ -58,18 +58,18 @@ loop:
 		switch err.(type) {
 		case nil:
 			if vd.mount == vfsroot.mount && vd.mount.root == vfsroot.dentry {
-				// GenericPrependPath() will have returned
+				// genericfstree.PrependPath() will have returned
 				// PrependPathAtVFSRootError in this case since it checks
 				// against vfsroot before mnt.root, but other implementations
 				// of FilesystemImpl.PrependPath() may return nil instead.
 				break loop
 			}
-			nextVD := vfs.getMountpointAt(vd.mount, vfsroot)
+			nextVD := vfs.getMountpointAt(ctx, vd.mount, vfsroot)
 			if !nextVD.Ok() {
 				break loop
 			}
 			if haveRef {
-				vd.DecRef()
+				vd.DecRef(ctx)
 			}
 			vd = nextVD
 			haveRef = true
@@ -84,17 +84,83 @@ loop:
 		}
 	}
 	b.PrependByte('/')
-	if origD.IsDisowned() {
+	if origD.IsDead() {
 		b.AppendString(" (deleted)")
 	}
+	return b.String(), nil
+}
+
+// PathnameReachable returns an absolute pathname to vd, consistent with
+// Linux's __d_path() (as used by seq_path_root()). If vfsroot.Ok() and vd is
+// not reachable from vfsroot, such that seq_path_root() would return SEQ_SKIP
+// (causing the entire containing entry to be skipped), PathnameReachable
+// returns ("", nil).
+func (vfs *VirtualFilesystem) PathnameReachable(ctx context.Context, vfsroot, vd VirtualDentry) (string, error) {
+	b := getFSPathBuilder()
+	defer putFSPathBuilder(b)
+	haveRef := false
+	defer func() {
+		if haveRef {
+			vd.DecRef(ctx)
+		}
+	}()
+loop:
+	for {
+		err := vd.mount.fs.impl.PrependPath(ctx, vfsroot, vd, b)
+		switch err.(type) {
+		case nil:
+			if vd.mount == vfsroot.mount && vd.mount.root == vfsroot.dentry {
+				break loop
+			}
+			nextVD := vfs.getMountpointAt(ctx, vd.mount, vfsroot)
+			if !nextVD.Ok() {
+				return "", nil
+			}
+			if haveRef {
+				vd.DecRef(ctx)
+			}
+			vd = nextVD
+			haveRef = true
+		case PrependPathAtVFSRootError:
+			break loop
+		case PrependPathAtNonMountRootError, PrependPathSyntheticError:
+			return "", nil
+		default:
+			return "", err
+		}
+	}
+	b.PrependByte('/')
+	return b.String(), nil
+}
+
+// PathnameInFilesystem returns an absolute path to vd relative to vd's
+// Filesystem root. It also appends //deleted to for disowned entries. It is
+// equivalent to Linux's dentry_path().
+func (vfs *VirtualFilesystem) PathnameInFilesystem(ctx context.Context, vd VirtualDentry) (string, error) {
+	b := getFSPathBuilder()
+	defer putFSPathBuilder(b)
+	if vd.dentry.IsDead() {
+		b.PrependString("//deleted")
+	}
+	if err := vd.mount.fs.impl.PrependPath(ctx, VirtualDentry{}, VirtualDentry{dentry: vd.dentry}, b); err != nil {
+		// PrependPath returns an error if it encounters a filesystem root before
+		// the provided vfsroot. We don't provide a vfsroot, so encountering this
+		// error is expected and can be ignored.
+		switch err.(type) {
+		case PrependPathAtNonMountRootError:
+		default:
+			return "", err
+		}
+	}
+	b.PrependByte('/')
 	return b.String(), nil
 }
 
 // PathnameForGetcwd returns an absolute pathname to vd, consistent with
 // Linux's sys_getcwd().
 func (vfs *VirtualFilesystem) PathnameForGetcwd(ctx context.Context, vfsroot, vd VirtualDentry) (string, error) {
-	if vd.dentry.IsDisowned() {
-		return "", syserror.ENOENT
+	if vd.dentry.IsDead() {
+		return "", linuxerr.ENOENT
 	}
 
 	b := getFSPathBuilder()
@@ -102,7 +168,7 @@ func (vfs *VirtualFilesystem) PathnameForGetcwd(ctx context.Context, vfsroot, vd
 	haveRef := false
 	defer func() {
 		if haveRef {
-			vd.DecRef()
+			vd.DecRef(ctx)
 		}
 	}()
 	unreachable := false
@@ -114,13 +180,13 @@ loop:
 			if vd.mount == vfsroot.mount && vd.mount.root == vfsroot.dentry {
 				break loop
 			}
-			nextVD := vfs.getMountpointAt(vd.mount, vfsroot)
+			nextVD := vfs.getMountpointAt(ctx, vd.mount, vfsroot)
 			if !nextVD.Ok() {
 				unreachable = true
 				break loop
 			}
 			if haveRef {
-				vd.DecRef()
+				vd.DecRef(ctx)
 			}
 			vd = nextVD
 			haveRef = true
@@ -142,11 +208,11 @@ loop:
 
 // As of this writing, we do not have equivalents to:
 //
-// - d_absolute_path(), which returns EINVAL if (effectively) any call to
-// FilesystemImpl.PrependPath() would return PrependPathAtNonMountRootError.
+//	- d_absolute_path(), which returns EINVAL if (effectively) any call to
+//		FilesystemImpl.PrependPath() would return PrependPathAtNonMountRootError.
 //
-// - dentry_path(), which does not walk up mounts (and only returns the path
-// relative to Filesystem root), but also appends "//deleted" for disowned
-// Dentries.
+//	- dentry_path(), which does not walk up mounts (and only returns the path
+//		relative to Filesystem root), but also appends "//deleted" for disowned
+//		Dentries.
 //
 // These should be added as necessary.

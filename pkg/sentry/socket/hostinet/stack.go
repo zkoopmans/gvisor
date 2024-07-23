@@ -22,14 +22,15 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -49,35 +50,28 @@ var defaultSendBufSize = inet.TCPBufferSize{
 // Stack implements inet.Stack for host sockets.
 type Stack struct {
 	// Stack is immutable.
-	interfaces     map[int32]inet.Interface
-	interfaceAddrs map[int32][]inet.InterfaceAddr
-	routes         []inet.Route
 	supportsIPv6   bool
+	tcpRecovery    inet.TCPLossRecovery
 	tcpRecvBufSize inet.TCPBufferSize
 	tcpSendBufSize inet.TCPBufferSize
 	tcpSACKEnabled bool
 	netDevFile     *os.File
 	netSNMPFile    *os.File
+	// allowedSocketTypes is the list of allowed socket types
+	allowedSocketTypes []AllowedSocketType
+}
+
+// Destroy implements inet.Stack.Destroy.
+func (*Stack) Destroy() {
 }
 
 // NewStack returns an empty Stack containing no configuration.
 func NewStack() *Stack {
-	return &Stack{
-		interfaces:     make(map[int32]inet.Interface),
-		interfaceAddrs: make(map[int32][]inet.InterfaceAddr),
-	}
+	return &Stack{}
 }
 
 // Configure sets up the stack using the current state of the host network.
-func (s *Stack) Configure() error {
-	if err := addHostInterfaces(s); err != nil {
-		return err
-	}
-
-	if err := addHostRoutes(s); err != nil {
-		return err
-	}
-
+func (s *Stack) Configure(allowRawSockets bool) error {
 	if _, err := os.Stat("/proc/net/if_inet6"); err == nil {
 		s.supportsIPv6 = true
 	}
@@ -117,162 +111,12 @@ func (s *Stack) Configure() error {
 		s.netSNMPFile = f
 	}
 
-	return nil
-}
-
-// ExtractHostInterfaces will populate an interface map and
-// interfaceAddrs map with the results of the equivalent
-// netlink messages.
-func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.NetlinkMessage, interfaces map[int32]inet.Interface, interfaceAddrs map[int32][]inet.InterfaceAddr) error {
-	for _, link := range links {
-		if link.Header.Type != syscall.RTM_NEWLINK {
-			continue
-		}
-		if len(link.Data) < syscall.SizeofIfInfomsg {
-			return fmt.Errorf("RTM_GETLINK returned RTM_NEWLINK message with invalid data length (%d bytes, expected at least %d bytes)", len(link.Data), syscall.SizeofIfInfomsg)
-		}
-		var ifinfo syscall.IfInfomsg
-		binary.Unmarshal(link.Data[:syscall.SizeofIfInfomsg], usermem.ByteOrder, &ifinfo)
-		inetIF := inet.Interface{
-			DeviceType: ifinfo.Type,
-			Flags:      ifinfo.Flags,
-		}
-		// Not clearly documented: syscall.ParseNetlinkRouteAttr will check the
-		// syscall.NetlinkMessage.Header.Type and skip the struct ifinfomsg
-		// accordingly.
-		attrs, err := syscall.ParseNetlinkRouteAttr(&link)
-		if err != nil {
-			return fmt.Errorf("RTM_GETLINK returned RTM_NEWLINK message with invalid rtattrs: %v", err)
-		}
-		for _, attr := range attrs {
-			switch attr.Attr.Type {
-			case syscall.IFLA_ADDRESS:
-				inetIF.Addr = attr.Value
-			case syscall.IFLA_IFNAME:
-				inetIF.Name = string(attr.Value[:len(attr.Value)-1])
-			}
-		}
-		interfaces[ifinfo.Index] = inetIF
-	}
-
-	for _, addr := range addrs {
-		if addr.Header.Type != syscall.RTM_NEWADDR {
-			continue
-		}
-		if len(addr.Data) < syscall.SizeofIfAddrmsg {
-			return fmt.Errorf("RTM_GETADDR returned RTM_NEWADDR message with invalid data length (%d bytes, expected at least %d bytes)", len(addr.Data), syscall.SizeofIfAddrmsg)
-		}
-		var ifaddr syscall.IfAddrmsg
-		binary.Unmarshal(addr.Data[:syscall.SizeofIfAddrmsg], usermem.ByteOrder, &ifaddr)
-		inetAddr := inet.InterfaceAddr{
-			Family:    ifaddr.Family,
-			PrefixLen: ifaddr.Prefixlen,
-			Flags:     ifaddr.Flags,
-		}
-		attrs, err := syscall.ParseNetlinkRouteAttr(&addr)
-		if err != nil {
-			return fmt.Errorf("RTM_GETADDR returned RTM_NEWADDR message with invalid rtattrs: %v", err)
-		}
-		for _, attr := range attrs {
-			switch attr.Attr.Type {
-			case syscall.IFA_ADDRESS:
-				inetAddr.Addr = attr.Value
-			}
-		}
-		interfaceAddrs[int32(ifaddr.Index)] = append(interfaceAddrs[int32(ifaddr.Index)], inetAddr)
+	s.allowedSocketTypes = AllowedSocketTypes
+	if allowRawSockets {
+		s.allowedSocketTypes = append(s.allowedSocketTypes, AllowedRawSocketTypes...)
 	}
 
 	return nil
-}
-
-// ExtractHostRoutes populates the given routes slice with the data from the
-// host route table.
-func ExtractHostRoutes(routeMsgs []syscall.NetlinkMessage) ([]inet.Route, error) {
-	var routes []inet.Route
-	for _, routeMsg := range routeMsgs {
-		if routeMsg.Header.Type != syscall.RTM_NEWROUTE {
-			continue
-		}
-
-		var ifRoute syscall.RtMsg
-		binary.Unmarshal(routeMsg.Data[:syscall.SizeofRtMsg], usermem.ByteOrder, &ifRoute)
-		inetRoute := inet.Route{
-			Family:   ifRoute.Family,
-			DstLen:   ifRoute.Dst_len,
-			SrcLen:   ifRoute.Src_len,
-			TOS:      ifRoute.Tos,
-			Table:    ifRoute.Table,
-			Protocol: ifRoute.Protocol,
-			Scope:    ifRoute.Scope,
-			Type:     ifRoute.Type,
-			Flags:    ifRoute.Flags,
-		}
-
-		// Not clearly documented: syscall.ParseNetlinkRouteAttr will check the
-		// syscall.NetlinkMessage.Header.Type and skip the struct rtmsg
-		// accordingly.
-		attrs, err := syscall.ParseNetlinkRouteAttr(&routeMsg)
-		if err != nil {
-			return nil, fmt.Errorf("RTM_GETROUTE returned RTM_NEWROUTE message with invalid rtattrs: %v", err)
-		}
-
-		for _, attr := range attrs {
-			switch attr.Attr.Type {
-			case syscall.RTA_DST:
-				inetRoute.DstAddr = attr.Value
-			case syscall.RTA_SRC:
-				inetRoute.SrcAddr = attr.Value
-			case syscall.RTA_GATEWAY:
-				inetRoute.GatewayAddr = attr.Value
-			case syscall.RTA_OIF:
-				expected := int(binary.Size(inetRoute.OutputInterface))
-				if len(attr.Value) != expected {
-					return nil, fmt.Errorf("RTM_GETROUTE returned RTM_NEWROUTE message with invalid attribute data length (%d bytes, expected %d bytes)", len(attr.Value), expected)
-				}
-				binary.Unmarshal(attr.Value, usermem.ByteOrder, &inetRoute.OutputInterface)
-			}
-		}
-
-		routes = append(routes, inetRoute)
-	}
-
-	return routes, nil
-}
-
-func addHostInterfaces(s *Stack) error {
-	links, err := doNetlinkRouteRequest(syscall.RTM_GETLINK)
-	if err != nil {
-		return fmt.Errorf("RTM_GETLINK failed: %v", err)
-	}
-
-	addrs, err := doNetlinkRouteRequest(syscall.RTM_GETADDR)
-	if err != nil {
-		return fmt.Errorf("RTM_GETADDR failed: %v", err)
-	}
-
-	return ExtractHostInterfaces(links, addrs, s.interfaces, s.interfaceAddrs)
-}
-
-func addHostRoutes(s *Stack) error {
-	routes, err := doNetlinkRouteRequest(syscall.RTM_GETROUTE)
-	if err != nil {
-		return fmt.Errorf("RTM_GETROUTE failed: %v", err)
-	}
-
-	s.routes, err = ExtractHostRoutes(routes)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func doNetlinkRouteRequest(req int) ([]syscall.NetlinkMessage, error) {
-	data, err := syscall.NetlinkRIB(req, syscall.AF_UNSPEC)
-	if err != nil {
-		return nil, err
-	}
-	return syscall.ParseNetlinkMessage(data)
 }
 
 func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
@@ -294,25 +138,101 @@ func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
 
 // Interfaces implements inet.Stack.Interfaces.
 func (s *Stack) Interfaces() map[int32]inet.Interface {
-	interfaces := make(map[int32]inet.Interface)
-	for k, v := range s.interfaces {
-		interfaces[k] = v
+	ifs, err := getInterfaces()
+	if err != nil {
+		log.Warningf("could not get host interface: %v", err)
+		return nil
 	}
-	return interfaces
+
+	// query interface features for each of the host interfaces.
+	if err := queryInterfaceFeatures(ifs); err != nil {
+		log.Warningf("could not query host interfaces: %v", err)
+		return nil
+	}
+	return ifs
+}
+
+// RemoveInterface implements inet.Stack.RemoveInterface.
+func (*Stack) RemoveInterface(idx int32) error {
+	return removeInterface(idx)
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.
 func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
-	addrs := make(map[int32][]inet.InterfaceAddr)
-	for k, v := range s.interfaceAddrs {
-		addrs[k] = append([]inet.InterfaceAddr(nil), v...)
+	addrs, err := getInterfaceAddrs()
+	if err != nil {
+		log.Warningf("failed to get host interface addresses: %v", err)
+		return nil
 	}
 	return addrs
 }
 
+// SetInterface implements inet.Stack.SetInterface.
+func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	var ifinfomsg linux.InterfaceInfoMessage
+	attrs, ok := msg.GetData(&ifinfomsg)
+	if !ok {
+		return syserr.ErrInvalidArgument
+	}
+	for !attrs.Empty() {
+		// The index is unspecified, search by the interface name.
+		ahdr, value, rest, ok := attrs.ParseFirst()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		attrs = rest
+		switch ahdr.Type {
+		case linux.IFLA_IFNAME:
+			if len(value) < 1 {
+				return syserr.ErrInvalidArgument
+			}
+			if ifinfomsg.Index != 0 {
+				// Device name changing isn't supported yet.
+				return syserr.ErrNotSupported
+			}
+			ifname := string(value[:len(value)-1])
+			for idx, ifa := range s.Interfaces() {
+				if ifname == ifa.Name {
+					ifinfomsg.Index = idx
+					break
+				}
+			}
+		default:
+			ctx.Warningf("unexpected attribute: %x", ahdr.Type)
+			return syserr.ErrNotSupported
+		}
+	}
+	if ifinfomsg.Index == 0 {
+		return syserr.ErrNoDevice
+	}
+
+	flags := msg.Header().Flags
+	if flags&(linux.NLM_F_EXCL|linux.NLM_F_REPLACE) != 0 {
+		return syserr.ErrExists
+	}
+
+	if ifinfomsg.Flags != 0 || ifinfomsg.Change != 0 {
+		if ifinfomsg.Change & ^uint32(linux.IFF_UP) != 0 {
+			ctx.Warningf("Unsupported ifi_change flags: %x", ifinfomsg.Change)
+			return syserr.ErrInvalidArgument
+		}
+		if ifinfomsg.Flags & ^uint32(linux.IFF_UP) != 0 {
+			ctx.Warningf("Unsupported ifi_flags: %x", ifinfomsg.Change)
+			return syserr.ErrInvalidArgument
+		}
+		// Netstack interfaces are always up.
+	}
+	return nil
+}
+
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
-	return syserror.EACCES
+func (*Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	return addInterfaceAddr(idx, addr)
+}
+
+// RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
+func (*Stack) RemoveInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	return removeInterfaceAddr(idx, addr)
 }
 
 // SupportsIPv6 implements inet.Stack.SupportsIPv6.
@@ -326,8 +246,8 @@ func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
 }
 
 // SetTCPReceiveBufferSize implements inet.Stack.SetTCPReceiveBufferSize.
-func (s *Stack) SetTCPReceiveBufferSize(size inet.TCPBufferSize) error {
-	return syserror.EACCES
+func (*Stack) SetTCPReceiveBufferSize(inet.TCPBufferSize) error {
+	return linuxerr.EACCES
 }
 
 // TCPSendBufferSize implements inet.Stack.TCPSendBufferSize.
@@ -336,8 +256,8 @@ func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
 }
 
 // SetTCPSendBufferSize implements inet.Stack.SetTCPSendBufferSize.
-func (s *Stack) SetTCPSendBufferSize(size inet.TCPBufferSize) error {
-	return syserror.EACCES
+func (*Stack) SetTCPSendBufferSize(inet.TCPBufferSize) error {
+	return linuxerr.EACCES
 }
 
 // TCPSACKEnabled implements inet.Stack.TCPSACKEnabled.
@@ -346,8 +266,18 @@ func (s *Stack) TCPSACKEnabled() (bool, error) {
 }
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
-func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
-	return syserror.EACCES
+func (*Stack) SetTCPSACKEnabled(bool) error {
+	return linuxerr.EACCES
+}
+
+// TCPRecovery implements inet.Stack.TCPRecovery.
+func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
+	return s.tcpRecovery, nil
+}
+
+// SetTCPRecovery implements inet.Stack.SetTCPRecovery.
+func (*Stack) SetTCPRecovery(inet.TCPLossRecovery) error {
+	return linuxerr.EACCES
 }
 
 // getLine reads one line from proc file, with specified prefix.
@@ -378,13 +308,13 @@ func getLine(f *os.File, prefix string, withHeader bool) string {
 	return ""
 }
 
-func toSlice(i interface{}) []uint64 {
+func toSlice(i any) []uint64 {
 	v := reflect.Indirect(reflect.ValueOf(i))
 	return v.Slice(0, v.Len()).Interface().([]uint64)
 }
 
 // Statistics implements inet.Stack.Statistics.
-func (s *Stack) Statistics(stat interface{}, arg string) error {
+func (s *Stack) Statistics(stat any, arg string) error {
 	var (
 		snmpTCP   bool
 		rawLine   string
@@ -407,18 +337,18 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 	}
 
 	if rawLine == "" {
-		return fmt.Errorf("Failed to get raw line")
+		return fmt.Errorf("failed to get raw line")
 	}
 
 	parts := strings.SplitN(rawLine, ":", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("Failed to get prefix from: %q", rawLine)
+		return fmt.Errorf("failed to get prefix from: %q", rawLine)
 	}
 
 	sliceStat = toSlice(stat)
 	fields := strings.Fields(strings.TrimSpace(parts[1]))
 	if len(fields) != len(sliceStat) {
-		return fmt.Errorf("Failed to parse fields: %q", rawLine)
+		return fmt.Errorf("failed to parse fields: %q", rawLine)
 	}
 	if _, ok := stat.(*inet.StatSNMPTCP); ok {
 		snmpTCP = true
@@ -434,7 +364,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			sliceStat[i], err = strconv.ParseUint(fields[i], 10, 64)
 		}
 		if err != nil {
-			return fmt.Errorf("Failed to parse field %d from: %q, %v", i, rawLine, err)
+			return fmt.Errorf("failed to parse field %d from: %q, %v", i, rawLine, err)
 		}
 	}
 
@@ -443,17 +373,51 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 
 // RouteTable implements inet.Stack.RouteTable.
 func (s *Stack) RouteTable() []inet.Route {
-	return append([]inet.Route(nil), s.routes...)
+	routes, err := getRoutes()
+	if err != nil {
+		log.Warningf("failed to get routes: %v", err)
+		return nil
+	}
+	// Prepend empty route.
+	return append([]inet.Route(nil), routes...)
 }
 
+// NewRoute implements inet.Stack.NewRoute.
+func (*Stack) NewRoute(context.Context, *nlmsg.Message) *syserr.Error {
+	// TODO(b/343524351): implements RTM_NEWROUTE for hostinet.
+	return syserr.ErrNotSupported
+}
+
+// Pause implements inet.Stack.Pause.
+func (*Stack) Pause() {}
+
+// Restore implements inet.Stack.Restore.
+func (*Stack) Restore() {}
+
 // Resume implements inet.Stack.Resume.
-func (s *Stack) Resume() {}
+func (*Stack) Resume() {}
 
 // RegisteredEndpoints implements inet.Stack.RegisteredEndpoints.
-func (s *Stack) RegisteredEndpoints() []stack.TransportEndpoint { return nil }
+func (*Stack) RegisteredEndpoints() []stack.TransportEndpoint { return nil }
 
 // CleanupEndpoints implements inet.Stack.CleanupEndpoints.
-func (s *Stack) CleanupEndpoints() []stack.TransportEndpoint { return nil }
+func (*Stack) CleanupEndpoints() []stack.TransportEndpoint { return nil }
 
 // RestoreCleanupEndpoints implements inet.Stack.RestoreCleanupEndpoints.
-func (s *Stack) RestoreCleanupEndpoints([]stack.TransportEndpoint) {}
+func (*Stack) RestoreCleanupEndpoints([]stack.TransportEndpoint) {}
+
+// SetForwarding implements inet.Stack.SetForwarding.
+func (*Stack) SetForwarding(tcpip.NetworkProtocolNumber, bool) error {
+	return linuxerr.EACCES
+}
+
+// PortRange implements inet.Stack.PortRange.
+func (*Stack) PortRange() (uint16, uint16) {
+	// Use the default Linux values per net/ipv4/af_inet.c:inet_init_net().
+	return 32768, 60999
+}
+
+// SetPortRange implements inet.Stack.SetPortRange.
+func (*Stack) SetPortRange(uint16, uint16) error {
+	return linuxerr.EACCES
+}

@@ -19,6 +19,8 @@ import (
 	"runtime/trace"
 	"sort"
 
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -27,26 +29,29 @@ const (
 	// maxStackDebugBytes is the maximum number of user stack bytes that may be
 	// printed by debugDumpStack.
 	maxStackDebugBytes = 1024
+	// maxCodeDebugBytes is the maximum number of user code bytes that may be
+	// printed by debugDumpCode.
+	maxCodeDebugBytes = 128
 )
 
 // Infof logs an formatted info message by calling log.Infof.
-func (t *Task) Infof(fmt string, v ...interface{}) {
+func (t *Task) Infof(fmt string, v ...any) {
 	if log.IsLogging(log.Info) {
-		log.Infof(t.logPrefix.Load().(string)+fmt, v...)
+		log.InfofAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
 // Warningf logs a warning string by calling log.Warningf.
-func (t *Task) Warningf(fmt string, v ...interface{}) {
+func (t *Task) Warningf(fmt string, v ...any) {
 	if log.IsLogging(log.Warning) {
-		log.Warningf(t.logPrefix.Load().(string)+fmt, v...)
+		log.WarningfAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
 // Debugf creates a debug string that includes the task ID.
-func (t *Task) Debugf(fmt string, v ...interface{}) {
+func (t *Task) Debugf(fmt string, v ...any) {
 	if log.IsLogging(log.Debug) {
-		log.Debugf(t.logPrefix.Load().(string)+fmt, v...)
+		log.DebugfAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
@@ -61,6 +66,7 @@ func (t *Task) IsLogging(level log.Level) bool {
 func (t *Task) DebugDumpState() {
 	t.debugDumpRegisters()
 	t.debugDumpStack()
+	t.debugDumpCode()
 	if mm := t.MemoryManager(); mm != nil {
 		t.Debugf("Mappings:\n%s", mm)
 	}
@@ -103,9 +109,9 @@ func (t *Task) debugDumpStack() {
 		return
 	}
 	t.Debugf("Stack:")
-	start := usermem.Addr(t.Arch().Stack())
+	start := hostarch.Addr(t.Arch().Stack())
 	// Round addr down to a 16-byte boundary.
-	start &= ^usermem.Addr(15)
+	start &= ^hostarch.Addr(15)
 	// Print 16 bytes per line, one byte at a time.
 	for offset := uint64(0); offset < maxStackDebugBytes; offset += 16 {
 		addr, ok := start.AddLength(offset)
@@ -122,7 +128,46 @@ func (t *Task) debugDumpStack() {
 			t.Debugf("%x: % x", addr, data[:n])
 		}
 		if err != nil {
-			t.Debugf("Error reading stack at address %x: %v", addr+usermem.Addr(n), err)
+			t.Debugf("Error reading stack at address %x: %v", addr+hostarch.Addr(n), err)
+			break
+		}
+	}
+}
+
+// debugDumpCode logs user code contents at log level debug.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) debugDumpCode() {
+	if !t.IsLogging(log.Debug) {
+		return
+	}
+	m := t.MemoryManager()
+	if m == nil {
+		t.Debugf("Memory manager for task is gone, skipping application code dump.")
+		return
+	}
+	t.Debugf("Code:")
+	// Print code on both sides of the instruction register.
+	start := hostarch.Addr(t.Arch().IP()) - maxCodeDebugBytes/2
+	// Round addr down to a 16-byte boundary.
+	start &= ^hostarch.Addr(15)
+	// Print 16 bytes per line, one byte at a time.
+	for offset := uint64(0); offset < maxCodeDebugBytes; offset += 16 {
+		addr, ok := start.AddLength(offset)
+		if !ok {
+			break
+		}
+		var data [16]byte
+		n, err := m.CopyIn(t, addr, data[:], usermem.IOOpts{
+			IgnorePermissions: true,
+		})
+		// Print as much of the line as we can, even if an error was
+		// encountered.
+		if n > 0 {
+			t.Debugf("%x: % x", addr, data[:n])
+		}
+		if err != nil {
+			t.Debugf("Error reading stack at address %x: %v", addr+hostarch.Addr(n), err)
 			break
 		}
 	}
@@ -137,7 +182,6 @@ const (
 	traceCategory = "task"
 	runRegion     = ":run"
 	blockRegion   = ":block"
-	cpuidRegion   = ":cpuid"
 	faultRegion   = ":fault"
 )
 
@@ -146,10 +190,20 @@ const (
 //
 // Preconditions: The task's owning TaskSet.mu must be locked.
 func (t *Task) updateInfoLocked() {
-	// Use the task's TID in the root PID namespace for logging.
-	tid := t.tg.pidns.owner.Root.tids[t]
-	t.logPrefix.Store(fmt.Sprintf("[% 4d] ", tid))
-	t.rebuildTraceContext(tid)
+	// Log the TID and PID in root pidns and t's pidns.
+	rootPID := t.tg.pidns.owner.Root.tgids[t.tg]
+	rootTID := t.tg.pidns.owner.Root.tids[t]
+	pid := t.tg.pidns.tgids[t.tg]
+	tid := t.tg.pidns.tids[t]
+	if rootPID == pid && rootTID == tid {
+		prefix := fmt.Sprintf("[% 4d:% 4d] ", pid, tid)
+		t.logPrefix.Store(&prefix)
+	} else {
+		prefix := fmt.Sprintf("[% 4d(%4d):% 4d(%4d)] ", rootPID, pid, rootTID, tid)
+		t.logPrefix.Store(&prefix)
+	}
+
+	t.rebuildTraceContext(rootTID)
 }
 
 // rebuildTraceContext rebuilds the trace context.
@@ -172,7 +226,7 @@ func (t *Task) rebuildTraceContext(tid ThreadID) {
 	// arbitrarily large (in general it won't be, especially for cases
 	// where we're collecting a brief profile), so using the TID is a
 	// reasonable compromise in this case.
-	t.traceContext, t.traceTask = trace.NewTask(t, fmt.Sprintf("tid:%d", tid))
+	t.traceContext, t.traceTask = trace.NewTask(context.Background(), fmt.Sprintf("tid:%d", tid))
 }
 
 // traceCloneEvent is called when a new task is spawned.
@@ -190,19 +244,23 @@ func (t *Task) traceExitEvent() {
 	if !trace.IsEnabled() {
 		return
 	}
-	trace.Logf(t.traceContext, traceCategory, "exit status: 0x%x", t.exitStatus.Status())
+	trace.Logf(t.traceContext, traceCategory, "exit status: %s", t.exitStatus)
 }
 
 // traceExecEvent is called when a task calls exec.
-func (t *Task) traceExecEvent(tc *TaskContext) {
+func (t *Task) traceExecEvent(image *TaskImage) {
 	if !trace.IsEnabled() {
 		return
 	}
-	file := tc.MemoryManager.Executable()
+	file := image.MemoryManager.Executable()
 	if file == nil {
 		trace.Logf(t.traceContext, traceCategory, "exec: << unknown >>")
 		return
 	}
-	defer file.DecRef()
-	trace.Logf(t.traceContext, traceCategory, "exec: %s", file.PathnameWithDeleted(t))
+	defer file.DecRef(t)
+
+	// traceExecEvent function may be called before the task goroutine
+	// starts, so we must use the async context.
+	name := file.MappedName(t.AsyncContext())
+	trace.Logf(t.traceContext, traceCategory, "exec: %s", name)
 }

@@ -16,15 +16,16 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/shm"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Shmget implements shmget(2).
-func Shmget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	key := shm.Key(args[0].Int())
+func Shmget(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	key := ipc.Key(args[0].Int())
 	size := uint64(args[1].SizeT())
 	flag := args[2].Int()
 
@@ -39,34 +40,34 @@ func Shmget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	if err != nil {
 		return 0, nil, err
 	}
-	defer segment.DecRef()
-	return uintptr(segment.ID), nil, nil
+	defer segment.DecRef(t)
+	return uintptr(segment.ID()), nil, nil
 }
 
-// findSegment retrives a shm segment by the given id.
+// findSegment retrieves a shm segment by the given id.
 //
 // findSegment returns a reference on Shm.
-func findSegment(t *kernel.Task, id shm.ID) (*shm.Shm, error) {
+func findSegment(t *kernel.Task, id ipc.ID) (*shm.Shm, error) {
 	r := t.IPCNamespace().ShmRegistry()
 	segment := r.FindByID(id)
 	if segment == nil {
 		// No segment with provided id.
-		return nil, syserror.EINVAL
+		return nil, linuxerr.EINVAL
 	}
 	return segment, nil
 }
 
 // Shmat implements shmat(2).
-func Shmat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := shm.ID(args[0].Int())
+func Shmat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	id := ipc.ID(args[0].Int())
 	addr := args[1].Pointer()
 	flag := args[2].Int()
 
 	segment, err := findSegment(t, id)
 	if err != nil {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
-	defer segment.DecRef()
+	defer segment.DecRef(t)
 
 	opts, err := segment.ConfigureAttach(t, addr, shm.AttachOpts{
 		Execute:  flag&linux.SHM_EXEC == linux.SHM_EXEC,
@@ -81,15 +82,15 @@ func Shmat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 }
 
 // Shmdt implements shmdt(2).
-func Shmdt(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Shmdt(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	err := t.MemoryManager().DetachShm(t, addr)
 	return 0, nil, err
 }
 
 // Shmctl implements shmctl(2).
-func Shmctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := shm.ID(args[0].Int())
+func Shmctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	id := ipc.ID(args[0].Int())
 	cmd := args[1].Int()
 	buf := args[2].Pointer()
 
@@ -106,56 +107,55 @@ func Shmctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	case linux.IPC_STAT:
 		segment, err := findSegment(t, id)
 		if err != nil {
-			return 0, nil, syserror.EINVAL
+			return 0, nil, linuxerr.EINVAL
 		}
-		defer segment.DecRef()
+		defer segment.DecRef(t)
 
 		stat, err := segment.IPCStat(t)
 		if err == nil {
-			_, err = t.CopyOut(buf, stat)
+			_, err = stat.CopyOut(t, buf)
 		}
 		return 0, nil, err
 
 	case linux.IPC_INFO:
 		params := r.IPCInfo()
-		_, err := t.CopyOut(buf, params)
+		_, err := params.CopyOut(t, buf)
 		return 0, nil, err
 
 	case linux.SHM_INFO:
 		info := r.ShmInfo()
-		_, err := t.CopyOut(buf, info)
+		_, err := info.CopyOut(t, buf)
 		return 0, nil, err
 	}
 
 	// Remaining commands refer to a specific segment.
 	segment, err := findSegment(t, id)
 	if err != nil {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
-	defer segment.DecRef()
+	defer segment.DecRef(t)
 
 	switch cmd {
 	case linux.IPC_SET:
 		var ds linux.ShmidDS
-		_, err = t.CopyIn(buf, &ds)
-		if err != nil {
+		if _, err = ds.CopyIn(t, buf); err != nil {
 			return 0, nil, err
 		}
-		err = segment.Set(t, &ds)
+		err := segment.Set(t, &ds)
 		return 0, nil, err
 
 	case linux.IPC_RMID:
-		segment.MarkDestroyed()
+		segment.MarkDestroyed(t)
 		return 0, nil, nil
 
 	case linux.SHM_LOCK, linux.SHM_UNLOCK:
 		// We currently do not support memory locking anywhere.
 		// mlock(2)/munlock(2) are currently stubbed out as no-ops so do the
 		// same here.
-		t.Kernel().EmitUnimplementedEvent(t)
+		t.Kernel().EmitUnimplementedEvent(t, sysno)
 		return 0, nil, nil
 
 	default:
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 }

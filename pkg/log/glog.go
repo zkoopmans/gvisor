@@ -25,7 +25,7 @@ import (
 // GoogleEmitter is a wrapper that emits logs in a format compatible with
 // package github.com/golang/glog.
 type GoogleEmitter struct {
-	Writer
+	*Writer
 }
 
 // pid is used for the threadid component of the header.
@@ -34,19 +34,20 @@ var pid = os.Getpid()
 // Emit emits the message, google-style.
 //
 // Log lines have this form:
-//   Lmmdd hh:mm:ss.uuuuuu threadid file:line] msg...
+//
+//	Lmmdd hh:mm:ss.uuuuuu threadid file:line] msg...
 //
 // where the fields are defined as follows:
-//   L                A single character, representing the log level (eg 'I' for INFO)
-//   mm               The month (zero padded; ie May is '05')
-//   dd               The day (zero padded)
-//   hh:mm:ss.uuuuuu  Time in hours, minutes and fractional seconds
-//   threadid         The space-padded thread ID as returned by GetTID()
-//   file             The file name
-//   line             The line number
-//   msg              The user-supplied message
 //
-func (g *GoogleEmitter) Emit(level Level, timestamp time.Time, format string, args ...interface{}) {
+//	L                A single character, representing the log level (eg 'I' for INFO)
+//	mm               The month (zero padded; ie May is '05')
+//	dd               The day (zero padded)
+//	hh:mm:ss.uuuuuu  Time in hours, minutes and fractional seconds
+//	threadid         The space-padded thread ID as returned by GetTID()
+//	file             The file name
+//	line             The line number
+//	msg              The user-supplied message
+func (g GoogleEmitter) Emit(depth int, level Level, timestamp time.Time, format string, args ...any) {
 	// Log level.
 	prefix := byte('?')
 	switch level {
@@ -64,9 +65,7 @@ func (g *GoogleEmitter) Emit(level Level, timestamp time.Time, format string, ar
 	microsecond := int(timestamp.Nanosecond() / 1000)
 
 	// 0 = this frame.
-	// 1 = Debugf, etc.
-	// 2 = Caller.
-	_, file, line, ok := runtime.Caller(2)
+	_, file, line, ok := runtime.Caller(depth + 1)
 	if ok {
 		// Trim any directory path from the file.
 		slash := strings.LastIndexByte(file, byte('/'))
@@ -83,5 +82,5 @@ func (g *GoogleEmitter) Emit(level Level, timestamp time.Time, format string, ar
 	message := fmt.Sprintf(format, args...)
 
 	// Emit the formatted result.
-	fmt.Fprintf(&g.Writer, "%c%02d%02d %02d:%02d:%02d.%06d % 7d %s:%d] %s\n", prefix, int(month), day, hour, minute, second, microsecond, pid, file, line, message)
+	fmt.Fprintf(g.Writer, "%c%02d%02d %02d:%02d:%02d.%06d % 7d %s:%d] %s\n", prefix, int(month), day, hour, minute, second, microsecond, pid, file, line, message)
 }

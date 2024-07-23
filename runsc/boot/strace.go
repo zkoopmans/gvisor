@@ -15,10 +15,13 @@
 package boot
 
 import (
+	"strings"
+
 	"gvisor.dev/gvisor/pkg/sentry/strace"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
-func enableStrace(conf *Config) error {
+func enableStrace(conf *config.Config) error {
 	// We must initialize even if strace is not enabled.
 	strace.Initialize()
 
@@ -26,15 +29,23 @@ func enableStrace(conf *Config) error {
 		return nil
 	}
 
+	// For now runsc always allows logging application buffers in strace logs.
+	strace.LogAppDataAllowed = true
+
 	max := conf.StraceLogSize
 	if max == 0 {
 		max = 1024
 	}
 	strace.LogMaximumSize = max
 
+	sink := strace.SinkTypeLog
+	if conf.StraceEvent {
+		sink = strace.SinkTypeEvent
+	}
+
 	if len(conf.StraceSyscalls) == 0 {
-		strace.EnableAll(strace.SinkTypeLog)
+		strace.EnableAll(sink)
 		return nil
 	}
-	return strace.Enable(conf.StraceSyscalls, strace.SinkTypeLog)
+	return strace.Enable(strings.Split(conf.StraceSyscalls, ","), sink)
 }

@@ -3,53 +3,60 @@ package time
 import (
 	"unsafe"
 
-	"fmt"
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/sync"
-	"reflect"
-	"strings"
 )
 
 // SeqAtomicLoad returns a copy of *ptr, ensuring that the read does not race
-// with any writer critical sections in sc.
-func SeqAtomicLoadParameters(sc *sync.SeqCount, ptr *Parameters) Parameters {
-	// This function doesn't use SeqAtomicTryLoad because doing so is
-	// measurably, significantly (~20%) slower; Go is awful at inlining.
-	var val Parameters
+// with any writer critical sections in seq.
+//
+//go:nosplit
+func SeqAtomicLoadParameters(seq *sync.SeqCount, ptr *Parameters) Parameters {
 	for {
-		epoch := sc.BeginRead()
-		if sync.RaceEnabled {
-
-			sync.Memmove(unsafe.Pointer(&val), unsafe.Pointer(ptr), unsafe.Sizeof(val))
-		} else {
-
-			val = *ptr
-		}
-		if sc.ReadOk(epoch) {
-			break
+		if val, ok := SeqAtomicTryLoadParameters(seq, seq.BeginRead(), ptr); ok {
+			return val
 		}
 	}
-	return val
 }
 
 // SeqAtomicTryLoad returns a copy of *ptr while in a reader critical section
-// in sc initiated by a call to sc.BeginRead() that returned epoch. If the read
-// would race with a writer critical section, SeqAtomicTryLoad returns
+// in seq initiated by a call to seq.BeginRead() that returned epoch. If the
+// read would race with a writer critical section, SeqAtomicTryLoad returns
 // (unspecified, false).
-func SeqAtomicTryLoadParameters(sc *sync.SeqCount, epoch sync.SeqCountEpoch, ptr *Parameters) (Parameters, bool) {
-	var val Parameters
+//
+//go:nosplit
+func SeqAtomicTryLoadParameters(seq *sync.SeqCount, epoch sync.SeqCountEpoch, ptr *Parameters) (val Parameters, ok bool) {
 	if sync.RaceEnabled {
-		sync.Memmove(unsafe.Pointer(&val), unsafe.Pointer(ptr), unsafe.Sizeof(val))
+
+		gohacks.Memmove(unsafe.Pointer(&val), unsafe.Pointer(ptr), unsafe.Sizeof(val))
 	} else {
+
 		val = *ptr
 	}
-	return val, sc.ReadOk(epoch)
+	ok = seq.ReadOk(epoch)
+	return
 }
 
-func initParameters() {
-	var val Parameters
-	typ := reflect.TypeOf(val)
-	name := typ.Name()
-	if ptrs := sync.PointersInType(typ, name); len(ptrs) != 0 {
-		panic(fmt.Sprintf("SeqAtomicLoad<%s> is invalid since values %s of type %s contain pointers:\n%s", typ, name, typ, strings.Join(ptrs, "\n")))
+// SeqAtomicStore sets *ptr to a copy of val, ensuring that any racing reader
+// critical sections are forced to retry.
+//
+//go:nosplit
+func SeqAtomicStoreParameters(seq *sync.SeqCount, ptr *Parameters, val Parameters) {
+	seq.BeginWrite()
+	SeqAtomicStoreSeqedParameters(ptr, val)
+	seq.EndWrite()
+}
+
+// SeqAtomicStoreSeqed sets *ptr to a copy of val.
+//
+// Preconditions: ptr is protected by a SeqCount that will be in a writer
+// critical section throughout the call to SeqAtomicStore.
+//
+//go:nosplit
+func SeqAtomicStoreSeqedParameters(ptr *Parameters, val Parameters) {
+	if sync.RaceEnabled {
+		gohacks.Memmove(unsafe.Pointer(ptr), unsafe.Pointer(&val), unsafe.Sizeof(val))
+	} else {
+		*ptr = val
 	}
 }

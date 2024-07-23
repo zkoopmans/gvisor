@@ -18,85 +18,21 @@ import (
 	"fmt"
 	"os"
 	"runtime/trace"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/errors"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
-
-// SyscallRestartErrno represents a ERESTART* errno defined in the Linux's kernel
-// include/linux/errno.h. These errnos are never returned to userspace
-// directly, but are used to communicate the expected behavior of an
-// interrupted syscall from the syscall to signal handling.
-type SyscallRestartErrno int
-
-// These numeric values are significant because ptrace syscall exit tracing can
-// observe them.
-//
-// For all of the following errnos, if the syscall is not interrupted by a
-// signal delivered to a user handler, the syscall is restarted.
-const (
-	// ERESTARTSYS is returned by an interrupted syscall to indicate that it
-	// should be converted to EINTR if interrupted by a signal delivered to a
-	// user handler without SA_RESTART set, and restarted otherwise.
-	ERESTARTSYS = SyscallRestartErrno(512)
-
-	// ERESTARTNOINTR is returned by an interrupted syscall to indicate that it
-	// should always be restarted.
-	ERESTARTNOINTR = SyscallRestartErrno(513)
-
-	// ERESTARTNOHAND is returned by an interrupted syscall to indicate that it
-	// should be converted to EINTR if interrupted by a signal delivered to a
-	// user handler, and restarted otherwise.
-	ERESTARTNOHAND = SyscallRestartErrno(514)
-
-	// ERESTART_RESTARTBLOCK is returned by an interrupted syscall to indicate
-	// that it should be restarted using a custom function. The interrupted
-	// syscall must register a custom restart function by calling
-	// Task.SetRestartSyscallFn.
-	ERESTART_RESTARTBLOCK = SyscallRestartErrno(516)
-)
-
-var vsyscallCount = metric.MustCreateNewUint64Metric("/kernel/vsyscall_count", false /* sync */, "Number of times vsyscalls were invoked by the application")
-
-// Error implements error.Error.
-func (e SyscallRestartErrno) Error() string {
-	// Descriptions are borrowed from strace.
-	switch e {
-	case ERESTARTSYS:
-		return "to be restarted if SA_RESTART is set"
-	case ERESTARTNOINTR:
-		return "to be restarted"
-	case ERESTARTNOHAND:
-		return "to be restarted if no handler"
-	case ERESTART_RESTARTBLOCK:
-		return "interrupted by signal"
-	default:
-		return "(unknown interrupt error)"
-	}
-}
-
-// SyscallRestartErrnoFromReturn returns the SyscallRestartErrno represented by
-// rv, the value in a syscall return register.
-func SyscallRestartErrnoFromReturn(rv uintptr) (SyscallRestartErrno, bool) {
-	switch int(rv) {
-	case -int(ERESTARTSYS):
-		return ERESTARTSYS, true
-	case -int(ERESTARTNOINTR):
-		return ERESTARTNOINTR, true
-	case -int(ERESTARTNOHAND):
-		return ERESTARTNOHAND, true
-	case -int(ERESTART_RESTARTBLOCK):
-		return ERESTART_RESTARTBLOCK, true
-	default:
-		return 0, false
-	}
-}
 
 // SyscallRestartBlock represents the restart block for a syscall restartable
 // with a custom function. It encapsulates the state required to restart a
@@ -150,9 +86,46 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 
 	fe := s.FeatureEnable.Word(sysno)
 
-	var straceContext interface{}
+	var straceContext any
 	if bits.IsAnyOn32(fe, StraceEnableBits) {
 		straceContext = s.Stracer.SyscallEnter(t, sysno, args, fe)
+	}
+
+	if bits.IsAnyOn32(fe, SecCheckRawEnter) {
+		info := pb.Syscall{
+			Sysno: uint64(sysno),
+			Arg1:  args[0].Uint64(),
+			Arg2:  args[1].Uint64(),
+			Arg3:  args[2].Uint64(),
+			Arg4:  args[3].Uint64(),
+			Arg5:  args[4].Uint64(),
+			Arg6:  args[5].Uint64(),
+		}
+		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallRawEnter, sysno))
+		if !fields.Context.Empty() {
+			info.ContextData = &pb.ContextData{}
+			LoadSeccheckData(t, fields.Context, info.ContextData)
+		}
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.RawSyscall(t, fields, &info)
+		})
+	}
+	if bits.IsAnyOn32(fe, SecCheckEnter) {
+		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallEnter, sysno))
+		var ctxData *pb.ContextData
+		if !fields.Context.Empty() {
+			ctxData = &pb.ContextData{}
+			LoadSeccheckData(t, fields.Context, ctxData)
+		}
+		info := SyscallInfo{
+			Sysno: sysno,
+			Args:  args,
+		}
+		cb := s.LookupSyscallToProto(sysno)
+		msg, msgType := cb(t, fields, ctxData, info)
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.Syscall(t, fields, ctxData, msgType, msg)
+		})
 	}
 
 	if bits.IsOn32(fe, ExternalBeforeEnable) && (s.ExternalFilterBefore == nil || s.ExternalFilterBefore(t, sysno, args)) {
@@ -167,7 +140,7 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 		}
 		if fn != nil {
 			// Call our syscall implementation.
-			rval, ctrl, err = fn(t, args)
+			rval, ctrl, err = fn(t, sysno, args)
 		} else {
 			// Use the missing function if not found.
 			rval, err = t.SyscallTable().Missing(t, sysno, args)
@@ -179,11 +152,55 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 
 	if bits.IsOn32(fe, ExternalAfterEnable) && (s.ExternalFilterAfter == nil || s.ExternalFilterAfter(t, sysno, args)) {
 		t.invokeExternal()
-		// Don't reinvoke the syscall.
+		// Don't reinvoke the unix.
 	}
 
 	if bits.IsAnyOn32(fe, StraceEnableBits) {
 		s.Stracer.SyscallExit(straceContext, t, sysno, rval, err)
+	}
+
+	if bits.IsAnyOn32(fe, SecCheckRawExit) {
+		info := pb.Syscall{
+			Sysno: uint64(sysno),
+			Arg1:  args[0].Uint64(),
+			Arg2:  args[1].Uint64(),
+			Arg3:  args[2].Uint64(),
+			Arg4:  args[3].Uint64(),
+			Arg5:  args[4].Uint64(),
+			Arg6:  args[5].Uint64(),
+			Exit: &pb.Exit{
+				Result:  int64(rval),
+				Errorno: int64(ExtractErrno(err, int(sysno))),
+			},
+		}
+		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallRawEnter, sysno))
+		if !fields.Context.Empty() {
+			info.ContextData = &pb.ContextData{}
+			LoadSeccheckData(t, fields.Context, info.ContextData)
+		}
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.RawSyscall(t, fields, &info)
+		})
+	}
+	if bits.IsAnyOn32(fe, SecCheckExit) {
+		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallExit, sysno))
+		var ctxData *pb.ContextData
+		if !fields.Context.Empty() {
+			ctxData = &pb.ContextData{}
+			LoadSeccheckData(t, fields.Context, ctxData)
+		}
+		info := SyscallInfo{
+			Exit:  true,
+			Sysno: sysno,
+			Args:  args,
+			Rval:  rval,
+			Errno: ExtractErrno(err, int(sysno)),
+		}
+		cb := s.LookupSyscallToProto(sysno)
+		msg, msgType := cb(t, fields, ctxData, info)
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.Syscall(t, fields, ctxData, msgType, msg)
+		})
 	}
 
 	return
@@ -194,19 +211,32 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 //
 // The syscall path is very hot; avoid defer.
 func (t *Task) doSyscall() taskRunState {
+	// Save value of the register which is clobbered in the following
+	// t.Arch().SetReturn(-ENOSYS) operation. This is dedicated to arm64.
+	//
+	// On x86, register rax was shared by syscall number and return
+	// value, and at the entry of the syscall handler, the rax was
+	// saved to regs.orig_rax which was exposed to userspace.
+	// But on arm64, syscall number was passed through X8, and the X0
+	// was shared by the first syscall argument and return value. The
+	// X0 was saved to regs.orig_x0 which was not exposed to userspace.
+	// So we have to do the same operation here to save the X0 value
+	// into the task context.
+	t.Arch().SyscallSaveOrig()
+
 	sysno := t.Arch().SyscallNo()
 	args := t.Arch().SyscallArgs()
 
 	// Tracers expect to see this between when the task traps into the kernel
 	// to perform a syscall and when the syscall is actually invoked.
 	// This useless-looking temporary is needed because Go.
-	tmp := uintptr(syscall.ENOSYS)
+	tmp := uintptr(unix.ENOSYS)
 	t.Arch().SetReturn(-tmp)
 
 	// Check seccomp filters. The nil check is for performance (as seccomp use
 	// is rare), not needed for correctness.
-	if t.syscallFilters.Load() != nil {
-		switch r := t.checkSeccompSyscall(int32(sysno), args, usermem.Addr(t.Arch().IP())); r {
+	if t.seccomp.Load() != nil {
+		switch r := t.checkSeccompSyscall(int32(sysno), args, hostarch.Addr(t.Arch().IP())); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("Syscall %d: denied by seccomp", sysno)
 			return (*runSyscallExit)(nil)
@@ -214,7 +244,7 @@ func (t *Task) doSyscall() taskRunState {
 			// ok
 		case linux.SECCOMP_RET_KILL_THREAD:
 			t.Debugf("Syscall %d: killed by seccomp", sysno)
-			t.PrepareExit(ExitStatus{Signo: int(linux.SIGSYS)})
+			t.PrepareExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
 			return (*runExit)(nil)
 		case linux.SECCOMP_RET_TRACE:
 			t.Debugf("Syscall %d: stopping for PTRACE_EVENT_SECCOMP", sysno)
@@ -224,6 +254,7 @@ func (t *Task) doSyscall() taskRunState {
 		}
 	}
 
+	syscallCounter.Increment()
 	return t.doSyscallEnter(sysno, args)
 }
 
@@ -269,6 +300,7 @@ func (*runSyscallAfterSyscallEnterStop) execute(t *Task) taskRunState {
 		return (*runSyscallExit)(nil)
 	}
 	args := t.Arch().SyscallArgs()
+
 	return t.doSyscallInvoke(sysno, args)
 }
 
@@ -298,7 +330,7 @@ func (t *Task) doSyscallInvoke(sysno uintptr, args arch.SyscallArguments) taskRu
 			return ctrl.next
 		}
 	} else if err != nil {
-		t.Arch().SetReturn(uintptr(-t.ExtractErrno(err, int(sysno))))
+		t.Arch().SetReturn(uintptr(-ExtractErrno(err, int(sysno))))
 		t.haveSyscallReturn = true
 	} else {
 		t.Arch().SetReturn(rval)
@@ -335,12 +367,12 @@ func (*runSyscallExit) execute(t *Task) taskRunState {
 // doVsyscall is the entry point for a vsyscall invocation of syscall sysno, as
 // indicated by an execution fault at address addr. doVsyscall returns the
 // task's next run state.
-func (t *Task) doVsyscall(addr usermem.Addr, sysno uintptr) taskRunState {
-	vsyscallCount.Increment()
+func (t *Task) doVsyscall(addr hostarch.Addr, sysno uintptr) taskRunState {
+	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeVsyscallCount)
 
 	// Grab the caller up front, to make sure there's a sensible stack.
 	caller := t.Arch().Native(uintptr(0))
-	if _, err := t.CopyIn(usermem.Addr(t.Arch().Stack()), caller); err != nil {
+	if _, err := caller.CopyIn(t, hostarch.Addr(t.Arch().Stack())); err != nil {
 		t.Debugf("vsyscall %d: error reading return address from stack: %v", sysno, err)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
 		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
@@ -351,7 +383,7 @@ func (t *Task) doVsyscall(addr usermem.Addr, sysno uintptr) taskRunState {
 	// to syscall ABI because they both use RDI, RSI, and RDX for the first three
 	// arguments and none of the vsyscalls uses more than two arguments.
 	args := t.Arch().SyscallArgs()
-	if t.syscallFilters.Load() != nil {
+	if t.seccomp.Load() != nil {
 		switch r := t.checkSeccompSyscall(int32(sysno), args, addr); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("vsyscall %d, caller %x: denied by seccomp", sysno, t.Arch().Value(caller))
@@ -363,7 +395,7 @@ func (t *Task) doVsyscall(addr usermem.Addr, sysno uintptr) taskRunState {
 			return &runVsyscallAfterPtraceEventSeccomp{addr, sysno, caller}
 		case linux.SECCOMP_RET_KILL_THREAD:
 			t.Debugf("vsyscall %d: killed by seccomp", sysno)
-			t.PrepareExit(ExitStatus{Signo: int(linux.SIGSYS)})
+			t.PrepareExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
 			return (*runExit)(nil)
 		default:
 			panic(fmt.Sprintf("Unknown seccomp result %d", r))
@@ -374,9 +406,9 @@ func (t *Task) doVsyscall(addr usermem.Addr, sysno uintptr) taskRunState {
 }
 
 type runVsyscallAfterPtraceEventSeccomp struct {
-	addr   usermem.Addr
+	addr   hostarch.Addr
 	sysno  uintptr
-	caller interface{}
+	caller marshal.Marshallable
 }
 
 func (r *runVsyscallAfterPtraceEventSeccomp) execute(t *Task) taskRunState {
@@ -389,8 +421,8 @@ func (r *runVsyscallAfterPtraceEventSeccomp) execute(t *Task) taskRunState {
 	// currently emulated call. ... The tracer MUST NOT modify rip or rsp." -
 	// Documentation/prctl/seccomp_filter.txt. On Linux, changing orig_ax or ip
 	// causes do_exit(SIGSYS), and changing sp is ignored.
-	if (sysno != ^uintptr(0) && sysno != r.sysno) || usermem.Addr(t.Arch().IP()) != r.addr {
-		t.PrepareExit(ExitStatus{Signo: int(linux.SIGSYS)})
+	if (sysno != ^uintptr(0) && sysno != r.sysno) || hostarch.Addr(t.Arch().IP()) != r.addr {
+		t.PrepareExit(linux.WaitStatusTerminationSignal(linux.SIGSYS))
 		return (*runExit)(nil)
 	}
 	if sysno == ^uintptr(0) {
@@ -399,7 +431,7 @@ func (r *runVsyscallAfterPtraceEventSeccomp) execute(t *Task) taskRunState {
 	return t.doVsyscallInvoke(sysno, t.Arch().SyscallArgs(), r.caller)
 }
 
-func (t *Task) doVsyscallInvoke(sysno uintptr, args arch.SyscallArguments, caller interface{}) taskRunState {
+func (t *Task) doVsyscallInvoke(sysno uintptr, args arch.SyscallArguments, caller marshal.Marshallable) taskRunState {
 	rval, ctrl, err := t.executeSyscall(sysno, args)
 	if ctrl != nil {
 		t.Debugf("vsyscall %d, caller %x: syscall control: %v", sysno, t.Arch().Value(caller), ctrl)
@@ -411,13 +443,13 @@ func (t *Task) doVsyscallInvoke(sysno uintptr, args arch.SyscallArguments, calle
 		t.Arch().SetReturn(uintptr(rval))
 	} else {
 		t.Debugf("vsyscall %d, caller %x: emulated syscall returned error: %v", sysno, t.Arch().Value(caller), err)
-		if err == syserror.EFAULT {
+		if linuxerr.Equals(linuxerr.EFAULT, err) {
 			t.forceSignal(linux.SIGSEGV, false /* unconditional */)
 			t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 			// A return is not emulated in this case.
 			return (*runApp)(nil)
 		}
-		t.Arch().SetReturn(uintptr(-t.ExtractErrno(err, int(sysno))))
+		t.Arch().SetReturn(uintptr(-ExtractErrno(err, int(sysno))))
 	}
 	t.Arch().SetIP(t.Arch().Value(caller))
 	t.Arch().SetStack(t.Arch().Stack() + uintptr(t.Arch().Width()))
@@ -427,28 +459,30 @@ func (t *Task) doVsyscallInvoke(sysno uintptr, args arch.SyscallArguments, calle
 // ExtractErrno extracts an integer error number from the error.
 // The syscall number is purely for context in the error case. Use -1 if
 // syscall number is unknown.
-func (t *Task) ExtractErrno(err error, sysno int) int {
+func ExtractErrno(err error, sysno int) int {
 	switch err := err.(type) {
 	case nil:
 		return 0
-	case syscall.Errno:
+	case unix.Errno:
 		return int(err)
-	case SyscallRestartErrno:
-		return int(err)
+	case *errors.Error:
+		return int(linuxerr.ToUnix(err))
 	case *memmap.BusError:
 		// Bus errors may generate SIGBUS, but for syscalls they still
 		// return EFAULT. See case in task_run.go where the fault is
 		// handled (and the SIGBUS is delivered).
-		return int(syscall.EFAULT)
+		return int(unix.EFAULT)
 	case *os.PathError:
-		return t.ExtractErrno(err.Err, sysno)
+		return ExtractErrno(err.Err, sysno)
 	case *os.LinkError:
-		return t.ExtractErrno(err.Err, sysno)
+		return ExtractErrno(err.Err, sysno)
 	case *os.SyscallError:
-		return t.ExtractErrno(err.Err, sysno)
+		return ExtractErrno(err.Err, sysno)
+	case *platform.ContextError:
+		return int(err.Errno)
 	default:
-		if errno, ok := syserror.TranslateError(err); ok {
-			return int(errno)
+		if errno, ok := linuxerr.TranslateError(err); ok {
+			return int(linuxerr.ToUnix(errno))
 		}
 	}
 	panic(fmt.Sprintf("Unknown syscall %d error: %v", sysno, err))

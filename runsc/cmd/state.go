@@ -21,7 +21,8 @@ import (
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 )
@@ -45,32 +46,31 @@ func (*State) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (*State) SetFlags(f *flag.FlagSet) {}
+func (*State) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.Execute.
-func (*State) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*State) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
 
 	id := f.Arg(0)
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		util.Fatalf("loading container: %v", err)
 	}
-	log.Debugf("Returning state for container %+v", c)
 
 	state := c.State()
-	log.Debugf("State: %+v", state)
+	log.Debugf("Returning state for container %q: %+v", c.ID, state)
 
 	// Write json-encoded state directly to stdout.
-	b, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		Fatalf("marshaling container state: %v", err)
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(state); err != nil {
+		util.Fatalf("error marshaling container state: %v", err)
 	}
-	os.Stdout.Write(b)
 	return subcommands.ExitSuccess
 }

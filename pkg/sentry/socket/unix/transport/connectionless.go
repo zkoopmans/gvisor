@@ -18,12 +18,11 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // connectionlessEndpoint is a unix endpoint for unix sockets that support operating in
-// a connectionless fashon.
+// a connectionless fashion.
 //
 // Specifically, this means datagram unix sockets not created with
 // socketpair(2).
@@ -41,9 +40,12 @@ var (
 // NewConnectionless creates a new unbound dgram endpoint.
 func NewConnectionless(ctx context.Context) Endpoint {
 	ep := &connectionlessEndpoint{baseEndpoint{Queue: &waiter.Queue{}}}
-	q := queue{ReaderQueue: ep.Queue, WriterQueue: &waiter.Queue{}, limit: initialLimit}
-	q.EnableLeakCheck("transport.queue")
+	q := queue{ReaderQueue: ep.Queue, WriterQueue: &waiter.Queue{}, limit: defaultBufferSize}
+	q.InitRefs()
 	ep.receiver = &queueReceiver{readQueue: &q}
+	ep.ops.InitHandler(ep, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
+	ep.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
+	ep.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
 	return ep
 }
 
@@ -54,12 +56,10 @@ func (e *connectionlessEndpoint) isBound() bool {
 
 // Close puts the endpoint in a closed state and frees all resources associated
 // with it.
-func (e *connectionlessEndpoint) Close() {
+func (e *connectionlessEndpoint) Close(ctx context.Context) {
 	e.Lock()
-	if e.connected != nil {
-		e.connected.Release()
-		e.connected = nil
-	}
+	connected := e.connected
+	e.connected = nil
 
 	if e.isBound() {
 		e.path = ""
@@ -70,8 +70,11 @@ func (e *connectionlessEndpoint) Close() {
 	e.receiver = nil
 	e.Unlock()
 
+	if connected != nil {
+		connected.Release(ctx)
+	}
 	r.CloseNotify()
-	r.Release()
+	r.Release(ctx)
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
@@ -99,26 +102,27 @@ func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context) (Con
 
 // SendMsg writes data and a control message to the specified endpoint.
 // This method does not block if the data cannot be written.
-func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, *syserr.Error) {
+func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, func(), *syserr.Error) {
 	if to == nil {
 		return e.baseEndpoint.SendMsg(ctx, data, c, nil)
 	}
 
 	connected, err := to.UnidirectionalConnect(ctx)
 	if err != nil {
-		return 0, syserr.ErrInvalidEndpointState
+		return 0, nil, syserr.ErrInvalidEndpointState
 	}
-	defer connected.Release()
+	defer connected.Release(ctx)
 
 	e.Lock()
-	n, notify, err := connected.Send(data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	n, notify, err := connected.Send(ctx, data, c, Address{Addr: e.path})
 	e.Unlock()
 
+	var notifyFn func()
 	if notify {
-		connected.SendNotify()
+		notifyFn = connected.SendNotify
 	}
 
-	return n, err
+	return n, notifyFn, err
 }
 
 // Type implements Endpoint.Type.
@@ -135,7 +139,7 @@ func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoi
 
 	e.Lock()
 	if e.connected != nil {
-		e.connected.Release()
+		e.connected.Release(ctx)
 	}
 	e.connected = connected
 	e.Unlock()
@@ -144,12 +148,12 @@ func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoi
 }
 
 // Listen starts listening on the connection.
-func (e *connectionlessEndpoint) Listen(int) *syserr.Error {
+func (*connectionlessEndpoint) Listen(context.Context, int) *syserr.Error {
 	return syserr.ErrNotSupported
 }
 
 // Accept accepts a new connection.
-func (e *connectionlessEndpoint) Accept() (Endpoint, *syserr.Error) {
+func (*connectionlessEndpoint) Accept(context.Context, *Address) (Endpoint, *syserr.Error) {
 	return nil, syserr.ErrNotSupported
 }
 
@@ -161,7 +165,7 @@ func (e *connectionlessEndpoint) Accept() (Endpoint, *syserr.Error) {
 //
 // Bind will fail only if the socket is connected, bound or the passed address
 // is invalid (the empty string).
-func (e *connectionlessEndpoint) Bind(addr tcpip.FullAddress, commit func() *syserr.Error) *syserr.Error {
+func (e *connectionlessEndpoint) Bind(addr Address) *syserr.Error {
 	e.Lock()
 	defer e.Unlock()
 	if e.isBound() {
@@ -171,14 +175,9 @@ func (e *connectionlessEndpoint) Bind(addr tcpip.FullAddress, commit func() *sys
 		// The empty string is not permitted.
 		return syserr.ErrBadLocalAddress
 	}
-	if commit != nil {
-		if err := commit(); err != nil {
-			return err
-		}
-	}
 
 	// Save the bound address.
-	e.path = string(addr.Addr)
+	e.path = addr.Addr
 	return nil
 }
 
@@ -189,13 +188,13 @@ func (e *connectionlessEndpoint) Readiness(mask waiter.EventMask) waiter.EventMa
 	defer e.Unlock()
 
 	ready := waiter.EventMask(0)
-	if mask&waiter.EventIn != 0 && e.receiver.Readable() {
-		ready |= waiter.EventIn
+	if mask&waiter.ReadableEvents != 0 && e.receiver.Readable() {
+		ready |= waiter.ReadableEvents
 	}
 
 	if e.Connected() {
-		if mask&waiter.EventOut != 0 && e.connected.Writable() {
-			ready |= waiter.EventOut
+		if mask&waiter.WritableEvents != 0 && e.connected.Writable() {
+			ready |= waiter.WritableEvents
 		}
 	}
 
@@ -216,3 +215,16 @@ func (e *connectionlessEndpoint) State() uint32 {
 		return linux.SS_DISCONNECTING
 	}
 }
+
+// OnSetSendBufferSize implements tcpip.SocketOptionsHandler.OnSetSendBufferSize.
+func (e *connectionlessEndpoint) OnSetSendBufferSize(v int64) (newSz int64) {
+	e.Lock()
+	defer e.Unlock()
+	if e.Connected() {
+		return e.baseEndpoint.connected.SetSendBufferSize(v)
+	}
+	return v
+}
+
+// WakeupWriters implements tcpip.SocketOptionsHandler.WakeupWriters.
+func (e *connectionlessEndpoint) WakeupWriters() {}

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -90,25 +91,10 @@ func GetNS(nst specs.LinuxNamespaceType, s *specs.Spec) (specs.LinuxNamespace, b
 	return specs.LinuxNamespace{}, false
 }
 
-// FilterNS returns a slice of namespaces from the spec with types that match
-// those in the `filter` slice.
-func FilterNS(filter []specs.LinuxNamespaceType, s *specs.Spec) []specs.LinuxNamespace {
-	if s.Linux == nil {
-		return nil
-	}
-	var out []specs.LinuxNamespace
-	for _, nst := range filter {
-		if ns, ok := GetNS(nst, s); ok {
-			out = append(out, ns)
-		}
-	}
-	return out
-}
-
 // setNS sets the namespace of the given type.  It must be called with
 // OSThreadLocked.
 func setNS(fd, nsType uintptr) error {
-	if _, _, err := syscall.RawSyscall(unix.SYS_SETNS, fd, nsType, 0); err != 0 {
+	if _, _, err := unix.RawSyscall(unix.SYS_SETNS, fd, nsType, 0); err != 0 {
 		return err
 	}
 	return nil
@@ -118,7 +104,7 @@ func setNS(fd, nsType uintptr) error {
 // that will restore the namespace to the original value.
 //
 // Preconditions: Must be called with os thread locked.
-func ApplyNS(ns specs.LinuxNamespace) (func(), error) {
+func ApplyNS(ns specs.LinuxNamespace) (func() error, error) {
 	log.Infof("Applying namespace %v at path %q", ns.Type, ns.Path)
 	newNS, err := os.Open(ns.Path)
 	if err != nil {
@@ -139,27 +125,49 @@ func ApplyNS(ns specs.LinuxNamespace) (func(), error) {
 		oldNS.Close()
 		return nil, fmt.Errorf("error setting namespace of type %v and path %q: %v", ns.Type, ns.Path, err)
 	}
-	return func() {
+	return func() error {
 		log.Infof("Restoring namespace %v", ns.Type)
 		defer oldNS.Close()
 		if err := setNS(oldNS.Fd(), flag); err != nil {
-			panic(fmt.Sprintf("error restoring namespace: of type %v: %v", ns.Type, err))
+			return fmt.Errorf("error restoring namespace: of type %v: %v", ns.Type, err)
 		}
+		return nil
 	}, nil
 }
 
 // StartInNS joins or creates the given namespaces and calls cmd.Start before
 // restoring the namespaces to the original values.
 func StartInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
-	// We are about to setup namespaces, which requires the os thread being
-	// locked so that Go doesn't change the thread out from under us.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	errChan := make(chan error)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
+		rstFuncs, err := startInNS(cmd, nss)
+		errChan <- err
+		for _, rstFunc := range rstFuncs {
+			err := rstFunc()
+			if err == nil {
+				continue
+			}
+
+			// One or more namespaces have not been restored, but
+			// we can't destroy the current system thread, because
+			// a child process is execited with Pdeathsig.
+			log.Debugf("Block the current system thread due to: %s", err)
+			c := make(chan any)
+			<-c
+		}
+	}()
+	return <-errChan
+}
+
+func startInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) ([]func() error, error) {
 	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
 
+	var deferFuncs []func() error
 	for _, ns := range nss {
 		if ns.Path == "" {
 			// No path.  Just set a flag to create a new namespace.
@@ -170,12 +178,16 @@ func StartInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
 		// before exiting.
 		restoreNS, err := ApplyNS(ns)
 		if err != nil {
-			return err
+			return deferFuncs, err
 		}
-		defer restoreNS()
+		deferFuncs = append(deferFuncs, restoreNS)
 	}
 
-	return cmd.Start()
+	err := cmd.Start()
+	if err != nil && cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWUSER != 0 {
+		err = fmt.Errorf("%v: check whether /proc/sys/user/max_user_namespaces is set too low (gvisor.dev/issue/5964)", err)
+	}
+	return deferFuncs, err
 }
 
 // SetUIDGIDMappings sets the given uid/gid mappings from the spec on the cmd.
@@ -184,7 +196,7 @@ func SetUIDGIDMappings(cmd *exec.Cmd, s *specs.Spec) {
 		return
 	}
 	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
 	for _, idMap := range s.Linux.UIDMappings {
 		log.Infof("Mapping host uid %d to container uid %d (size=%d)", idMap.HostID, idMap.ContainerID, idMap.Size)
@@ -240,8 +252,8 @@ func MaybeRunAsRoot() error {
 
 	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+	cmd.SysProcAttr = &unix.SysProcAttr{
+		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
 		// Set current user/group as root inside the namespace. Since we may not
 		// have CAP_SETUID/CAP_SETGID, just map root to the current user/group.
 		UidMappings: []syscall.SysProcIDMap{
@@ -252,13 +264,34 @@ func MaybeRunAsRoot() error {
 		},
 		Credential:                 &syscall.Credential{Uid: 0, Gid: 0},
 		GidMappingsEnableSetgroups: false,
+
+		// Make sure child is killed when the parent terminates.
+		Pdeathsig: unix.SIGKILL,
+
+		// Detach from session. Otherwise, signals sent to the foreground process
+		// will also be forwarded by this process, resulting in duplicate signals.
+		Setsid: true,
 	}
 
 	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("re-executing self: %w", err)
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch)
+	go func() {
+		for {
+			// Forward all signals to child process.
+			sig := <-ch
+			if err := cmd.Process.Signal(sig); err != nil {
+				log.Warningf("Error forwarding signal %v to child (PID %d)", sig, cmd.Process.Pid)
+			}
+		}
+	}()
+	if err := cmd.Wait(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			if ws, ok := exit.Sys().(syscall.WaitStatus); ok {
 				os.Exit(ws.ExitStatus())
@@ -266,7 +299,7 @@ func MaybeRunAsRoot() error {
 			log.Warningf("No wait status provided, exiting with -1: %v", err)
 			os.Exit(-1)
 		}
-		return fmt.Errorf("re-executing self: %v", err)
+		return err
 	}
 	// Child completed with success.
 	os.Exit(0)

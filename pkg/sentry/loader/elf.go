@@ -22,16 +22,16 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -41,19 +41,19 @@ const (
 
 	// maxTotalPhdrSize is the maximum combined size of all program
 	// headers.  Linux limits this to one page.
-	maxTotalPhdrSize = usermem.PageSize
+	maxTotalPhdrSize = hostarch.PageSize
 )
 
 var (
 	// header64Size is the size of elf.Header64.
-	header64Size = int(binary.Size(elf.Header64{}))
+	header64Size = (*linux.ElfHeader64)(nil).SizeBytes()
 
 	// Prog64Size is the size of elf.Prog64.
-	prog64Size = int(binary.Size(elf.Prog64{}))
+	prog64Size = (*linux.ElfProg64)(nil).SizeBytes()
 )
 
-func progFlagsAsPerms(f elf.ProgFlag) usermem.AccessType {
-	var p usermem.AccessType
+func progFlagsAsPerms(f elf.ProgFlag) hostarch.AccessType {
+	var p hostarch.AccessType
 	if f&elf.PF_R == elf.PF_R {
 		p.Read = true
 	}
@@ -75,7 +75,7 @@ type elfInfo struct {
 	arch arch.Arch
 
 	// entry is the program entry point.
-	entry usermem.Addr
+	entry hostarch.Addr
 
 	// phdrs are the program headers.
 	phdrs []elf.ProgHeader
@@ -90,14 +90,17 @@ type elfInfo struct {
 	sharedObject bool
 }
 
+type fullReader interface {
+	// ReadFull is the same as vfs.FileDescription.ReadFull.
+	ReadFull(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error)
+}
+
 // parseHeader parse the ELF header, verifying that this is a supported ELF
 // file and returning the ELF program headers.
 //
 // This is similar to elf.NewFile, except that it is more strict about what it
 // accepts from the ELF, and it doesn't parse unnecessary parts of the file.
-//
-// ctx may be nil if f does not need it.
-func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
+func parseHeader(ctx context.Context, f fullReader) (elfInfo, error) {
 	// Check ident first; it will tell us the endianness of the rest of the
 	// structs.
 	var ident [elf.EI_NIDENT]byte
@@ -106,7 +109,7 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 		log.Infof("Error reading ELF ident: %v", err)
 		// The entire ident array always exists.
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			err = syserror.ENOEXEC
+			err = linuxerr.ENOEXEC
 		}
 		return elfInfo{}, err
 	}
@@ -114,39 +117,38 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 	// Only some callers pre-check the ELF magic.
 	if !bytes.Equal(ident[:len(elfMagic)], []byte(elfMagic)) {
 		log.Infof("File is not an ELF")
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 
 	// We only support 64-bit, little endian binaries
 	if class := elf.Class(ident[elf.EI_CLASS]); class != elf.ELFCLASS64 {
 		log.Infof("Unsupported ELF class: %v", class)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 	if endian := elf.Data(ident[elf.EI_DATA]); endian != elf.ELFDATA2LSB {
 		log.Infof("Unsupported ELF endianness: %v", endian)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
-	byteOrder := binary.LittleEndian
 
 	if version := elf.Version(ident[elf.EI_VERSION]); version != elf.EV_CURRENT {
 		log.Infof("Unsupported ELF version: %v", version)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 	// EI_OSABI is ignored by Linux, which is the only OS supported.
 	os := abi.Linux
 
-	var hdr elf.Header64
+	var hdr linux.ElfHeader64
 	hdrBuf := make([]byte, header64Size)
 	_, err = f.ReadFull(ctx, usermem.BytesIOSequence(hdrBuf), 0)
 	if err != nil {
 		log.Infof("Error reading ELF header: %v", err)
 		// The entire header always exists.
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			err = syserror.ENOEXEC
+			err = linuxerr.ENOEXEC
 		}
 		return elfInfo{}, err
 	}
-	binary.Unmarshal(hdrBuf, byteOrder, &hdr)
+	hdr.UnmarshalUnsafe(hdrBuf)
 
 	// We support amd64 and arm64.
 	var a arch.Arch
@@ -157,7 +159,7 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 		a = arch.ARM64
 	default:
 		log.Infof("Unsupported ELF machine %d", machine)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 
 	var sharedObject bool
@@ -169,21 +171,25 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 		sharedObject = true
 	default:
 		log.Infof("Unsupported ELF type %v", elfType)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 
 	if int(hdr.Phentsize) != prog64Size {
 		log.Infof("Unsupported phdr size %d", hdr.Phentsize)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 	totalPhdrSize := prog64Size * int(hdr.Phnum)
 	if totalPhdrSize < prog64Size {
 		log.Warningf("No phdrs or total phdr size overflows: prog64Size: %d phnum: %d", prog64Size, int(hdr.Phnum))
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 	if totalPhdrSize > maxTotalPhdrSize {
 		log.Infof("Too many phdrs (%d): total size %d > %d", hdr.Phnum, totalPhdrSize, maxTotalPhdrSize)
-		return elfInfo{}, syserror.ENOEXEC
+		return elfInfo{}, linuxerr.ENOEXEC
+	}
+	if int64(hdr.Phoff) < 0 || int64(hdr.Phoff+uint64(totalPhdrSize)) < 0 {
+		ctx.Infof("Unsupported phdr offset %d", hdr.Phoff)
+		return elfInfo{}, linuxerr.ENOEXEC
 	}
 
 	phdrBuf := make([]byte, totalPhdrSize)
@@ -192,16 +198,15 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 		log.Infof("Error reading ELF phdrs: %v", err)
 		// If phdrs were specified, they should all exist.
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			err = syserror.ENOEXEC
+			err = linuxerr.ENOEXEC
 		}
 		return elfInfo{}, err
 	}
 
 	phdrs := make([]elf.ProgHeader, hdr.Phnum)
 	for i := range phdrs {
-		var prog64 elf.Prog64
-		binary.Unmarshal(phdrBuf[:prog64Size], byteOrder, &prog64)
-		phdrBuf = phdrBuf[prog64Size:]
+		var prog64 linux.ElfProg64
+		phdrBuf = prog64.UnmarshalUnsafe(phdrBuf)
 		phdrs[i] = elf.ProgHeader{
 			Type:   elf.ProgType(prog64.Type),
 			Flags:  elf.ProgFlag(prog64.Flags),
@@ -217,7 +222,7 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 	return elfInfo{
 		os:           os,
 		arch:         a,
-		entry:        usermem.Addr(hdr.Entry),
+		entry:        hostarch.Addr(hdr.Entry),
 		phdrs:        phdrs,
 		phdrOff:      hdr.Phoff,
 		phdrSize:     prog64Size,
@@ -227,27 +232,27 @@ func parseHeader(ctx context.Context, f fsbridge.File) (elfInfo, error) {
 
 // mapSegment maps a phdr into the Task. offset is the offset to apply to
 // phdr.Vaddr.
-func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr *elf.ProgHeader, offset usermem.Addr) error {
+func mapSegment(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescription, phdr *elf.ProgHeader, offset hostarch.Addr) error {
 	// We must make a page-aligned mapping.
-	adjust := usermem.Addr(phdr.Vaddr).PageOffset()
+	adjust := hostarch.Addr(phdr.Vaddr).PageOffset()
 
 	addr, ok := offset.AddLength(phdr.Vaddr)
 	if !ok {
 		// If offset != 0 we should have ensured this would fit.
 		ctx.Warningf("Computed segment load address overflows: %#x + %#x", phdr.Vaddr, offset)
-		return syserror.ENOEXEC
+		return linuxerr.ENOEXEC
 	}
-	addr -= usermem.Addr(adjust)
+	addr -= hostarch.Addr(adjust)
 
 	fileSize := phdr.Filesz + adjust
 	if fileSize < phdr.Filesz {
 		ctx.Infof("Computed segment file size overflows: %#x + %#x", phdr.Filesz, adjust)
-		return syserror.ENOEXEC
+		return linuxerr.ENOEXEC
 	}
-	ms, ok := usermem.Addr(fileSize).RoundUp()
+	ms, ok := hostarch.Addr(fileSize).RoundUp()
 	if !ok {
 		ctx.Infof("fileSize %#x too large", fileSize)
-		return syserror.ENOEXEC
+		return linuxerr.ENOEXEC
 	}
 	mapSize := uint64(ms)
 
@@ -268,14 +273,14 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr 
 			Unmap:    true,
 			Private:  true,
 			Perms:    prot,
-			MaxPerms: usermem.AnyAccess,
+			MaxPerms: hostarch.AnyAccess,
 		}
 		defer func() {
 			if mopts.MappingIdentity != nil {
-				mopts.MappingIdentity.DecRef()
+				mopts.MappingIdentity.DecRef(ctx)
 			}
 		}()
-		if err := f.ConfigureMMap(ctx, &mopts); err != nil {
+		if err := fd.ConfigureMMap(ctx, &mopts); err != nil {
 			ctx.Infof("File is not memory-mappable: %v", err)
 			return err
 		}
@@ -299,7 +304,7 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr 
 				panic(fmt.Sprintf("zeroSize too big? %#x", uint64(zeroSize)))
 			}
 			if _, err := m.ZeroOut(ctx, zeroAddr, zeroSize, usermem.IOOpts{IgnorePermissions: true}); err != nil {
-				ctx.Warningf("Failed to zero end of page [%#x, %#x): %v", zeroAddr, zeroAddr+usermem.Addr(zeroSize), err)
+				ctx.Warningf("Failed to zero end of page [%#x, %#x): %v", zeroAddr, zeroAddr+hostarch.Addr(zeroSize), err)
 				return err
 			}
 		}
@@ -308,7 +313,7 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr 
 	memSize := phdr.Memsz + adjust
 	if memSize < phdr.Memsz {
 		ctx.Infof("Computed segment mem size overflows: %#x + %#x", phdr.Memsz, adjust)
-		return syserror.ENOEXEC
+		return linuxerr.ENOEXEC
 	}
 
 	// Allocate more anonymous pages if necessary.
@@ -317,16 +322,16 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr 
 		if !ok {
 			panic(fmt.Sprintf("anonymous memory doesn't fit in pre-sized range? %#x + %#x", addr, mapSize))
 		}
-		anonSize, ok := usermem.Addr(memSize - mapSize).RoundUp()
+		anonSize, ok := hostarch.Addr(memSize - mapSize).RoundUp()
 		if !ok {
 			ctx.Infof("extra anon pages too large: %#x", memSize-mapSize)
-			return syserror.ENOEXEC
+			return linuxerr.ENOEXEC
 		}
 
 		// N.B. Linux uses vm_brk_flags to map these pages, which only
 		// honors the X bit, always mapping at least RW. ignoring These
 		// pages are not included in the final brk region.
-		prot := usermem.ReadWrite
+		prot := hostarch.ReadWrite
 		if phdr.Flags&elf.PF_X == elf.PF_X {
 			prot.Execute = true
 		}
@@ -339,7 +344,7 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, phdr 
 			Fixed:    true,
 			Private:  true,
 			Perms:    prot,
-			MaxPerms: usermem.AnyAccess,
+			MaxPerms: hostarch.AnyAccess,
 		}); err != nil {
 			ctx.Infof("Error mapping PT_LOAD segment %v anonymous memory: %v", phdr, err)
 			return err
@@ -358,19 +363,19 @@ type loadedELF struct {
 	arch arch.Arch
 
 	// entry is the entry point of the ELF.
-	entry usermem.Addr
+	entry hostarch.Addr
 
 	// start is the end of the ELF.
-	start usermem.Addr
+	start hostarch.Addr
 
 	// end is the end of the ELF.
-	end usermem.Addr
+	end hostarch.Addr
 
 	// interpter is the path to the ELF interpreter.
 	interpreter string
 
 	// phdrAddr is the address of the ELF program headers.
-	phdrAddr usermem.Addr
+	phdrAddr hostarch.Addr
 
 	// phdrSize is the size of a single program header in the ELF.
 	phdrSize int
@@ -379,11 +384,11 @@ type loadedELF struct {
 	phdrNum int
 
 	// auxv contains a subset of ELF-specific auxiliary vector entries:
-	// * AT_PHDR
-	// * AT_PHENT
-	// * AT_PHNUM
-	// * AT_BASE
-	// * AT_ENTRY
+	//	* AT_PHDR
+	//	* AT_PHENT
+	//	* AT_PHNUM
+	//	* AT_BASE
+	//	* AT_ENTRY
 	auxv arch.Auxv
 }
 
@@ -393,16 +398,15 @@ type loadedELF struct {
 //
 // It does not load the ELF interpreter, or return any auxv entries.
 //
-// Preconditions:
-//  * f is an ELF file
-func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, info elfInfo, sharedLoadOffset usermem.Addr) (loadedELF, error) {
+// Preconditions: f is an ELF file.
+func loadParsedELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescription, info elfInfo, sharedLoadOffset hostarch.Addr) (loadedELF, error) {
 	first := true
-	var start, end usermem.Addr
+	var start, end hostarch.Addr
 	var interpreter string
 	for _, phdr := range info.phdrs {
 		switch phdr.Type {
 		case elf.PT_LOAD:
-			vaddr := usermem.Addr(phdr.Vaddr)
+			vaddr := hostarch.Addr(phdr.Vaddr)
 			if first {
 				first = false
 				start = vaddr
@@ -411,36 +415,40 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 				// NOTE(b/37474556): Linux allows out-of-order
 				// segments, in violation of the spec.
 				ctx.Infof("PT_LOAD headers out-of-order. %#x < %#x", vaddr, end)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 			var ok bool
 			end, ok = vaddr.AddLength(phdr.Memsz)
 			if !ok {
 				ctx.Infof("PT_LOAD header size overflows. %#x + %#x", vaddr, phdr.Memsz)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 
 		case elf.PT_INTERP:
 			if phdr.Filesz < 2 {
 				ctx.Infof("PT_INTERP path too small: %v", phdr.Filesz)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 			if phdr.Filesz > linux.PATH_MAX {
 				ctx.Infof("PT_INTERP path too big: %v", phdr.Filesz)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
+			}
+			if int64(phdr.Off) < 0 || int64(phdr.Off+phdr.Filesz) < 0 {
+				ctx.Infof("Unsupported PT_INTERP offset %d", phdr.Off)
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 
 			path := make([]byte, phdr.Filesz)
-			_, err := f.ReadFull(ctx, usermem.BytesIOSequence(path), int64(phdr.Off))
+			_, err := fd.ReadFull(ctx, usermem.BytesIOSequence(path), int64(phdr.Off))
 			if err != nil {
 				// If an interpreter was specified, it should exist.
 				ctx.Infof("Error reading PT_INTERP path: %v", err)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 
 			if path[len(path)-1] != 0 {
 				ctx.Infof("PT_INTERP path not NUL-terminated: %v", path)
-				return loadedELF{}, syserror.ENOEXEC
+				return loadedELF{}, linuxerr.ENOEXEC
 			}
 
 			// Strip NUL-terminator and everything beyond from
@@ -461,7 +469,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 				// the open path would return a different
 				// error.
 				ctx.Infof("PT_INTERP path is empty: %v", path)
-				return loadedELF{}, syserror.EACCES
+				return loadedELF{}, linuxerr.EACCES
 			}
 		}
 	}
@@ -476,13 +484,13 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 	// Note that the vaddr of the first PT_LOAD segment is ignored when
 	// choosing the load address (even if it is non-zero). The vaddr does
 	// become an offset from that load address.
-	var offset usermem.Addr
+	var offset hostarch.Addr
 	if info.sharedObject {
 		totalSize := end - start
 		totalSize, ok := totalSize.RoundUp()
 		if !ok {
 			ctx.Infof("ELF PT_LOAD segments too big")
-			return loadedELF{}, syserror.ENOEXEC
+			return loadedELF{}, linuxerr.ENOEXEC
 		}
 
 		var err error
@@ -501,12 +509,14 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 
 		start, ok = start.AddLength(uint64(offset))
 		if !ok {
-			panic(fmt.Sprintf("Start %#x + offset %#x overflows?", start, offset))
+			ctx.Infof(fmt.Sprintf("Start %#x + offset %#x overflows?", start, offset))
+			return loadedELF{}, linuxerr.EINVAL
 		}
 
 		end, ok = end.AddLength(uint64(offset))
 		if !ok {
-			panic(fmt.Sprintf("End %#x + offset %#x overflows?", end, offset))
+			ctx.Infof(fmt.Sprintf("End %#x + offset %#x overflows?", end, offset))
+			return loadedELF{}, linuxerr.EINVAL
 		}
 
 		info.entry, ok = info.entry.AddLength(uint64(offset))
@@ -526,7 +536,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 				continue
 			}
 
-			if err := mapSegment(ctx, m, f, &phdr, offset); err != nil {
+			if err := mapSegment(ctx, m, fd, &phdr, offset); err != nil {
 				ctx.Infof("Failed to map PT_LOAD segment: %+v", phdr)
 				return loadedELF{}, err
 			}
@@ -557,15 +567,15 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, in
 
 // loadInitialELF loads f into mm.
 //
-// It creates an arch.Context for the ELF and prepares the mm for this arch.
+// It creates an arch.Context64 for the ELF and prepares the mm for this arch.
 //
 // It does not load the ELF interpreter, or return any auxv entries.
 //
 // Preconditions:
-//  * f is an ELF file
-//  * f is the first ELF loaded into m
-func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs *cpuid.FeatureSet, f fsbridge.File) (loadedELF, arch.Context, error) {
-	info, err := parseHeader(ctx, f)
+//   - f is an ELF file.
+//   - f is the first ELF loaded into m.
+func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs cpuid.FeatureSet, fd *vfs.FileDescription) (loadedELF, *arch.Context64, error) {
+	info, err := parseHeader(ctx, fd)
 	if err != nil {
 		ctx.Infof("Failed to parse initial ELF: %v", err)
 		return loadedELF{}, nil, err
@@ -574,12 +584,12 @@ func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs *cpuid.FeatureS
 	// Check Image Compatibility.
 	if arch.Host != info.arch {
 		ctx.Warningf("Found mismatch for platform %s with ELF type %s", arch.Host.String(), info.arch.String())
-		return loadedELF{}, nil, syserror.ENOEXEC
+		return loadedELF{}, nil, linuxerr.ENOEXEC
 	}
 
-	// Create the arch.Context now so we can prepare the mmap layout before
+	// Create the arch.Context64 now so we can prepare the mmap layout before
 	// mapping anything.
-	ac := arch.New(info.arch, fs)
+	ac := arch.New(info.arch)
 
 	l, err := m.SetMmapLayout(ac, limits.FromContext(ctx))
 	if err != nil {
@@ -590,7 +600,7 @@ func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs *cpuid.FeatureS
 	// PIELoadAddress tries to move the ELF out of the way of the default
 	// mmap base to ensure that the initial brk has sufficient space to
 	// grow.
-	le, err := loadParsedELF(ctx, m, f, info, ac.PIELoadAddress(l))
+	le, err := loadParsedELF(ctx, m, fd, info, ac.PIELoadAddress(l))
 	return le, ac, err
 }
 
@@ -600,30 +610,29 @@ func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs *cpuid.FeatureS
 //
 // It does not return any auxv entries.
 //
-// Preconditions:
-//  * f is an ELF file
-func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.File, initial loadedELF) (loadedELF, error) {
-	info, err := parseHeader(ctx, f)
+// Preconditions: f is an ELF file.
+func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescription, initial loadedELF) (loadedELF, error) {
+	info, err := parseHeader(ctx, fd)
 	if err != nil {
-		if err == syserror.ENOEXEC {
+		if linuxerr.Equals(linuxerr.ENOEXEC, err) {
 			// Bad interpreter.
-			err = syserror.ELIBBAD
+			err = linuxerr.ELIBBAD
 		}
 		return loadedELF{}, err
 	}
 
 	if info.os != initial.os {
 		ctx.Infof("Initial ELF OS %v and interpreter ELF OS %v differ", initial.os, info.os)
-		return loadedELF{}, syserror.ELIBBAD
+		return loadedELF{}, linuxerr.ELIBBAD
 	}
 	if info.arch != initial.arch {
 		ctx.Infof("Initial ELF arch %v and interpreter ELF arch %v differ", initial.arch, info.arch)
-		return loadedELF{}, syserror.ELIBBAD
+		return loadedELF{}, linuxerr.ELIBBAD
 	}
 
 	// The interpreter is not given a load offset, as its location does not
 	// affect brk.
-	return loadParsedELF(ctx, m, f, info, 0)
+	return loadParsedELF(ctx, m, fd, info, 0)
 }
 
 // loadELF loads args.File into the Task address space.
@@ -631,9 +640,8 @@ func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, f fsbridge.Fil
 // If loadELF returns ErrSwitchFile it should be called again with the returned
 // path and argv.
 //
-// Preconditions:
-//  * args.File is an ELF file
-func loadELF(ctx context.Context, args LoadArgs) (loadedELF, arch.Context, error) {
+// Preconditions: args.File is an ELF file.
+func loadELF(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, error) {
 	bin, ac, err := loadInitialELF(ctx, args.MemoryManager, args.Features, args.File)
 	if err != nil {
 		ctx.Infof("Error loading binary: %v", err)
@@ -654,7 +662,7 @@ func loadELF(ctx context.Context, args LoadArgs) (loadedELF, arch.Context, error
 			ctx.Infof("Error opening interpreter %s: %v", bin.interpreter, err)
 			return loadedELF{}, nil, err
 		}
-		defer intFile.DecRef()
+		defer intFile.DecRef(ctx)
 
 		interp, err = loadInterpreterELF(ctx, args.MemoryManager, intFile, bin)
 		if err != nil {
@@ -665,15 +673,15 @@ func loadELF(ctx context.Context, args LoadArgs) (loadedELF, arch.Context, error
 		if interp.interpreter != "" {
 			// No recursive interpreters!
 			ctx.Infof("Interpreter requires an interpreter")
-			return loadedELF{}, nil, syserror.ENOEXEC
+			return loadedELF{}, nil, linuxerr.ENOEXEC
 		}
 	}
 
 	// ELF-specific auxv entries.
 	bin.auxv = arch.Auxv{
 		arch.AuxEntry{linux.AT_PHDR, bin.phdrAddr},
-		arch.AuxEntry{linux.AT_PHENT, usermem.Addr(bin.phdrSize)},
-		arch.AuxEntry{linux.AT_PHNUM, usermem.Addr(bin.phdrNum)},
+		arch.AuxEntry{linux.AT_PHENT, hostarch.Addr(bin.phdrSize)},
+		arch.AuxEntry{linux.AT_PHNUM, hostarch.Addr(bin.phdrNum)},
 		arch.AuxEntry{linux.AT_ENTRY, bin.entry},
 	}
 	if bin.interpreter != "" {

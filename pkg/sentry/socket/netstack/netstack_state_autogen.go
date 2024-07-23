@@ -3,54 +3,101 @@
 package netstack
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *SocketOperations) beforeSave() {}
-func (x *SocketOperations) save(m state.Map) {
-	x.beforeSave()
-	m.Save("SendReceiveTimeout", &x.SendReceiveTimeout)
-	m.Save("Queue", &x.Queue)
-	m.Save("family", &x.family)
-	m.Save("Endpoint", &x.Endpoint)
-	m.Save("skType", &x.skType)
-	m.Save("protocol", &x.protocol)
-	m.Save("readView", &x.readView)
-	m.Save("readCM", &x.readCM)
-	m.Save("sender", &x.sender)
-	m.Save("sockOptTimestamp", &x.sockOptTimestamp)
-	m.Save("timestampValid", &x.timestampValid)
-	m.Save("timestampNS", &x.timestampNS)
-	m.Save("sockOptInq", &x.sockOptInq)
+func (s *sock) StateTypeName() string {
+	return "pkg/sentry/socket/netstack.sock"
 }
 
-func (x *SocketOperations) afterLoad() {}
-func (x *SocketOperations) load(m state.Map) {
-	m.Load("SendReceiveTimeout", &x.SendReceiveTimeout)
-	m.Load("Queue", &x.Queue)
-	m.Load("family", &x.family)
-	m.Load("Endpoint", &x.Endpoint)
-	m.Load("skType", &x.skType)
-	m.Load("protocol", &x.protocol)
-	m.Load("readView", &x.readView)
-	m.Load("readCM", &x.readCM)
-	m.Load("sender", &x.sender)
-	m.Load("sockOptTimestamp", &x.sockOptTimestamp)
-	m.Load("timestampValid", &x.timestampValid)
-	m.Load("timestampNS", &x.timestampNS)
-	m.Load("sockOptInq", &x.sockOptInq)
+func (s *sock) StateFields() []string {
+	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"LockFD",
+		"SendReceiveTimeout",
+		"Queue",
+		"family",
+		"Endpoint",
+		"skType",
+		"protocol",
+		"namespace",
+		"sockOptTimestamp",
+		"timestampValid",
+		"timestamp",
+		"sockOptInq",
+	}
 }
 
-func (x *Stack) beforeSave() {}
-func (x *Stack) save(m state.Map) {
-	x.beforeSave()
+func (s *sock) beforeSave() {}
+
+// +checklocksignore
+func (s *sock) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var timestampValue int64
+	timestampValue = s.saveTimestamp()
+	stateSinkObject.SaveValue(13, timestampValue)
+	stateSinkObject.Save(0, &s.vfsfd)
+	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &s.LockFD)
+	stateSinkObject.Save(4, &s.SendReceiveTimeout)
+	stateSinkObject.Save(5, &s.Queue)
+	stateSinkObject.Save(6, &s.family)
+	stateSinkObject.Save(7, &s.Endpoint)
+	stateSinkObject.Save(8, &s.skType)
+	stateSinkObject.Save(9, &s.protocol)
+	stateSinkObject.Save(10, &s.namespace)
+	stateSinkObject.Save(11, &s.sockOptTimestamp)
+	stateSinkObject.Save(12, &s.timestampValid)
+	stateSinkObject.Save(14, &s.sockOptInq)
 }
 
-func (x *Stack) load(m state.Map) {
-	m.AfterLoad(x.afterLoad)
+func (s *sock) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (s *sock) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.vfsfd)
+	stateSourceObject.Load(1, &s.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &s.LockFD)
+	stateSourceObject.Load(4, &s.SendReceiveTimeout)
+	stateSourceObject.Load(5, &s.Queue)
+	stateSourceObject.Load(6, &s.family)
+	stateSourceObject.Load(7, &s.Endpoint)
+	stateSourceObject.Load(8, &s.skType)
+	stateSourceObject.Load(9, &s.protocol)
+	stateSourceObject.Load(10, &s.namespace)
+	stateSourceObject.Load(11, &s.sockOptTimestamp)
+	stateSourceObject.Load(12, &s.timestampValid)
+	stateSourceObject.Load(14, &s.sockOptInq)
+	stateSourceObject.LoadValue(13, new(int64), func(y any) { s.loadTimestamp(ctx, y.(int64)) })
+}
+
+func (s *Stack) StateTypeName() string {
+	return "pkg/sentry/socket/netstack.Stack"
+}
+
+func (s *Stack) StateFields() []string {
+	return []string{}
+}
+
+func (s *Stack) beforeSave() {}
+
+// +checklocksignore
+func (s *Stack) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+}
+
+// +checklocksignore
+func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
 }
 
 func init() {
-	state.Register("pkg/sentry/socket/netstack.SocketOperations", (*SocketOperations)(nil), state.Fns{Save: (*SocketOperations).save, Load: (*SocketOperations).load})
-	state.Register("pkg/sentry/socket/netstack.Stack", (*Stack)(nil), state.Fns{Save: (*Stack).save, Load: (*Stack).load})
+	state.Register((*sock)(nil))
+	state.Register((*Stack)(nil))
 }

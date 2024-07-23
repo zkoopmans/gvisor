@@ -21,9 +21,10 @@ func (messageElementMapper) linkerFor(elem *message) *message { return elem }
 // The zero value for List is an empty list ready to use.
 //
 // To iterate over a list (where l is a List):
-//      for e := l.Front(); e != nil; e = e.Next() {
-// 		// do something with e.
-//      }
+//
+//	for e := l.Front(); e != nil; e = e.Next() {
+//		// do something with e.
+//	}
 //
 // +stateify savable
 type messageList struct {
@@ -38,25 +39,45 @@ func (l *messageList) Reset() {
 }
 
 // Empty returns true iff the list is empty.
+//
+//go:nosplit
 func (l *messageList) Empty() bool {
 	return l.head == nil
 }
 
 // Front returns the first element of list l or nil.
+//
+//go:nosplit
 func (l *messageList) Front() *message {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
+//
+//go:nosplit
 func (l *messageList) Back() *message {
 	return l.tail
 }
 
-// PushFront inserts the element e at the front of list l.
-func (l *messageList) PushFront(e *message) {
-	messageElementMapper{}.linkerFor(e).SetNext(l.head)
-	messageElementMapper{}.linkerFor(e).SetPrev(nil)
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+//
+//go:nosplit
+func (l *messageList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (messageElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
 
+// PushFront inserts the element e at the front of list l.
+//
+//go:nosplit
+func (l *messageList) PushFront(e *message) {
+	linker := messageElementMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
 		messageElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -66,11 +87,30 @@ func (l *messageList) PushFront(e *message) {
 	l.head = e
 }
 
-// PushBack inserts the element e at the back of list l.
-func (l *messageList) PushBack(e *message) {
-	messageElementMapper{}.linkerFor(e).SetNext(nil)
-	messageElementMapper{}.linkerFor(e).SetPrev(l.tail)
+// PushFrontList inserts list m at the start of list l, emptying m.
+//
+//go:nosplit
+func (l *messageList) PushFrontList(m *messageList) {
+	if l.head == nil {
+		l.head = m.head
+		l.tail = m.tail
+	} else if m.head != nil {
+		messageElementMapper{}.linkerFor(l.head).SetPrev(m.tail)
+		messageElementMapper{}.linkerFor(m.tail).SetNext(l.head)
 
+		l.head = m.head
+	}
+	m.head = nil
+	m.tail = nil
+}
+
+// PushBack inserts the element e at the back of list l.
+//
+//go:nosplit
+func (l *messageList) PushBack(e *message) {
+	linker := messageElementMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
 		messageElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -81,6 +121,8 @@ func (l *messageList) PushBack(e *message) {
 }
 
 // PushBackList inserts list m at the end of list l, emptying m.
+//
+//go:nosplit
 func (l *messageList) PushBackList(m *messageList) {
 	if l.head == nil {
 		l.head = m.head
@@ -91,17 +133,22 @@ func (l *messageList) PushBackList(m *messageList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
+//
+//go:nosplit
 func (l *messageList) InsertAfter(b, e *message) {
-	a := messageElementMapper{}.linkerFor(b).Next()
-	messageElementMapper{}.linkerFor(e).SetNext(a)
-	messageElementMapper{}.linkerFor(e).SetPrev(b)
-	messageElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := messageElementMapper{}.linkerFor(b)
+	eLinker := messageElementMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
 		messageElementMapper{}.linkerFor(a).SetPrev(e)
@@ -111,11 +158,16 @@ func (l *messageList) InsertAfter(b, e *message) {
 }
 
 // InsertBefore inserts e before a.
+//
+//go:nosplit
 func (l *messageList) InsertBefore(a, e *message) {
-	b := messageElementMapper{}.linkerFor(a).Prev()
-	messageElementMapper{}.linkerFor(e).SetNext(a)
-	messageElementMapper{}.linkerFor(e).SetPrev(b)
-	messageElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := messageElementMapper{}.linkerFor(a)
+	eLinker := messageElementMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
 		messageElementMapper{}.linkerFor(b).SetNext(e)
@@ -125,21 +177,27 @@ func (l *messageList) InsertBefore(a, e *message) {
 }
 
 // Remove removes e from l.
+//
+//go:nosplit
 func (l *messageList) Remove(e *message) {
-	prev := messageElementMapper{}.linkerFor(e).Prev()
-	next := messageElementMapper{}.linkerFor(e).Next()
+	linker := messageElementMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
 		messageElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		messageElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields
@@ -153,21 +211,29 @@ type messageEntry struct {
 }
 
 // Next returns the entry that follows e in the list.
+//
+//go:nosplit
 func (e *messageEntry) Next() *message {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *messageEntry) Prev() *message {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
+//
+//go:nosplit
 func (e *messageEntry) SetNext(elem *message) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *messageEntry) SetPrev(elem *message) {
 	e.prev = elem
 }

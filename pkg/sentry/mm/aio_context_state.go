@@ -14,7 +14,18 @@
 
 package mm
 
+import (
+	"context"
+
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+)
+
 // afterLoad is invoked by stateify.
-func (a *AIOContext) afterLoad() {
-	a.done = make(chan struct{}, 1)
+func (aio *AIOContext) afterLoad(context.Context) {
+	aio.requestReady = make(chan struct{}, 1)
+}
+
+// afterLoad is invoked by stateify.
+func (m *aioMappable) afterLoad(ctx context.Context) {
+	m.mf = pgalloc.MemoryFileFromContext(ctx)
 }

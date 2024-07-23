@@ -17,6 +17,8 @@ package log
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -27,8 +29,8 @@ type jsonLog struct {
 }
 
 // MarshalJSON implements json.Marshaler.MarashalJSON.
-func (lv Level) MarshalJSON() ([]byte, error) {
-	switch lv {
+func (l Level) MarshalJSON() ([]byte, error) {
+	switch l {
 	case Warning:
 		return []byte(`"warning"`), nil
 	case Info:
@@ -36,20 +38,20 @@ func (lv Level) MarshalJSON() ([]byte, error) {
 	case Debug:
 		return []byte(`"debug"`), nil
 	default:
-		return nil, fmt.Errorf("unknown level %v", lv)
+		return nil, fmt.Errorf("unknown level %v", l)
 	}
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON.  It can unmarshal
 // from both string names and integers.
-func (lv *Level) UnmarshalJSON(b []byte) error {
+func (l *Level) UnmarshalJSON(b []byte) error {
 	switch s := string(b); s {
 	case "0", `"warning"`:
-		*lv = Warning
+		*l = Warning
 	case "1", `"info"`:
-		*lv = Info
+		*l = Info
 	case "2", `"debug"`:
-		*lv = Debug
+		*l = Debug
 	default:
 		return fmt.Errorf("unknown level %q", s)
 	}
@@ -58,13 +60,20 @@ func (lv *Level) UnmarshalJSON(b []byte) error {
 
 // JSONEmitter logs messages in json format.
 type JSONEmitter struct {
-	Writer
+	*Writer
 }
 
 // Emit implements Emitter.Emit.
-func (e JSONEmitter) Emit(level Level, timestamp time.Time, format string, v ...interface{}) {
+func (e JSONEmitter) Emit(depth int, level Level, timestamp time.Time, format string, v ...any) {
+	logLine := fmt.Sprintf(format, v...)
+	if _, file, line, ok := runtime.Caller(depth + 1); ok {
+		if slash := strings.LastIndexByte(file, byte('/')); slash >= 0 {
+			file = file[slash+1:] // Trim any directory path from the file.
+		}
+		logLine = fmt.Sprintf("%s:%d] %s", file, line, logLine)
+	}
 	j := jsonLog{
-		Msg:   fmt.Sprintf(format, v...),
+		Msg:   logLine,
 		Level: level,
 		Time:  timestamp,
 	}

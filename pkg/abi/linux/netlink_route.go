@@ -85,6 +85,8 @@ const (
 )
 
 // InterfaceInfoMessage is struct ifinfomsg, from uapi/linux/rtnetlink.h.
+//
+// +marshal
 type InterfaceInfoMessage struct {
 	Family uint8
 	_      uint8
@@ -93,6 +95,9 @@ type InterfaceInfoMessage struct {
 	Flags  uint32
 	Change uint32
 }
+
+// InterfaceInfoMessageSize is the size of InterfaceInfoMessage.
+const InterfaceInfoMessageSize = 16
 
 // Interface flags, from uapi/linux/if.h.
 const (
@@ -163,7 +168,24 @@ const (
 	IFLA_GSO_MAX_SIZE    = 41
 )
 
+// Interface link info attributes, from uapi/linux/if_link.h.
+const (
+	IFLA_INFO_UNSPEC     = 0
+	IFLA_INFO_KIND       = 1
+	IFLA_INFO_DATA       = 2
+	IFLA_INFO_XSTATS     = 3
+	IFLA_INFO_SLAVE_KIND = 4
+	IFLA_INFO_SLAVE_DATA = 5
+)
+
+// Virtuall ethernet attributes, from uapi/linux/veth.h.
+const (
+	VETH_INFO_PEER = 1
+)
+
 // InterfaceAddrMessage is struct ifaddrmsg, from uapi/linux/if_addr.h.
+//
+// +marshal
 type InterfaceAddrMessage struct {
 	Family    uint8
 	PrefixLen uint8
@@ -171,6 +193,9 @@ type InterfaceAddrMessage struct {
 	Scope     uint8
 	Index     uint32
 }
+
+// InterfaceAddrMessageSize is the size of InterfaceAddrMessage.
+const InterfaceAddrMessageSize = 8
 
 // Interface attributes, from uapi/linux/if_addr.h.
 const (
@@ -187,10 +212,14 @@ const (
 
 // Device types, from uapi/linux/if_arp.h.
 const (
+	ARPHRD_NONE     = 65534
+	ARPHRD_ETHER    = 1
 	ARPHRD_LOOPBACK = 772
 )
 
 // RouteMessage is struct rtmsg, from uapi/linux/rtnetlink.h.
+//
+// +marshal
 type RouteMessage struct {
 	Family uint8
 	DstLen uint8
@@ -337,6 +366,8 @@ const (
 
 // RtAttr is the header of optional addition route information, as a netlink
 // attribute. From include/uapi/linux/rtnetlink.h.
+//
+// +marshal
 type RtAttr struct {
 	Len  uint16
 	Type uint16

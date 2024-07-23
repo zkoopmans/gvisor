@@ -107,19 +107,19 @@ func (p Parameters) ComputeTime(nowCycles TSCValue) (int64, bool) {
 // errorAdjust returns a new Parameters struct "adjusted" that satisfies:
 //
 // 1. adjusted.ComputeTime(now) = prevParams.ComputeTime(now)
-//   * i.e., the current time does not jump.
+//   - i.e., the current time does not jump.
 //
 // 2. adjusted.ComputeTime(TSC at next update) = newParams.ComputeTime(TSC at next update)
-//   * i.e., Any error between prevParams and newParams will be corrected over
+//   - i.e., Any error between prevParams and newParams will be corrected over
 //     the course of the next update period.
 //
 // errorAdjust also returns the current clock error.
 //
 // Preconditions:
-// * newParams.BaseCycles >= prevParams.BaseCycles; i.e., TSC must not go
-//   backwards.
-// * newParams.BaseCycles <= now; i.e., the new parameters be computed at or
-//   before now.
+//   - newParams.BaseCycles >= prevParams.BaseCycles; i.e., TSC must not go
+//     backwards.
+//   - newParams.BaseCycles <= now; i.e., the new parameters be computed at or
+//     before now.
 func errorAdjust(prevParams Parameters, newParams Parameters, now TSCValue) (Parameters, ReferenceNS, error) {
 	if newParams.BaseCycles < prevParams.BaseCycles {
 		// Oh dear! Something is very wrong.
@@ -228,12 +228,11 @@ func errorAdjust(prevParams Parameters, newParams Parameters, now TSCValue) (Par
 //
 // The log level is determined by the error severity.
 func logErrorAdjustment(clock ClockID, errorNS ReferenceNS, orig, adjusted Parameters) {
-	fn := log.Debugf
-	if int64(errorNS.Magnitude()) > time.Millisecond.Nanoseconds() {
-		fn = log.Warningf
-	} else if int64(errorNS.Magnitude()) > 10*time.Microsecond.Nanoseconds() {
-		fn = log.Infof
+	magNS := int64(errorNS.Magnitude())
+	if magNS <= time.Millisecond.Nanoseconds() {
+		// Don't log small errors.
+		return
 	}
 
-	fn("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", clock, errorNS, orig.Frequency, adjusted.Frequency)
+	log.Warningf("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", clock, errorNS, orig.Frequency, adjusted.Frequency)
 }

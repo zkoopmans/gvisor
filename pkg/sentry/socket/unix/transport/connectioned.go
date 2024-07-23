@@ -15,19 +15,21 @@
 package transport
 
 import (
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// UniqueIDProvider generates a sequence of unique identifiers useful for,
-// among other things, lock ordering.
-type UniqueIDProvider interface {
-	// UniqueID returns a new unique identifier.
-	UniqueID() uint64
+type locker interface {
+	Lock()
+	Unlock()
+	NestedLock(endpointlockNameIndex)
+	NestedUnlock(endpointlockNameIndex)
 }
 
 // A ConnectingEndpoint is a connectioned unix endpoint that is attempting to
@@ -44,32 +46,33 @@ type ConnectingEndpoint interface {
 
 	// Type returns the socket type, typically either SockStream or
 	// SockSeqpacket. The connection attempt must be aborted if this
-	// value doesn't match the ConnectableEndpoint's type.
+	// value doesn't match the BoundEndpoint's type.
 	Type() linux.SockType
 
 	// GetLocalAddress returns the bound path.
-	GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetLocalAddress() (Address, tcpip.Error)
 
 	// Locker protects the following methods. While locked, only the holder of
 	// the lock can change the return value of the protected methods.
-	sync.Locker
+	locker
 
 	// Connected returns true iff the ConnectingEndpoint is in the connected
 	// state. ConnectingEndpoints can only be connected to a single endpoint,
 	// so the connection attempt must be aborted if this returns true.
 	Connected() bool
 
-	// Listening returns true iff the ConnectingEndpoint is in the listening
-	// state. ConnectingEndpoints cannot make connections while listening, so
-	// the connection attempt must be aborted if this returns true.
-	Listening() bool
+	// ListeningLocked returns true iff the ConnectingEndpoint is in the
+	// listening state. ConnectingEndpoints cannot make connections while
+	// listening, so the connection attempt must be aborted if this returns
+	// true.
+	ListeningLocked() bool
 
 	// WaiterQueue returns a pointer to the endpoint's waiter queue.
 	WaiterQueue() *waiter.Queue
 }
 
 // connectionedEndpoint is a Unix-domain connected or connectable endpoint and implements
-// ConnectingEndpoint, ConnectableEndpoint and tcpip.Endpoint.
+// ConnectingEndpoint, BoundEndpoint and tcpip.Endpoint.
 //
 // connectionedEndpoints must be in connected state in order to transfer data.
 //
@@ -96,7 +99,7 @@ type connectionedEndpoint struct {
 	id uint64
 
 	// idGenerator is used to generate new unique endpoint identifiers.
-	idGenerator UniqueIDProvider
+	idGenerator uniqueid.Provider
 
 	// stype is used by connecting sockets to ensure that they are the
 	// same type. The value is typically either tcpip.SockSeqpacket or
@@ -109,6 +112,12 @@ type connectionedEndpoint struct {
 	//
 	// If nil, then no listen call has been made.
 	acceptedChan chan *connectionedEndpoint `state:".([]*connectionedEndpoint)"`
+
+	// boundSocketFD corresponds to a bound socket on the host filesystem
+	// that may listen and accept incoming connections.
+	//
+	// boundSocketFD is protected by baseEndpoint.mu.
+	boundSocketFD BoundSocketFD
 }
 
 var (
@@ -117,34 +126,33 @@ var (
 )
 
 // NewConnectioned creates a new unbound connectionedEndpoint.
-func NewConnectioned(ctx context.Context, stype linux.SockType, uid UniqueIDProvider) Endpoint {
-	return &connectionedEndpoint{
+func NewConnectioned(ctx context.Context, stype linux.SockType, uid uniqueid.Provider) Endpoint {
+	return newConnectioned(ctx, stype, uid)
+}
+
+func newConnectioned(ctx context.Context, stype linux.SockType, uid uniqueid.Provider) *connectionedEndpoint {
+	ep := &connectionedEndpoint{
 		baseEndpoint: baseEndpoint{Queue: &waiter.Queue{}},
 		id:           uid.UniqueID(),
 		idGenerator:  uid,
 		stype:        stype,
 	}
+
+	ep.ops.InitHandler(ep, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
+	ep.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
+	ep.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
+	return ep
 }
 
 // NewPair allocates a new pair of connected unix-domain connectionedEndpoints.
-func NewPair(ctx context.Context, stype linux.SockType, uid UniqueIDProvider) (Endpoint, Endpoint) {
-	a := &connectionedEndpoint{
-		baseEndpoint: baseEndpoint{Queue: &waiter.Queue{}},
-		id:           uid.UniqueID(),
-		idGenerator:  uid,
-		stype:        stype,
-	}
-	b := &connectionedEndpoint{
-		baseEndpoint: baseEndpoint{Queue: &waiter.Queue{}},
-		id:           uid.UniqueID(),
-		idGenerator:  uid,
-		stype:        stype,
-	}
+func NewPair(ctx context.Context, stype linux.SockType, uid uniqueid.Provider) (Endpoint, Endpoint) {
+	a := newConnectioned(ctx, stype, uid)
+	b := newConnectioned(ctx, stype, uid)
 
-	q1 := &queue{ReaderQueue: a.Queue, WriterQueue: b.Queue, limit: initialLimit}
-	q1.EnableLeakCheck("transport.queue")
-	q2 := &queue{ReaderQueue: b.Queue, WriterQueue: a.Queue, limit: initialLimit}
-	q2.EnableLeakCheck("transport.queue")
+	q1 := &queue{ReaderQueue: a.Queue, WriterQueue: b.Queue, limit: defaultBufferSize}
+	q1.InitRefs()
+	q2 := &queue{ReaderQueue: b.Queue, WriterQueue: a.Queue, limit: defaultBufferSize}
+	q2.InitRefs()
 
 	if stype == linux.SOCK_STREAM {
 		a.receiver = &streamQueueReceiver{queueReceiver: queueReceiver{q1}}
@@ -170,13 +178,17 @@ func NewPair(ctx context.Context, stype linux.SockType, uid UniqueIDProvider) (E
 
 // NewExternal creates a new externally backed Endpoint. It behaves like a
 // socketpair.
-func NewExternal(ctx context.Context, stype linux.SockType, uid UniqueIDProvider, queue *waiter.Queue, receiver Receiver, connected ConnectedEndpoint) Endpoint {
-	return &connectionedEndpoint{
+func NewExternal(stype linux.SockType, uid uniqueid.Provider, queue *waiter.Queue, receiver Receiver, connected ConnectedEndpoint) Endpoint {
+	ep := &connectionedEndpoint{
 		baseEndpoint: baseEndpoint{Queue: queue, receiver: receiver, connected: connected},
 		id:           uid.UniqueID(),
 		idGenerator:  uid,
 		stype:        stype,
 	}
+	ep.ops.InitHandler(ep, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
+	ep.ops.SetSendBufferSize(connected.SendMaxQueueSize(), false /* notify */)
+	ep.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
+	return ep
 }
 
 // ID implements ConnectingEndpoint.ID.
@@ -202,6 +214,12 @@ func (e *connectionedEndpoint) isBound() bool {
 
 // Listening implements ConnectingEndpoint.Listening.
 func (e *connectionedEndpoint) Listening() bool {
+	e.Lock()
+	defer e.Unlock()
+	return e.ListeningLocked()
+}
+
+func (e *connectionedEndpoint) ListeningLocked() bool {
 	return e.acceptedChan != nil
 }
 
@@ -211,10 +229,13 @@ func (e *connectionedEndpoint) Listening() bool {
 // The socket will be a fresh state after a call to close and may be reused.
 // That is, close may be used to "unbind" or "disconnect" the socket in error
 // paths.
-func (e *connectionedEndpoint) Close() {
+func (e *connectionedEndpoint) Close(ctx context.Context) {
+	var acceptedChan chan *connectionedEndpoint
 	e.Lock()
-	var c ConnectedEndpoint
-	var r Receiver
+	var (
+		c ConnectedEndpoint
+		r Receiver
+	)
 	switch {
 	case e.Connected():
 		e.connected.CloseSend()
@@ -230,29 +251,33 @@ func (e *connectionedEndpoint) Close() {
 		e.receiver = nil
 	case e.isBound():
 		e.path = ""
-	case e.Listening():
+	case e.ListeningLocked():
 		close(e.acceptedChan)
-		for n := range e.acceptedChan {
-			n.Close()
-		}
+		acceptedChan = e.acceptedChan
 		e.acceptedChan = nil
 		e.path = ""
 	}
 	e.Unlock()
+	if acceptedChan != nil {
+		for n := range acceptedChan {
+			n.Close(ctx)
+		}
+	}
 	if c != nil {
 		c.CloseNotify()
-		c.Release()
+		c.Release(ctx)
 	}
+	e.ResetBoundSocketFD(ctx)
 	if r != nil {
 		r.CloseNotify()
-		r.Release()
+		r.Release(ctx)
 	}
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
 func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error {
 	if ce.Type() != e.stype {
-		return syserr.ErrConnectionRefused
+		return syserr.ErrWrongProtocolForSocket
 	}
 
 	// Check if ce is e to avoid a deadlock.
@@ -263,27 +288,27 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	// Do a dance to safely acquire locks on both endpoints.
 	if e.id < ce.ID() {
 		e.Lock()
-		ce.Lock()
+		ce.NestedLock(endpointLockHigherid)
 	} else {
 		ce.Lock()
-		e.Lock()
+		e.NestedLock(endpointLockHigherid)
 	}
 
 	// Check connecting state.
 	if ce.Connected() {
-		e.Unlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrAlreadyConnected
 	}
-	if ce.Listening() {
-		e.Unlock()
+	if ce.ListeningLocked() {
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrInvalidEndpointState
 	}
 
 	// Check bound state.
-	if !e.Listening() {
-		e.Unlock()
+	if !e.ListeningLocked() {
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrConnectionRefused
 	}
@@ -298,16 +323,21 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 		idGenerator: e.idGenerator,
 		stype:       e.stype,
 	}
+	ne.ops.InitHandler(ne, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
+	ne.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
+	ne.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
+	ne.SocketOptions().SetPassCred(e.SocketOptions().GetPassCred())
 
-	readQueue := &queue{ReaderQueue: ce.WaiterQueue(), WriterQueue: ne.Queue, limit: initialLimit}
-	readQueue.EnableLeakCheck("transport.queue")
+	readQueue := &queue{ReaderQueue: ce.WaiterQueue(), WriterQueue: ne.Queue, limit: defaultBufferSize}
+	readQueue.InitRefs()
 	ne.connected = &connectedEndpoint{
 		endpoint:   ce,
 		writeQueue: readQueue,
 	}
 
-	writeQueue := &queue{ReaderQueue: ne.Queue, WriterQueue: ce.WaiterQueue(), limit: initialLimit}
-	writeQueue.EnableLeakCheck("transport.queue")
+	// Make sure the accepted endpoint inherits this listening socket's SO_SNDBUF.
+	writeQueue := &queue{ReaderQueue: ne.Queue, WriterQueue: ce.WaiterQueue(), limit: e.ops.GetSendBufferSize()}
+	writeQueue.InitRefs()
 	if e.stype == linux.SOCK_STREAM {
 		ne.receiver = &streamQueueReceiver{queueReceiver: queueReceiver{readQueue: writeQueue}}
 	} else {
@@ -330,20 +360,20 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 		}
 
 		// Notify can deadlock if we are holding these locks.
-		e.Unlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 
 		// Notify on both ends.
-		e.Notify(waiter.EventIn)
-		ce.WaiterQueue().Notify(waiter.EventOut)
+		e.Notify(waiter.ReadableEvents)
+		ce.WaiterQueue().Notify(waiter.WritableEvents)
 
 		return nil
 	default:
-		// Busy; return ECONNREFUSED per spec.
-		ne.Close()
-		e.Unlock()
+		// Busy; return EAGAIN per spec.
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
-		return syserr.ErrConnectionRefused
+		ne.Close(ctx)
+		return syserr.ErrTryAgain
 	}
 }
 
@@ -358,16 +388,22 @@ func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint
 	returnConnect := func(r Receiver, ce ConnectedEndpoint) {
 		e.receiver = r
 		e.connected = ce
+		// Make sure the newly created connected endpoint's write queue is updated
+		// to reflect this endpoint's send buffer size.
+		if bufSz := e.connected.SetSendBufferSize(e.ops.GetSendBufferSize()); bufSz != e.ops.GetSendBufferSize() {
+			e.ops.SetSendBufferSize(bufSz, false /* notify */)
+			e.ops.SetReceiveBufferSize(bufSz, false /* notify */)
+		}
 	}
 
 	return server.BidirectionalConnect(ctx, e, returnConnect)
 }
 
 // Listen starts listening on the connection.
-func (e *connectionedEndpoint) Listen(backlog int) *syserr.Error {
+func (e *connectionedEndpoint) Listen(ctx context.Context, backlog int) *syserr.Error {
 	e.Lock()
 	defer e.Unlock()
-	if e.Listening() {
+	if e.ListeningLocked() {
 		// Adjust the size of the channel iff we can fix existing
 		// pending connections into the new one.
 		if len(e.acceptedChan) > backlog {
@@ -379,6 +415,11 @@ func (e *connectionedEndpoint) Listen(backlog int) *syserr.Error {
 		for ep := range origChan {
 			e.acceptedChan <- ep
 		}
+		if e.boundSocketFD != nil {
+			if err := e.boundSocketFD.Listen(ctx, int32(backlog)); err != nil {
+				return syserr.FromError(err)
+			}
+		}
 		return nil
 	}
 	if !e.isBound() {
@@ -387,26 +428,79 @@ func (e *connectionedEndpoint) Listen(backlog int) *syserr.Error {
 
 	// Normal case.
 	e.acceptedChan = make(chan *connectionedEndpoint, backlog)
+	if e.boundSocketFD != nil {
+		if err := e.boundSocketFD.Listen(ctx, int32(backlog)); err != nil {
+			return syserr.FromError(err)
+		}
+	}
+
 	return nil
 }
 
 // Accept accepts a new connection.
-func (e *connectionedEndpoint) Accept() (Endpoint, *syserr.Error) {
+func (e *connectionedEndpoint) Accept(ctx context.Context, peerAddr *Address) (Endpoint, *syserr.Error) {
 	e.Lock()
-	defer e.Unlock()
 
-	if !e.Listening() {
+	if !e.ListeningLocked() {
+		e.Unlock()
 		return nil, syserr.ErrInvalidEndpointState
 	}
 
+	ne, err := e.getAcceptedEndpointLocked(ctx)
+	e.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	if peerAddr != nil {
+		ne.Lock()
+		c := ne.connected
+		ne.Unlock()
+		if c != nil {
+			addr, err := c.GetLocalAddress()
+			if err != nil {
+				return nil, syserr.TranslateNetstackError(err)
+			}
+			*peerAddr = addr
+		}
+	}
+	return ne, nil
+}
+
+// Preconditions:
+//   - e.Listening()
+//   - e is locked.
+func (e *connectionedEndpoint) getAcceptedEndpointLocked(ctx context.Context) (*connectionedEndpoint, *syserr.Error) {
+	// Accept connections from within the sentry first, since this avoids
+	// an RPC to the gofer on the common path.
 	select {
 	case ne := <-e.acceptedChan:
 		return ne, nil
-
 	default:
-		// Nothing left.
+		// No internal connections.
+	}
+
+	if e.boundSocketFD == nil {
 		return nil, syserr.ErrWouldBlock
 	}
+
+	// Check for external connections.
+	nfd, err := e.boundSocketFD.Accept(ctx)
+	if err == unix.EWOULDBLOCK {
+		return nil, syserr.ErrWouldBlock
+	}
+	if err != nil {
+		return nil, syserr.FromError(err)
+	}
+	q := &waiter.Queue{}
+	scme, serr := NewSCMEndpoint(nfd, q, e.path)
+	if serr != nil {
+		unix.Close(nfd)
+		return nil, serr
+	}
+	scme.Init()
+	return NewExternal(e.stype, e.idGenerator, q, scme, scme).(*connectionedEndpoint), nil
+
 }
 
 // Bind binds the connection.
@@ -417,36 +511,38 @@ func (e *connectionedEndpoint) Accept() (Endpoint, *syserr.Error) {
 //
 // Bind will fail only if the socket is connected, bound or the passed address
 // is invalid (the empty string).
-func (e *connectionedEndpoint) Bind(addr tcpip.FullAddress, commit func() *syserr.Error) *syserr.Error {
+func (e *connectionedEndpoint) Bind(addr Address) *syserr.Error {
 	e.Lock()
 	defer e.Unlock()
-	if e.isBound() || e.Listening() {
+	if e.isBound() || e.ListeningLocked() {
 		return syserr.ErrAlreadyBound
 	}
 	if addr.Addr == "" {
 		// The empty string is not permitted.
 		return syserr.ErrBadLocalAddress
 	}
-	if commit != nil {
-		if err := commit(); err != nil {
-			return err
-		}
-	}
 
 	// Save the bound address.
-	e.path = string(addr.Addr)
+	e.path = addr.Addr
 	return nil
 }
 
 // SendMsg writes data and a control message to the endpoint's peer.
 // This method does not block if the data cannot be written.
-func (e *connectionedEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, *syserr.Error) {
+func (e *connectionedEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, func(), *syserr.Error) {
 	// Stream sockets do not support specifying the endpoint. Seqpacket
 	// sockets ignore the passed endpoint.
 	if e.stype == linux.SOCK_STREAM && to != nil {
-		return 0, syserr.ErrNotSupported
+		return 0, nil, syserr.ErrNotSupported
 	}
 	return e.baseEndpoint.SendMsg(ctx, data, c, to)
+}
+
+func (e *connectionedEndpoint) isBoundSocketReadable() bool {
+	if e.boundSocketFD == nil {
+		return false
+	}
+	return fdnotifier.NonBlockingPoll(e.boundSocketFD.NotificationFD(), waiter.ReadableEvents)&waiter.ReadableEvents != 0
 }
 
 // Readiness returns the current readiness of the connectionedEndpoint. For
@@ -459,15 +555,21 @@ func (e *connectionedEndpoint) Readiness(mask waiter.EventMask) waiter.EventMask
 	ready := waiter.EventMask(0)
 	switch {
 	case e.Connected():
-		if mask&waiter.EventIn != 0 && e.receiver.Readable() {
-			ready |= waiter.EventIn
+		if mask&waiter.ReadableEvents != 0 && e.receiver.Readable() {
+			ready |= waiter.ReadableEvents
 		}
-		if mask&waiter.EventOut != 0 && e.connected.Writable() {
-			ready |= waiter.EventOut
+		if mask&waiter.WritableEvents != 0 && e.connected.Writable() {
+			ready |= waiter.WritableEvents
 		}
-	case e.Listening():
-		if mask&waiter.EventIn != 0 && len(e.acceptedChan) > 0 {
-			ready |= waiter.EventIn
+		if mask&(waiter.EventHUp|waiter.EventRdHUp) != 0 && e.receiver.IsRecvClosed() {
+			ready |= waiter.EventRdHUp
+			if mask&waiter.EventHUp != 0 && e.connected.IsSendClosed() {
+				ready |= waiter.EventHUp
+			}
+		}
+	case e.ListeningLocked():
+		if mask&waiter.ReadableEvents != 0 && (len(e.acceptedChan) > 0 || e.isBoundSocketReadable()) {
+			ready |= waiter.ReadableEvents
 		}
 	}
 
@@ -476,8 +578,80 @@ func (e *connectionedEndpoint) Readiness(mask waiter.EventMask) waiter.EventMask
 
 // State implements socket.Socket.State.
 func (e *connectionedEndpoint) State() uint32 {
+	e.Lock()
+	defer e.Unlock()
+
 	if e.Connected() {
 		return linux.SS_CONNECTED
 	}
 	return linux.SS_UNCONNECTED
+}
+
+// OnSetSendBufferSize implements tcpip.SocketOptionsHandler.OnSetSendBufferSize.
+func (e *connectionedEndpoint) OnSetSendBufferSize(v int64) (newSz int64) {
+	e.Lock()
+	defer e.Unlock()
+	if e.Connected() {
+		return e.baseEndpoint.connected.SetSendBufferSize(v)
+	}
+	return v
+}
+
+// WakeupWriters implements tcpip.SocketOptionsHandler.WakeupWriters.
+func (e *connectionedEndpoint) WakeupWriters() {}
+
+// SetBoundSocketFD implement HostBountEndpoint.SetBoundSocketFD.
+func (e *connectionedEndpoint) SetBoundSocketFD(ctx context.Context, bsFD BoundSocketFD) error {
+	e.Lock()
+	defer e.Unlock()
+	if e.path != "" || e.boundSocketFD != nil {
+		bsFD.Close(ctx)
+		return syserr.ErrAlreadyBound.ToError()
+	}
+	e.boundSocketFD = bsFD
+	fdnotifier.AddFD(bsFD.NotificationFD(), e.Queue)
+	return nil
+}
+
+// SetBoundSocketFD implement HostBountEndpoint.ResetBoundSocketFD.
+func (e *connectionedEndpoint) ResetBoundSocketFD(ctx context.Context) {
+	e.Lock()
+	defer e.Unlock()
+	if e.boundSocketFD == nil {
+		return
+	}
+	fdnotifier.RemoveFD(e.boundSocketFD.NotificationFD())
+	e.boundSocketFD.Close(ctx)
+	e.boundSocketFD = nil
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (e *connectionedEndpoint) EventRegister(we *waiter.Entry) error {
+	if err := e.baseEndpoint.EventRegister(we); err != nil {
+		return err
+	}
+
+	e.Lock()
+	bsFD := e.boundSocketFD
+	e.Unlock()
+	if bsFD != nil {
+		fdnotifier.UpdateFD(bsFD.NotificationFD())
+	}
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (e *connectionedEndpoint) EventUnregister(we *waiter.Entry) {
+	e.baseEndpoint.EventUnregister(we)
+
+	e.Lock()
+	bsFD := e.boundSocketFD
+	e.Unlock()
+	if bsFD != nil {
+		fdnotifier.UpdateFD(bsFD.NotificationFD())
+	}
+}
+
+func (e *connectionedEndpoint) GetAcceptConn() bool {
+	return e.Listening()
 }

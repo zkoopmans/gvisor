@@ -15,9 +15,10 @@
 package mm
 
 import (
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
-	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Dumpability describes if and how core dumps should be created.
@@ -38,29 +39,25 @@ const (
 
 // Dumpability returns the dumpability.
 func (mm *MemoryManager) Dumpability() Dumpability {
-	mm.metadataMu.Lock()
-	defer mm.metadataMu.Unlock()
-	return mm.dumpability
+	return Dumpability(mm.dumpability.Load())
 }
 
 // SetDumpability sets the dumpability.
 func (mm *MemoryManager) SetDumpability(d Dumpability) {
-	mm.metadataMu.Lock()
-	defer mm.metadataMu.Unlock()
-	mm.dumpability = d
+	mm.dumpability.Store(int32(d))
 }
 
 // ArgvStart returns the start of the application argument vector.
 //
 // There is no guarantee that this value is sensible w.r.t. ArgvEnd.
-func (mm *MemoryManager) ArgvStart() usermem.Addr {
+func (mm *MemoryManager) ArgvStart() hostarch.Addr {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	return mm.argv.Start
 }
 
 // SetArgvStart sets the start of the application argument vector.
-func (mm *MemoryManager) SetArgvStart(a usermem.Addr) {
+func (mm *MemoryManager) SetArgvStart(a hostarch.Addr) {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	mm.argv.Start = a
@@ -69,14 +66,14 @@ func (mm *MemoryManager) SetArgvStart(a usermem.Addr) {
 // ArgvEnd returns the end of the application argument vector.
 //
 // There is no guarantee that this value is sensible w.r.t. ArgvStart.
-func (mm *MemoryManager) ArgvEnd() usermem.Addr {
+func (mm *MemoryManager) ArgvEnd() hostarch.Addr {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	return mm.argv.End
 }
 
 // SetArgvEnd sets the end of the application argument vector.
-func (mm *MemoryManager) SetArgvEnd(a usermem.Addr) {
+func (mm *MemoryManager) SetArgvEnd(a hostarch.Addr) {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	mm.argv.End = a
@@ -85,14 +82,14 @@ func (mm *MemoryManager) SetArgvEnd(a usermem.Addr) {
 // EnvvStart returns the start of the application environment vector.
 //
 // There is no guarantee that this value is sensible w.r.t. EnvvEnd.
-func (mm *MemoryManager) EnvvStart() usermem.Addr {
+func (mm *MemoryManager) EnvvStart() hostarch.Addr {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	return mm.envv.Start
 }
 
 // SetEnvvStart sets the start of the application environment vector.
-func (mm *MemoryManager) SetEnvvStart(a usermem.Addr) {
+func (mm *MemoryManager) SetEnvvStart(a hostarch.Addr) {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	mm.envv.Start = a
@@ -101,14 +98,14 @@ func (mm *MemoryManager) SetEnvvStart(a usermem.Addr) {
 // EnvvEnd returns the end of the application environment vector.
 //
 // There is no guarantee that this value is sensible w.r.t. EnvvStart.
-func (mm *MemoryManager) EnvvEnd() usermem.Addr {
+func (mm *MemoryManager) EnvvEnd() hostarch.Addr {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	return mm.envv.End
 }
 
 // SetEnvvEnd sets the end of the application environment vector.
-func (mm *MemoryManager) SetEnvvEnd(a usermem.Addr) {
+func (mm *MemoryManager) SetEnvvEnd(a hostarch.Addr) {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 	mm.envv.End = a
@@ -132,7 +129,7 @@ func (mm *MemoryManager) SetAuxv(auxv arch.Auxv) {
 //
 // An additional reference will be taken in the case of a non-nil executable,
 // which must be released by the caller.
-func (mm *MemoryManager) Executable() fsbridge.File {
+func (mm *MemoryManager) Executable() *vfs.FileDescription {
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 
@@ -147,15 +144,15 @@ func (mm *MemoryManager) Executable() fsbridge.File {
 // SetExecutable sets the executable.
 //
 // This takes a reference on d.
-func (mm *MemoryManager) SetExecutable(file fsbridge.File) {
+func (mm *MemoryManager) SetExecutable(ctx context.Context, fd *vfs.FileDescription) {
 	mm.metadataMu.Lock()
 
 	// Grab a new reference.
-	file.IncRef()
+	fd.IncRef()
 
 	// Set the executable.
 	orig := mm.executable
-	mm.executable = file
+	mm.executable = fd
 
 	mm.metadataMu.Unlock()
 
@@ -164,6 +161,20 @@ func (mm *MemoryManager) SetExecutable(file fsbridge.File) {
 	// Do this without holding the lock, since it may wind up doing some
 	// I/O to sync the dirent, etc.
 	if orig != nil {
-		orig.DecRef()
+		orig.DecRef(ctx)
 	}
+}
+
+// VDSOSigReturn returns the address of vdso_sigreturn.
+func (mm *MemoryManager) VDSOSigReturn() uint64 {
+	mm.metadataMu.Lock()
+	defer mm.metadataMu.Unlock()
+	return mm.vdsoSigReturnAddr
+}
+
+// SetVDSOSigReturn sets the address of vdso_sigreturn.
+func (mm *MemoryManager) SetVDSOSigReturn(addr uint64) {
+	mm.metadataMu.Lock()
+	defer mm.metadataMu.Unlock()
+	mm.vdsoSigReturnAddr = addr
 }

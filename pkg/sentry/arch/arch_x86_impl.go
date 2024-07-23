@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64 i386
+//go:build (amd64 || 386) && !false
+// +build amd64 386
+// +build !false
 
 package arch
 
 import (
-	"syscall"
+	"context"
 
-	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
 // State contains the common architecture bits for X86 (the build tag of this
@@ -28,16 +30,13 @@ import (
 // +stateify savable
 type State struct {
 	// The system registers.
-	Regs syscall.PtraceRegs `state:".(syscallPtraceRegs)"`
+	Regs Registers
 
 	// Our floating point state.
-	x86FPState `state:"wait"`
-
-	// FeatureSet is a pointer to the currently active feature set.
-	FeatureSet *cpuid.FeatureSet
+	fpState fpu.State `state:"wait"`
 }
 
 // afterLoad is invoked by stateify.
-func (s *State) afterLoad() {
+func (s *State) afterLoad(context.Context) {
 	s.afterLoadFPState()
 }

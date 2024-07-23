@@ -1,22 +1,51 @@
 package mm
 
 import (
-	__generics_imported0 "gvisor.dev/gvisor/pkg/usermem"
+	__generics_imported0 "gvisor.dev/gvisor/pkg/hostarch"
 )
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 )
+
+// trackGaps is an optional parameter.
+//
+// If trackGaps is 1, the Set will track maximum gap size recursively,
+// enabling the GapIterator.{Prev,Next}LargeEnoughGap functions. In this
+// case, Key must be an unsigned integer.
+//
+// trackGaps must be 0 or 1.
+const pmatrackGaps = 0
+
+var _ = uint8(pmatrackGaps << 7) // Will fail if not zero or one.
+
+// dynamicGap is a type that disappears if trackGaps is 0.
+type pmadynamicGap [pmatrackGaps]__generics_imported0.Addr
+
+// Get returns the value of the gap.
+//
+// Precondition: trackGaps must be non-zero.
+func (d *pmadynamicGap) Get() __generics_imported0.Addr {
+	return d[:][0]
+}
+
+// Set sets the value of the gap.
+//
+// Precondition: trackGaps must be non-zero.
+func (d *pmadynamicGap) Set(v __generics_imported0.Addr) {
+	d[:][0] = v
+}
 
 const (
 	// minDegree is the minimum degree of an internal node in a Set B-tree.
 	//
-	// - Any non-root node has at least minDegree-1 segments.
+	//	- Any non-root node has at least minDegree-1 segments.
 	//
-	// - Any non-root internal (non-leaf) node has at least minDegree children.
+	//	- Any non-root internal (non-leaf) node has at least minDegree children.
 	//
-	// - The root node may have fewer than minDegree-1 segments, but it may
+	//	- The root node may have fewer than minDegree-1 segments, but it may
 	// only have 0 segments if the tree is empty.
 	//
 	// Our implementation requires minDegree >= 3. Higher values of minDegree
@@ -32,7 +61,7 @@ const (
 //
 // +stateify savable
 type pmaSet struct {
-	root pmanode `state:".(*pmaSegmentDataSlices)"`
+	root pmanode `state:".([]pmaFlatSegment)"`
 }
 
 // IsEmpty returns true if the set contains no segments.
@@ -204,42 +233,68 @@ func (s *pmaSet) UpperBoundGap(max __generics_imported0.Addr) pmaGapIterator {
 	return seg.PrevGap()
 }
 
-// Add inserts the given segment into the set and returns true. If the new
-// segment can be merged with adjacent segments, Add will do so. If the new
-// segment would overlap an existing segment, Add returns false. If Add
-// succeeds, all existing iterators are invalidated.
-func (s *pmaSet) Add(r __generics_imported0.AddrRange, val pma) bool {
-	if r.Length() <= 0 {
-		panic(fmt.Sprintf("invalid segment range %v", r))
+// FirstLargeEnoughGap returns the first gap in the set with at least the given
+// length. If no such gap exists, FirstLargeEnoughGap returns a terminal
+// iterator.
+//
+// Precondition: trackGaps must be 1.
+func (s *pmaSet) FirstLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
 	}
-	gap := s.FindGap(r.Start)
-	if !gap.Ok() {
-		return false
+	gap := s.FirstGap()
+	if gap.Range().Length() >= minSize {
+		return gap
 	}
-	if r.End > gap.End() {
-		return false
-	}
-	s.Insert(gap, r, val)
-	return true
+	return gap.NextLargeEnoughGap(minSize)
 }
 
-// AddWithoutMerging inserts the given segment into the set and returns true.
-// If it would overlap an existing segment, AddWithoutMerging does nothing and
-// returns false. If AddWithoutMerging succeeds, all existing iterators are
-// invalidated.
-func (s *pmaSet) AddWithoutMerging(r __generics_imported0.AddrRange, val pma) bool {
-	if r.Length() <= 0 {
-		panic(fmt.Sprintf("invalid segment range %v", r))
+// LastLargeEnoughGap returns the last gap in the set with at least the given
+// length. If no such gap exists, LastLargeEnoughGap returns a terminal
+// iterator.
+//
+// Precondition: trackGaps must be 1.
+func (s *pmaSet) LastLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
 	}
-	gap := s.FindGap(r.Start)
-	if !gap.Ok() {
-		return false
+	gap := s.LastGap()
+	if gap.Range().Length() >= minSize {
+		return gap
 	}
-	if r.End > gap.End() {
-		return false
+	return gap.PrevLargeEnoughGap(minSize)
+}
+
+// LowerBoundLargeEnoughGap returns the first gap in the set with at least the
+// given length and whose range contains a key greater than or equal to min. If
+// no such gap exists, LowerBoundLargeEnoughGap returns a terminal iterator.
+//
+// Precondition: trackGaps must be 1.
+func (s *pmaSet) LowerBoundLargeEnoughGap(min, minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
 	}
-	s.InsertWithoutMergingUnchecked(gap, r, val)
-	return true
+	gap := s.LowerBoundGap(min)
+	if gap.Range().Length() >= minSize {
+		return gap
+	}
+	return gap.NextLargeEnoughGap(minSize)
+}
+
+// UpperBoundLargeEnoughGap returns the last gap in the set with at least the
+// given length and whose range contains a key less than or equal to max. If no
+// such gap exists, UpperBoundLargeEnoughGap returns a terminal iterator.
+//
+// Precondition: trackGaps must be 1.
+func (s *pmaSet) UpperBoundLargeEnoughGap(max, minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
+	}
+	gap := s.UpperBoundGap(max)
+	if gap.Range().Length() >= minSize {
+		return gap
+	}
+	return gap.PrevLargeEnoughGap(minSize)
 }
 
 // Insert inserts the given segment into the given gap. If the new segment can
@@ -267,8 +322,12 @@ func (s *pmaSet) Insert(gap pmaGapIterator, r __generics_imported0.AddrRange, va
 	}
 	if prev.Ok() && prev.End() == r.Start {
 		if mval, ok := (pmaSetFunctions{}).Merge(prev.Range(), prev.Value(), r, val); ok {
+			shrinkMaxGap := pmatrackGaps != 0 && gap.Range().Length() == gap.node.maxGap.Get()
 			prev.SetEndUnchecked(r.End)
 			prev.SetValue(mval)
+			if shrinkMaxGap {
+				gap.node.updateMaxGapLeaf()
+			}
 			if next.Ok() && next.Start() == r.End {
 				val = mval
 				if mval, ok := (pmaSetFunctions{}).Merge(prev.Range(), val, next.Range(), next.Value()); ok {
@@ -282,11 +341,16 @@ func (s *pmaSet) Insert(gap pmaGapIterator, r __generics_imported0.AddrRange, va
 	}
 	if next.Ok() && next.Start() == r.End {
 		if mval, ok := (pmaSetFunctions{}).Merge(r, val, next.Range(), next.Value()); ok {
+			shrinkMaxGap := pmatrackGaps != 0 && gap.Range().Length() == gap.node.maxGap.Get()
 			next.SetStartUnchecked(r.Start)
 			next.SetValue(mval)
+			if shrinkMaxGap {
+				gap.node.updateMaxGapLeaf()
+			}
 			return next
 		}
 	}
+
 	return s.InsertWithoutMergingUnchecked(gap, r, val)
 }
 
@@ -310,15 +374,122 @@ func (s *pmaSet) InsertWithoutMerging(gap pmaGapIterator, r __generics_imported0
 // and returns an iterator to the inserted segment. All existing iterators
 // (including gap, but not including the returned iterator) are invalidated.
 //
-// Preconditions: r.Start >= gap.Start(); r.End <= gap.End().
+// Preconditions:
+//   - r.Start >= gap.Start().
+//   - r.End <= gap.End().
 func (s *pmaSet) InsertWithoutMergingUnchecked(gap pmaGapIterator, r __generics_imported0.AddrRange, val pma) pmaIterator {
 	gap = gap.node.rebalanceBeforeInsert(gap)
+	splitMaxGap := pmatrackGaps != 0 && (gap.node.nrSegments == 0 || gap.Range().Length() == gap.node.maxGap.Get())
 	copy(gap.node.keys[gap.index+1:], gap.node.keys[gap.index:gap.node.nrSegments])
 	copy(gap.node.values[gap.index+1:], gap.node.values[gap.index:gap.node.nrSegments])
 	gap.node.keys[gap.index] = r
 	gap.node.values[gap.index] = val
 	gap.node.nrSegments++
+	if splitMaxGap {
+		gap.node.updateMaxGapLeaf()
+	}
 	return pmaIterator{gap.node, gap.index}
+}
+
+// InsertRange inserts the given segment into the set. If the new segment can
+// be merged with adjacent segments, InsertRange will do so. InsertRange
+// returns an iterator to the segment containing the inserted value (which may
+// have been merged with other values). All existing iterators (excluding the
+// returned iterator) are invalidated.
+//
+// If the new segment would overlap an existing segment, or if r is invalid,
+// InsertRange panics.
+//
+// InsertRange searches the set to find the gap to insert into. If the caller
+// already has the appropriate GapIterator, or if the caller needs to do
+// additional work between finding the gap and insertion, use Insert instead.
+func (s *pmaSet) InsertRange(r __generics_imported0.AddrRange, val pma) pmaIterator {
+	if r.Length() <= 0 {
+		panic(fmt.Sprintf("invalid segment range %v", r))
+	}
+	seg, gap := s.Find(r.Start)
+	if seg.Ok() {
+		panic(fmt.Sprintf("new segment %v overlaps existing segment %v", r, seg.Range()))
+	}
+	if gap.End() < r.End {
+		panic(fmt.Sprintf("new segment %v overlaps existing segment %v", r, gap.NextSegment().Range()))
+	}
+	return s.Insert(gap, r, val)
+}
+
+// InsertWithoutMergingRange inserts the given segment into the set and returns
+// an iterator to the inserted segment. All existing iterators (excluding the
+// returned iterator) are invalidated.
+//
+// If the new segment would overlap an existing segment, or if r is invalid,
+// InsertWithoutMergingRange panics.
+//
+// InsertWithoutMergingRange searches the set to find the gap to insert into.
+// If the caller already has the appropriate GapIterator, or if the caller
+// needs to do additional work between finding the gap and insertion, use
+// InsertWithoutMerging instead.
+func (s *pmaSet) InsertWithoutMergingRange(r __generics_imported0.AddrRange, val pma) pmaIterator {
+	if r.Length() <= 0 {
+		panic(fmt.Sprintf("invalid segment range %v", r))
+	}
+	seg, gap := s.Find(r.Start)
+	if seg.Ok() {
+		panic(fmt.Sprintf("new segment %v overlaps existing segment %v", r, seg.Range()))
+	}
+	if gap.End() < r.End {
+		panic(fmt.Sprintf("new segment %v overlaps existing segment %v", r, gap.NextSegment().Range()))
+	}
+	return s.InsertWithoutMerging(gap, r, val)
+}
+
+// TryInsertRange attempts to insert the given segment into the set. If the new
+// segment can be merged with adjacent segments, TryInsertRange will do so.
+// TryInsertRange returns an iterator to the segment containing the inserted
+// value (which may have been merged with other values). All existing iterators
+// (excluding the returned iterator) are invalidated.
+//
+// If the new segment would overlap an existing segment, TryInsertRange does
+// nothing and returns a terminal iterator.
+//
+// TryInsertRange searches the set to find the gap to insert into. If the
+// caller already has the appropriate GapIterator, or if the caller needs to do
+// additional work between finding the gap and insertion, use Insert instead.
+func (s *pmaSet) TryInsertRange(r __generics_imported0.AddrRange, val pma) pmaIterator {
+	if r.Length() <= 0 {
+		panic(fmt.Sprintf("invalid segment range %v", r))
+	}
+	seg, gap := s.Find(r.Start)
+	if seg.Ok() {
+		return pmaIterator{}
+	}
+	if gap.End() < r.End {
+		return pmaIterator{}
+	}
+	return s.Insert(gap, r, val)
+}
+
+// TryInsertWithoutMergingRange attempts to insert the given segment into the
+// set. If successful, it returns an iterator to the inserted segment; all
+// existing iterators (excluding the returned iterator) are invalidated. If the
+// new segment would overlap an existing segment, TryInsertWithoutMergingRange
+// does nothing and returns a terminal iterator.
+//
+// TryInsertWithoutMergingRange searches the set to find the gap to insert
+// into. If the caller already has the appropriate GapIterator, or if the
+// caller needs to do additional work between finding the gap and insertion,
+// use InsertWithoutMerging instead.
+func (s *pmaSet) TryInsertWithoutMergingRange(r __generics_imported0.AddrRange, val pma) pmaIterator {
+	if r.Length() <= 0 {
+		panic(fmt.Sprintf("invalid segment range %v", r))
+	}
+	seg, gap := s.Find(r.Start)
+	if seg.Ok() {
+		return pmaIterator{}
+	}
+	if gap.End() < r.End {
+		return pmaIterator{}
+	}
+	return s.InsertWithoutMerging(gap, r, val)
 }
 
 // Remove removes the given segment and returns an iterator to the vacated gap.
@@ -332,12 +503,20 @@ func (s *pmaSet) Remove(seg pmaIterator) pmaGapIterator {
 
 		seg.SetRangeUnchecked(victim.Range())
 		seg.SetValue(victim.Value())
+
+		nextAdjacentNode := seg.NextSegment().node
+		if pmatrackGaps != 0 {
+			nextAdjacentNode.updateMaxGapLeaf()
+		}
 		return s.Remove(victim).NextGap()
 	}
 	copy(seg.node.keys[seg.index:], seg.node.keys[seg.index+1:seg.node.nrSegments])
 	copy(seg.node.values[seg.index:], seg.node.values[seg.index+1:seg.node.nrSegments])
 	pmaSetFunctions{}.ClearValue(&seg.node.values[seg.node.nrSegments-1])
 	seg.node.nrSegments--
+	if pmatrackGaps != 0 {
+		seg.node.updateMaxGapLeaf()
+	}
 	return seg.node.rebalanceAfterRemove(pmaGapIterator{seg.node, seg.index})
 }
 
@@ -349,6 +528,11 @@ func (s *pmaSet) RemoveAll() {
 
 // RemoveRange removes all segments in the given range. An iterator to the
 // newly formed gap is returned, and all existing iterators are invalidated.
+//
+// RemoveRange searches the set to find segments to remove. If the caller
+// already has an iterator to either end of the range of segments to remove, or
+// if the caller needs to do additional work before removing each segment,
+// iterate segments and call Remove in a loop instead.
 func (s *pmaSet) RemoveRange(r __generics_imported0.AddrRange) pmaGapIterator {
 	seg, gap := s.Find(r.Start)
 	if seg.Ok() {
@@ -356,10 +540,32 @@ func (s *pmaSet) RemoveRange(r __generics_imported0.AddrRange) pmaGapIterator {
 		gap = s.Remove(seg)
 	}
 	for seg = gap.NextSegment(); seg.Ok() && seg.Start() < r.End; seg = gap.NextSegment() {
-		seg = s.Isolate(seg, r)
+		seg = s.SplitAfter(seg, r.End)
 		gap = s.Remove(seg)
 	}
 	return gap
+}
+
+// RemoveFullRange is equivalent to RemoveRange, except that if any key in the
+// given range does not correspond to a segment, RemoveFullRange panics.
+func (s *pmaSet) RemoveFullRange(r __generics_imported0.AddrRange) pmaGapIterator {
+	seg := s.FindSegment(r.Start)
+	if !seg.Ok() {
+		panic(fmt.Sprintf("missing segment at %v", r.Start))
+	}
+	seg = s.SplitBefore(seg, r.Start)
+	for {
+		seg = s.SplitAfter(seg, r.End)
+		end := seg.End()
+		gap := s.Remove(seg)
+		if r.End <= end {
+			return gap
+		}
+		seg = gap.NextSegment()
+		if !seg.Ok() || seg.Start() != end {
+			panic(fmt.Sprintf("missing segment at %v", end))
+		}
+	}
 }
 
 // Merge attempts to merge two neighboring segments. If successful, Merge
@@ -387,13 +593,75 @@ func (s *pmaSet) MergeUnchecked(first, second pmaIterator) pmaIterator {
 
 			first.SetEndUnchecked(second.End())
 			first.SetValue(mval)
+
 			return s.Remove(second).PrevSegment()
 		}
 	}
 	return pmaIterator{}
 }
 
-// MergeAll attempts to merge all adjacent segments in the set. All existing
+// MergePrev attempts to merge the given segment with its predecessor if
+// possible, and returns an updated iterator to the extended segment. All
+// existing iterators (including seg, but not including the returned iterator)
+// are invalidated.
+//
+// MergePrev is usually used when mutating segments while iterating them in
+// order of increasing keys, to attempt merging of each mutated segment with
+// its previously-mutated predecessor. In such cases, merging a mutated segment
+// with its unmutated successor would incorrectly cause the latter to be
+// skipped.
+func (s *pmaSet) MergePrev(seg pmaIterator) pmaIterator {
+	if prev := seg.PrevSegment(); prev.Ok() {
+		if mseg := s.MergeUnchecked(prev, seg); mseg.Ok() {
+			seg = mseg
+		}
+	}
+	return seg
+}
+
+// MergeNext attempts to merge the given segment with its successor if
+// possible, and returns an updated iterator to the extended segment. All
+// existing iterators (including seg, but not including the returned iterator)
+// are invalidated.
+//
+// MergeNext is usually used when mutating segments while iterating them in
+// order of decreasing keys, to attempt merging of each mutated segment with
+// its previously-mutated successor. In such cases, merging a mutated segment
+// with its unmutated predecessor would incorrectly cause the latter to be
+// skipped.
+func (s *pmaSet) MergeNext(seg pmaIterator) pmaIterator {
+	if next := seg.NextSegment(); next.Ok() {
+		if mseg := s.MergeUnchecked(seg, next); mseg.Ok() {
+			seg = mseg
+		}
+	}
+	return seg
+}
+
+// Unisolate attempts to merge the given segment with its predecessor and
+// successor if possible, and returns an updated iterator to the extended
+// segment. All existing iterators (including seg, but not including the
+// returned iterator) are invalidated.
+//
+// Unisolate is usually used in conjunction with Isolate when mutating part of
+// a single segment in a way that may affect its mergeability. For the reasons
+// described by MergePrev and MergeNext, it is usually incorrect to use the
+// return value of Unisolate in a loop variable.
+func (s *pmaSet) Unisolate(seg pmaIterator) pmaIterator {
+	if prev := seg.PrevSegment(); prev.Ok() {
+		if mseg := s.MergeUnchecked(prev, seg); mseg.Ok() {
+			seg = mseg
+		}
+	}
+	if next := seg.NextSegment(); next.Ok() {
+		if mseg := s.MergeUnchecked(seg, next); mseg.Ok() {
+			seg = mseg
+		}
+	}
+	return seg
+}
+
+// MergeAll merges all mergeable adjacent segments in the set. All existing
 // iterators are invalidated.
 func (s *pmaSet) MergeAll() {
 	seg := s.FirstSegment()
@@ -410,15 +678,20 @@ func (s *pmaSet) MergeAll() {
 	}
 }
 
-// MergeRange attempts to merge all adjacent segments that contain a key in the
-// specific range. All existing iterators are invalidated.
-func (s *pmaSet) MergeRange(r __generics_imported0.AddrRange) {
+// MergeInsideRange attempts to merge all adjacent segments that contain a key
+// in the specific range. All existing iterators are invalidated.
+//
+// MergeInsideRange only makes sense after mutating the set in a way that may
+// change the mergeability of modified segments; callers should prefer to use
+// MergePrev or MergeNext during the mutating loop instead (depending on the
+// direction of iteration), in order to avoid a redundant search.
+func (s *pmaSet) MergeInsideRange(r __generics_imported0.AddrRange) {
 	seg := s.LowerBoundSegment(r.Start)
 	if !seg.Ok() {
 		return
 	}
 	next := seg.NextSegment()
-	for next.Ok() && next.Range().Start < r.End {
+	for next.Ok() && next.Start() < r.End {
 		if mseg := s.MergeUnchecked(seg, next); mseg.Ok() {
 			seg, next = mseg, mseg.NextSegment()
 		} else {
@@ -427,9 +700,14 @@ func (s *pmaSet) MergeRange(r __generics_imported0.AddrRange) {
 	}
 }
 
-// MergeAdjacent attempts to merge the segment containing r.Start with its
+// MergeOutsideRange attempts to merge the segment containing r.Start with its
 // predecessor, and the segment containing r.End-1 with its successor.
-func (s *pmaSet) MergeAdjacent(r __generics_imported0.AddrRange) {
+//
+// MergeOutsideRange only makes sense after mutating the set in a way that may
+// change the mergeability of modified segments; callers should prefer to use
+// MergePrev or MergeNext during the mutating loop instead (depending on the
+// direction of iteration), in order to avoid two redundant searches.
+func (s *pmaSet) MergeOutsideRange(r __generics_imported0.AddrRange) {
 	first := s.FindSegment(r.Start)
 	if first.Ok() {
 		if prev := first.PrevSegment(); prev.Ok() {
@@ -474,21 +752,58 @@ func (s *pmaSet) SplitUnchecked(seg pmaIterator, split __generics_imported0.Addr
 	return seg2.PrevSegment(), seg2
 }
 
-// SplitAt splits the segment straddling split, if one exists. SplitAt returns
-// true if a segment was split and false otherwise. If SplitAt splits a
-// segment, all existing iterators are invalidated.
-func (s *pmaSet) SplitAt(split __generics_imported0.Addr) bool {
-	if seg := s.FindSegment(split); seg.Ok() && seg.Range().CanSplitAt(split) {
-		s.SplitUnchecked(seg, split)
-		return true
+// SplitBefore ensures that the given segment's start is at least start by
+// splitting at start if necessary, and returns an updated iterator to the
+// bounded segment. All existing iterators (including seg, but not including
+// the returned iterator) are invalidated.
+//
+// SplitBefore is usually when mutating segments in a range. In such cases,
+// when iterating segments in order of increasing keys, the first segment may
+// extend beyond the start of the range to be mutated, and needs to be
+// SplitBefore to ensure that only the part of the segment within the range is
+// mutated. When iterating segments in order of decreasing keys, SplitBefore
+// and SplitAfter; i.e. SplitBefore needs to be invoked on each segment, while
+// SplitAfter only needs to be invoked on the first.
+//
+// Preconditions: start < seg.End().
+func (s *pmaSet) SplitBefore(seg pmaIterator, start __generics_imported0.Addr) pmaIterator {
+	if seg.Range().CanSplitAt(start) {
+		_, seg = s.SplitUnchecked(seg, start)
 	}
-	return false
+	return seg
 }
 
-// Isolate ensures that the given segment's range does not escape r by
-// splitting at r.Start and r.End if necessary, and returns an updated iterator
-// to the bounded segment. All existing iterators (including seg, but not
-// including the returned iterators) are invalidated.
+// SplitAfter ensures that the given segment's end is at most end by splitting
+// at end if necessary, and returns an updated iterator to the bounded segment.
+// All existing iterators (including seg, but not including the returned
+// iterator) are invalidated.
+//
+// SplitAfter is usually used when mutating segments in a range. In such cases,
+// when iterating segments in order of increasing keys, each iterated segment
+// may extend beyond the end of the range to be mutated, and needs to be
+// SplitAfter to ensure that only the part of the segment within the range is
+// mutated. When iterating segments in order of decreasing keys, SplitBefore
+// and SplitAfter exchange roles; i.e. SplitBefore needs to be invoked on each
+// segment, while SplitAfter only needs to be invoked on the first.
+//
+// Preconditions: seg.Start() < end.
+func (s *pmaSet) SplitAfter(seg pmaIterator, end __generics_imported0.Addr) pmaIterator {
+	if seg.Range().CanSplitAt(end) {
+		seg, _ = s.SplitUnchecked(seg, end)
+	}
+	return seg
+}
+
+// Isolate ensures that the given segment's range is a subset of r by splitting
+// at r.Start and r.End if necessary, and returns an updated iterator to the
+// bounded segment. All existing iterators (including seg, but not including
+// the returned iterators) are invalidated.
+//
+// Isolate is usually used when mutating part of a single segment, or when
+// mutating segments in a range where the first segment is not necessarily
+// split, making use of SplitBefore/SplitAfter complex.
+//
+// Preconditions: seg.Range().Overlaps(r).
 func (s *pmaSet) Isolate(seg pmaIterator, r __generics_imported0.AddrRange) pmaIterator {
 	if seg.Range().CanSplitAt(r.Start) {
 		_, seg = s.SplitUnchecked(seg, r.Start)
@@ -499,32 +814,118 @@ func (s *pmaSet) Isolate(seg pmaIterator, r __generics_imported0.AddrRange) pmaI
 	return seg
 }
 
-// ApplyContiguous applies a function to a contiguous range of segments,
-// splitting if necessary. The function is applied until the first gap is
-// encountered, at which point the gap is returned. If the function is applied
-// across the entire range, a terminal gap is returned. All existing iterators
-// are invalidated.
+// LowerBoundSegmentSplitBefore combines LowerBoundSegment and SplitBefore.
 //
-// N.B. The Iterator must not be invalidated by the function.
-func (s *pmaSet) ApplyContiguous(r __generics_imported0.AddrRange, fn func(seg pmaIterator)) pmaGapIterator {
-	seg, gap := s.Find(r.Start)
-	if !seg.Ok() {
-		return gap
+// LowerBoundSegmentSplitBefore is usually used when mutating segments in a
+// range while iterating them in order of increasing keys. In such cases,
+// LowerBoundSegmentSplitBefore provides an iterator to the first segment to be
+// mutated, suitable as the initial value for a loop variable.
+func (s *pmaSet) LowerBoundSegmentSplitBefore(min __generics_imported0.Addr) pmaIterator {
+	seg := s.LowerBoundSegment(min)
+	if seg.Ok() {
+		seg = s.SplitBefore(seg, min)
 	}
-	for {
-		seg = s.Isolate(seg, r)
-		fn(seg)
-		if seg.End() >= r.End {
-			return pmaGapIterator{}
-		}
-		gap = seg.NextGap()
-		if !gap.IsEmpty() {
-			return gap
-		}
-		seg = gap.NextSegment()
-		if !seg.Ok() {
+	return seg
+}
 
-			return pmaGapIterator{}
+// UpperBoundSegmentSplitAfter combines UpperBoundSegment and SplitAfter.
+//
+// UpperBoundSegmentSplitAfter is usually used when mutating segments in a
+// range while iterating them in order of decreasing keys. In such cases,
+// UpperBoundSegmentSplitAfter provides an iterator to the first segment to be
+// mutated, suitable as the initial value for a loop variable.
+func (s *pmaSet) UpperBoundSegmentSplitAfter(max __generics_imported0.Addr) pmaIterator {
+	seg := s.UpperBoundSegment(max)
+	if seg.Ok() {
+		seg = s.SplitAfter(seg, max)
+	}
+	return seg
+}
+
+// VisitRange applies the function f to all segments intersecting the range r,
+// in order of ascending keys. Segments will not be split, so f may be called
+// on segments lying partially outside r. Non-empty gaps between segments are
+// skipped. If a call to f returns false, VisitRange stops iteration
+// immediately.
+//
+// N.B. f must not invalidate iterators into s.
+func (s *pmaSet) VisitRange(r __generics_imported0.AddrRange, f func(seg pmaIterator) bool) {
+	for seg := s.LowerBoundSegment(r.Start); seg.Ok() && seg.Start() < r.End; seg = seg.NextSegment() {
+		if !f(seg) {
+			return
+		}
+	}
+}
+
+// VisitFullRange is equivalent to VisitRange, except that if any key in r that
+// is visited before f returns false does not correspond to a segment,
+// VisitFullRange panics.
+func (s *pmaSet) VisitFullRange(r __generics_imported0.AddrRange, f func(seg pmaIterator) bool) {
+	pos := r.Start
+	seg := s.FindSegment(r.Start)
+	for {
+		if !seg.Ok() {
+			panic(fmt.Sprintf("missing segment at %v", pos))
+		}
+		if !f(seg) {
+			return
+		}
+		pos = seg.End()
+		if r.End <= pos {
+			return
+		}
+		seg, _ = seg.NextNonEmpty()
+	}
+}
+
+// MutateRange applies the function f to all segments intersecting the range r,
+// in order of ascending keys. Segments that lie partially outside r are split
+// before f is called, such that f only observes segments entirely within r.
+// Iterated segments are merged again after f is called. Non-empty gaps between
+// segments are skipped. If a call to f returns false, MutateRange stops
+// iteration immediately.
+//
+// MutateRange invalidates all existing iterators.
+//
+// N.B. f must not invalidate iterators into s.
+func (s *pmaSet) MutateRange(r __generics_imported0.AddrRange, f func(seg pmaIterator) bool) {
+	seg := s.LowerBoundSegmentSplitBefore(r.Start)
+	for seg.Ok() && seg.Start() < r.End {
+		seg = s.SplitAfter(seg, r.End)
+		cont := f(seg)
+		seg = s.MergePrev(seg)
+		if !cont {
+			s.MergeNext(seg)
+			return
+		}
+		seg = seg.NextSegment()
+	}
+	if seg.Ok() {
+		s.MergePrev(seg)
+	}
+}
+
+// MutateFullRange is equivalent to MutateRange, except that if any key in r
+// that is visited before f returns false does not correspond to a segment,
+// MutateFullRange panics.
+func (s *pmaSet) MutateFullRange(r __generics_imported0.AddrRange, f func(seg pmaIterator) bool) {
+	seg := s.FindSegment(r.Start)
+	if !seg.Ok() {
+		panic(fmt.Sprintf("missing segment at %v", r.Start))
+	}
+	seg = s.SplitBefore(seg, r.Start)
+	for {
+		seg = s.SplitAfter(seg, r.End)
+		cont := f(seg)
+		end := seg.End()
+		seg = s.MergePrev(seg)
+		if !cont || r.End <= end {
+			s.MergeNext(seg)
+			return
+		}
+		seg = seg.NextSegment()
+		if !seg.Ok() || seg.Start() != end {
+			panic(fmt.Sprintf("missing segment at %v", end))
 		}
 	}
 }
@@ -561,6 +962,12 @@ type pmanode struct {
 	// != nil", but is stored in the first cache line. "hasChildren" rather
 	// than "isLeaf" because false must be the correct value for an empty root.
 	hasChildren bool
+
+	// The longest gap within this node. If the node is a leaf, it's simply the
+	// maximum gap among all the (nrSegments+1) gaps formed by its nrSegments keys
+	// including the 0th and nrSegments-th gap possibly shared with its upper-level
+	// nodes; if it's a non-leaf node, it's the max of all children's maxGap.
+	maxGap pmadynamicGap
 
 	// Nodes store keys and values in separate arrays to maximize locality in
 	// the common case (scanning keys for lookup).
@@ -607,11 +1014,11 @@ func (n *pmanode) nextSibling() *pmanode {
 // required for insertion, and returns an updated iterator to the position
 // represented by gap.
 func (n *pmanode) rebalanceBeforeInsert(gap pmaGapIterator) pmaGapIterator {
-	if n.parent != nil {
-		gap = n.parent.rebalanceBeforeInsert(gap)
-	}
 	if n.nrSegments < pmamaxDegree-1 {
 		return gap
+	}
+	if n.parent != nil {
+		gap = n.parent.rebalanceBeforeInsert(gap)
 	}
 	if n.parent == nil {
 
@@ -648,6 +1055,11 @@ func (n *pmanode) rebalanceBeforeInsert(gap pmaGapIterator) pmaGapIterator {
 		n.hasChildren = true
 		n.children[0] = left
 		n.children[1] = right
+
+		if pmatrackGaps != 0 {
+			left.updateMaxGapLocal()
+			right.updateMaxGapLocal()
+		}
 		if gap.node != n {
 			return gap
 		}
@@ -684,6 +1096,11 @@ func (n *pmanode) rebalanceBeforeInsert(gap pmaGapIterator) pmaGapIterator {
 		}
 	}
 	n.nrSegments = pmaminDegree - 1
+
+	if pmatrackGaps != 0 {
+		n.updateMaxGapLocal()
+		sibling.updateMaxGapLocal()
+	}
 
 	if gap.node != n {
 		return gap
@@ -730,6 +1147,11 @@ func (n *pmanode) rebalanceAfterRemove(gap pmaGapIterator) pmaGapIterator {
 			}
 			n.nrSegments++
 			sibling.nrSegments--
+
+			if pmatrackGaps != 0 {
+				n.updateMaxGapLocal()
+				sibling.updateMaxGapLocal()
+			}
 			if gap.node == sibling && gap.index == sibling.nrSegments {
 				return pmaGapIterator{n, 0}
 			}
@@ -758,6 +1180,11 @@ func (n *pmanode) rebalanceAfterRemove(gap pmaGapIterator) pmaGapIterator {
 			}
 			n.nrSegments++
 			sibling.nrSegments--
+
+			if pmatrackGaps != 0 {
+				n.updateMaxGapLocal()
+				sibling.updateMaxGapLocal()
+			}
 			if gap.node == sibling {
 				if gap.index == 0 {
 					return pmaGapIterator{n, n.nrSegments}
@@ -790,6 +1217,7 @@ func (n *pmanode) rebalanceAfterRemove(gap pmaGapIterator) pmaGapIterator {
 				p.children[0] = nil
 				p.children[1] = nil
 			}
+
 			if gap.node == left {
 				return pmaGapIterator{p, gap.index}
 			}
@@ -836,16 +1264,152 @@ func (n *pmanode) rebalanceAfterRemove(gap pmaGapIterator) pmaGapIterator {
 		p.children[p.nrSegments] = nil
 		p.nrSegments--
 
+		if pmatrackGaps != 0 {
+			left.updateMaxGapLocal()
+		}
+
 		n = p
 	}
 }
 
+// updateMaxGapLeaf updates maxGap bottom-up from the calling leaf until no
+// necessary update.
+//
+// Preconditions: n must be a leaf node, trackGaps must be 1.
+func (n *pmanode) updateMaxGapLeaf() {
+	if n.hasChildren {
+		panic(fmt.Sprintf("updateMaxGapLeaf should always be called on leaf node: %v", n))
+	}
+	max := n.calculateMaxGapLeaf()
+	if max == n.maxGap.Get() {
+
+		return
+	}
+	oldMax := n.maxGap.Get()
+	n.maxGap.Set(max)
+	if max > oldMax {
+
+		for p := n.parent; p != nil; p = p.parent {
+			if p.maxGap.Get() >= max {
+
+				break
+			}
+
+			p.maxGap.Set(max)
+		}
+		return
+	}
+
+	for p := n.parent; p != nil; p = p.parent {
+		if p.maxGap.Get() > oldMax {
+
+			break
+		}
+
+		parentNewMax := p.calculateMaxGapInternal()
+		if p.maxGap.Get() == parentNewMax {
+
+			break
+		}
+
+		p.maxGap.Set(parentNewMax)
+	}
+}
+
+// updateMaxGapLocal updates maxGap of the calling node solely with no
+// propagation to ancestor nodes.
+//
+// Precondition: trackGaps must be 1.
+func (n *pmanode) updateMaxGapLocal() {
+	if !n.hasChildren {
+
+		n.maxGap.Set(n.calculateMaxGapLeaf())
+	} else {
+
+		n.maxGap.Set(n.calculateMaxGapInternal())
+	}
+}
+
+// calculateMaxGapLeaf iterates the gaps within a leaf node and calculate the
+// max.
+//
+// Preconditions: n must be a leaf node.
+func (n *pmanode) calculateMaxGapLeaf() __generics_imported0.Addr {
+	max := pmaGapIterator{n, 0}.Range().Length()
+	for i := 1; i <= n.nrSegments; i++ {
+		if current := (pmaGapIterator{n, i}).Range().Length(); current > max {
+			max = current
+		}
+	}
+	return max
+}
+
+// calculateMaxGapInternal iterates children's maxGap within an internal node n
+// and calculate the max.
+//
+// Preconditions: n must be a non-leaf node.
+func (n *pmanode) calculateMaxGapInternal() __generics_imported0.Addr {
+	max := n.children[0].maxGap.Get()
+	for i := 1; i <= n.nrSegments; i++ {
+		if current := n.children[i].maxGap.Get(); current > max {
+			max = current
+		}
+	}
+	return max
+}
+
+// searchFirstLargeEnoughGap returns the first gap having at least minSize length
+// in the subtree rooted by n. If not found, return a terminal gap iterator.
+func (n *pmanode) searchFirstLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if n.maxGap.Get() < minSize {
+		return pmaGapIterator{}
+	}
+	if n.hasChildren {
+		for i := 0; i <= n.nrSegments; i++ {
+			if largeEnoughGap := n.children[i].searchFirstLargeEnoughGap(minSize); largeEnoughGap.Ok() {
+				return largeEnoughGap
+			}
+		}
+	} else {
+		for i := 0; i <= n.nrSegments; i++ {
+			currentGap := pmaGapIterator{n, i}
+			if currentGap.Range().Length() >= minSize {
+				return currentGap
+			}
+		}
+	}
+	panic(fmt.Sprintf("invalid maxGap in %v", n))
+}
+
+// searchLastLargeEnoughGap returns the last gap having at least minSize length
+// in the subtree rooted by n. If not found, return a terminal gap iterator.
+func (n *pmanode) searchLastLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if n.maxGap.Get() < minSize {
+		return pmaGapIterator{}
+	}
+	if n.hasChildren {
+		for i := n.nrSegments; i >= 0; i-- {
+			if largeEnoughGap := n.children[i].searchLastLargeEnoughGap(minSize); largeEnoughGap.Ok() {
+				return largeEnoughGap
+			}
+		}
+	} else {
+		for i := n.nrSegments; i >= 0; i-- {
+			currentGap := pmaGapIterator{n, i}
+			if currentGap.Range().Length() >= minSize {
+				return currentGap
+			}
+		}
+	}
+	panic(fmt.Sprintf("invalid maxGap in %v", n))
+}
+
 // A Iterator is conceptually one of:
 //
-// - A pointer to a segment in a set; or
+//   - A pointer to a segment in a set; or
 //
-// - A terminal iterator, which is a sentinel indicating that the end of
-// iteration has been reached.
+//   - A terminal iterator, which is a sentinel indicating that the end of
+//     iteration has been reached.
 //
 // Iterators are copyable values and are meaningfully equality-comparable. The
 // zero value of Iterator is a terminal iterator.
@@ -888,12 +1452,10 @@ func (seg pmaIterator) End() __generics_imported0.Addr {
 // does not invalidate any iterators.
 //
 // Preconditions:
-//
 // - r.Length() > 0.
-//
-// - The new range must not overlap an existing one: If seg.NextSegment().Ok(),
-// then r.end <= seg.NextSegment().Start(); if seg.PrevSegment().Ok(), then
-// r.start >= seg.PrevSegment().End().
+// - The new range must not overlap an existing one:
+//   - If seg.NextSegment().Ok(), then r.end <= seg.NextSegment().Start().
+//   - If seg.PrevSegment().Ok(), then r.start >= seg.PrevSegment().End().
 func (seg pmaIterator) SetRangeUnchecked(r __generics_imported0.AddrRange) {
 	seg.node.keys[seg.index] = r
 }
@@ -918,8 +1480,9 @@ func (seg pmaIterator) SetRange(r __generics_imported0.AddrRange) {
 // SetStartUnchecked mutates the iterated segment's start. This operation does
 // not invalidate any iterators.
 //
-// Preconditions: The new start must be valid: start < seg.End(); if
-// seg.PrevSegment().Ok(), then start >= seg.PrevSegment().End().
+// Preconditions: The new start must be valid:
+//   - start < seg.End()
+//   - If seg.PrevSegment().Ok(), then start >= seg.PrevSegment().End().
 func (seg pmaIterator) SetStartUnchecked(start __generics_imported0.Addr) {
 	seg.node.keys[seg.index].Start = start
 }
@@ -941,8 +1504,9 @@ func (seg pmaIterator) SetStart(start __generics_imported0.Addr) {
 // SetEndUnchecked mutates the iterated segment's end. This operation does not
 // invalidate any iterators.
 //
-// Preconditions: The new end must be valid: end > seg.Start(); if
-// seg.NextSegment().Ok(), then end <= seg.NextSegment().Start().
+// Preconditions: The new end must be valid:
+//   - end > seg.Start().
+//   - If seg.NextSegment().Ok(), then end <= seg.NextSegment().Start().
 func (seg pmaIterator) SetEndUnchecked(end __generics_imported0.Addr) {
 	seg.node.keys[seg.index].End = end
 }
@@ -1032,11 +1596,10 @@ func (seg pmaIterator) NextGap() pmaGapIterator {
 // Otherwise, exactly one of the iterators returned by PrevNonEmpty will be
 // non-terminal.
 func (seg pmaIterator) PrevNonEmpty() (pmaIterator, pmaGapIterator) {
-	gap := seg.PrevGap()
-	if gap.Range().Length() != 0 {
-		return pmaIterator{}, gap
+	if prev := seg.PrevSegment(); prev.Ok() && prev.End() == seg.Start() {
+		return prev, pmaGapIterator{}
 	}
-	return gap.PrevSegment(), pmaGapIterator{}
+	return pmaIterator{}, seg.PrevGap()
 }
 
 // NextNonEmpty returns the iterated segment's successor if it is adjacent, or
@@ -1045,20 +1608,19 @@ func (seg pmaIterator) PrevNonEmpty() (pmaIterator, pmaGapIterator) {
 // Otherwise, exactly one of the iterators returned by NextNonEmpty will be
 // non-terminal.
 func (seg pmaIterator) NextNonEmpty() (pmaIterator, pmaGapIterator) {
-	gap := seg.NextGap()
-	if gap.Range().Length() != 0 {
-		return pmaIterator{}, gap
+	if next := seg.NextSegment(); next.Ok() && next.Start() == seg.End() {
+		return next, pmaGapIterator{}
 	}
-	return gap.NextSegment(), pmaGapIterator{}
+	return pmaIterator{}, seg.NextGap()
 }
 
 // A GapIterator is conceptually one of:
 //
-// - A pointer to a position between two segments, before the first segment, or
-// after the last segment in a set, called a *gap*; or
+//   - A pointer to a position between two segments, before the first segment, or
+//     after the last segment in a set, called a *gap*; or
 //
-// - A terminal iterator, which is a sentinel indicating that the end of
-// iteration has been reached.
+//   - A terminal iterator, which is a sentinel indicating that the end of
+//     iteration has been reached.
 //
 // Note that the gap between two adjacent segments exists (iterators to it are
 // non-terminal), but has a length of zero. GapIterator.IsEmpty returns true
@@ -1145,6 +1707,116 @@ func (gap pmaGapIterator) NextGap() pmaGapIterator {
 	return seg.NextGap()
 }
 
+// NextLargeEnoughGap returns the iterated gap's first next gap with larger
+// length than minSize.  If not found, return a terminal gap iterator (does NOT
+// include this gap itself).
+//
+// Precondition: trackGaps must be 1.
+func (gap pmaGapIterator) NextLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
+	}
+	if gap.node != nil && gap.node.hasChildren && gap.index == gap.node.nrSegments {
+
+		gap.node = gap.NextSegment().node
+		gap.index = 0
+		return gap.nextLargeEnoughGapHelper(minSize)
+	}
+	return gap.nextLargeEnoughGapHelper(minSize)
+}
+
+// nextLargeEnoughGapHelper is the helper function used by NextLargeEnoughGap
+// to do the real recursions.
+//
+// Preconditions: gap is NOT the trailing gap of a non-leaf node.
+func (gap pmaGapIterator) nextLargeEnoughGapHelper(minSize __generics_imported0.Addr) pmaGapIterator {
+	for {
+
+		for gap.node != nil &&
+			(gap.node.maxGap.Get() < minSize || (!gap.node.hasChildren && gap.index == gap.node.nrSegments)) {
+			gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		}
+
+		if gap.node == nil {
+			return pmaGapIterator{}
+		}
+
+		gap.index++
+		for gap.index <= gap.node.nrSegments {
+			if gap.node.hasChildren {
+				if largeEnoughGap := gap.node.children[gap.index].searchFirstLargeEnoughGap(minSize); largeEnoughGap.Ok() {
+					return largeEnoughGap
+				}
+			} else {
+				if gap.Range().Length() >= minSize {
+					return gap
+				}
+			}
+			gap.index++
+		}
+		gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		if gap.node != nil && gap.index == gap.node.nrSegments {
+
+			gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		}
+	}
+}
+
+// PrevLargeEnoughGap returns the iterated gap's first prev gap with larger or
+// equal length than minSize.  If not found, return a terminal gap iterator
+// (does NOT include this gap itself).
+//
+// Precondition: trackGaps must be 1.
+func (gap pmaGapIterator) PrevLargeEnoughGap(minSize __generics_imported0.Addr) pmaGapIterator {
+	if pmatrackGaps != 1 {
+		panic("set is not tracking gaps")
+	}
+	if gap.node != nil && gap.node.hasChildren && gap.index == 0 {
+
+		gap.node = gap.PrevSegment().node
+		gap.index = gap.node.nrSegments
+		return gap.prevLargeEnoughGapHelper(minSize)
+	}
+	return gap.prevLargeEnoughGapHelper(minSize)
+}
+
+// prevLargeEnoughGapHelper is the helper function used by PrevLargeEnoughGap
+// to do the real recursions.
+//
+// Preconditions: gap is NOT the first gap of a non-leaf node.
+func (gap pmaGapIterator) prevLargeEnoughGapHelper(minSize __generics_imported0.Addr) pmaGapIterator {
+	for {
+
+		for gap.node != nil &&
+			(gap.node.maxGap.Get() < minSize || (!gap.node.hasChildren && gap.index == 0)) {
+			gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		}
+
+		if gap.node == nil {
+			return pmaGapIterator{}
+		}
+
+		gap.index--
+		for gap.index >= 0 {
+			if gap.node.hasChildren {
+				if largeEnoughGap := gap.node.children[gap.index].searchLastLargeEnoughGap(minSize); largeEnoughGap.Ok() {
+					return largeEnoughGap
+				}
+			} else {
+				if gap.Range().Length() >= minSize {
+					return gap
+				}
+			}
+			gap.index--
+		}
+		gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		if gap.node != nil && gap.index == 0 {
+
+			gap.node, gap.index = gap.node.parent, gap.node.parentIndex
+		}
+	}
+}
+
 // segmentBeforePosition returns the predecessor segment of the position given
 // by n.children[i], which may or may not contain a child. If no such segment
 // exists, segmentBeforePosition returns a terminal iterator.
@@ -1211,64 +1883,116 @@ func (n *pmanode) writeDebugString(buf *bytes.Buffer, prefix string) {
 			child.writeDebugString(buf, fmt.Sprintf("%s- % 3d ", prefix, i))
 		}
 		buf.WriteString(prefix)
-		buf.WriteString(fmt.Sprintf("- % 3d: %v => %v\n", i, n.keys[i], n.values[i]))
+		if n.hasChildren {
+			if pmatrackGaps != 0 {
+				buf.WriteString(fmt.Sprintf("- % 3d: %v => %v, maxGap: %d\n", i, n.keys[i], n.values[i], n.maxGap.Get()))
+			} else {
+				buf.WriteString(fmt.Sprintf("- % 3d: %v => %v\n", i, n.keys[i], n.values[i]))
+			}
+		} else {
+			buf.WriteString(fmt.Sprintf("- % 3d: %v => %v\n", i, n.keys[i], n.values[i]))
+		}
 	}
 	if child := n.children[n.nrSegments]; child != nil {
 		child.writeDebugString(buf, fmt.Sprintf("%s- % 3d ", prefix, n.nrSegments))
 	}
 }
 
-// SegmentDataSlices represents segments from a set as slices of start, end, and
-// values. SegmentDataSlices is primarily used as an intermediate representation
-// for save/restore and the layout here is optimized for that.
+// FlatSegment represents a segment as a single object. FlatSegment is used as
+// an intermediate representation for save/restore and tests.
 //
 // +stateify savable
-type pmaSegmentDataSlices struct {
-	Start  []__generics_imported0.Addr
-	End    []__generics_imported0.Addr
-	Values []pma
+type pmaFlatSegment struct {
+	Start __generics_imported0.Addr
+	End   __generics_imported0.Addr
+	Value pma
 }
 
-// ExportSortedSlice returns a copy of all segments in the given set, in ascending
+// ExportSlice returns a copy of all segments in the given set, in ascending
 // key order.
-func (s *pmaSet) ExportSortedSlices() *pmaSegmentDataSlices {
-	var sds pmaSegmentDataSlices
+func (s *pmaSet) ExportSlice() []pmaFlatSegment {
+	var fs []pmaFlatSegment
 	for seg := s.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		sds.Start = append(sds.Start, seg.Start())
-		sds.End = append(sds.End, seg.End())
-		sds.Values = append(sds.Values, seg.Value())
+		fs = append(fs, pmaFlatSegment{
+			Start: seg.Start(),
+			End:   seg.End(),
+			Value: seg.Value(),
+		})
 	}
-	sds.Start = sds.Start[:len(sds.Start):len(sds.Start)]
-	sds.End = sds.End[:len(sds.End):len(sds.End)]
-	sds.Values = sds.Values[:len(sds.Values):len(sds.Values)]
-	return &sds
+	return fs
 }
 
-// ImportSortedSlice initializes the given set from the given slice.
+// ImportSlice initializes the given set from the given slice.
 //
-// Preconditions: s must be empty. sds must represent a valid set (the segments
-// in sds must have valid lengths that do not overlap). The segments in sds
-// must be sorted in ascending key order.
-func (s *pmaSet) ImportSortedSlices(sds *pmaSegmentDataSlices) error {
+// Preconditions:
+//   - s must be empty.
+//   - fs must represent a valid set (the segments in fs must have valid
+//     lengths that do not overlap).
+//   - The segments in fs must be sorted in ascending key order.
+func (s *pmaSet) ImportSlice(fs []pmaFlatSegment) error {
 	if !s.IsEmpty() {
 		return fmt.Errorf("cannot import into non-empty set %v", s)
 	}
 	gap := s.FirstGap()
-	for i := range sds.Start {
-		r := __generics_imported0.AddrRange{sds.Start[i], sds.End[i]}
+	for i := range fs {
+		f := &fs[i]
+		r := __generics_imported0.AddrRange{f.Start, f.End}
 		if !gap.Range().IsSupersetOf(r) {
-			return fmt.Errorf("segment overlaps a preceding segment or is incorrectly sorted: [%d, %d) => %v", sds.Start[i], sds.End[i], sds.Values[i])
+			return fmt.Errorf("segment overlaps a preceding segment or is incorrectly sorted: %v => %v", r, f.Value)
 		}
-		gap = s.InsertWithoutMerging(gap, r, sds.Values[i]).NextGap()
+		gap = s.InsertWithoutMerging(gap, r, f.Value).NextGap()
 	}
 	return nil
 }
-func (s *pmaSet) saveRoot() *pmaSegmentDataSlices {
-	return s.ExportSortedSlices()
+
+// segmentTestCheck returns an error if s is incorrectly sorted, does not
+// contain exactly expectedSegments segments, or contains a segment which
+// fails the passed check.
+//
+// This should be used only for testing, and has been added to this package for
+// templating convenience.
+func (s *pmaSet) segmentTestCheck(expectedSegments int, segFunc func(int, __generics_imported0.AddrRange, pma) error) error {
+	havePrev := false
+	prev := __generics_imported0.Addr(0)
+	nrSegments := 0
+	for seg := s.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		next := seg.Start()
+		if havePrev && prev >= next {
+			return fmt.Errorf("incorrect order: key %d (segment %d) >= key %d (segment %d)", prev, nrSegments-1, next, nrSegments)
+		}
+		if segFunc != nil {
+			if err := segFunc(nrSegments, seg.Range(), seg.Value()); err != nil {
+				return err
+			}
+		}
+		prev = next
+		havePrev = true
+		nrSegments++
+	}
+	if nrSegments != expectedSegments {
+		return fmt.Errorf("incorrect number of segments: got %d, wanted %d", nrSegments, expectedSegments)
+	}
+	return nil
 }
 
-func (s *pmaSet) loadRoot(sds *pmaSegmentDataSlices) {
-	if err := s.ImportSortedSlices(sds); err != nil {
+// countSegments counts the number of segments in the set.
+//
+// Similar to Check, this should only be used for testing.
+func (s *pmaSet) countSegments() (segments int) {
+	for seg := s.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		segments++
+	}
+	return segments
+}
+func (s *pmaSet) saveRoot() []pmaFlatSegment {
+	fs := s.ExportSlice()
+
+	fs = fs[:len(fs):len(fs)]
+	return fs
+}
+
+func (s *pmaSet) loadRoot(_ context.Context, fs []pmaFlatSegment) {
+	if err := s.ImportSlice(fs); err != nil {
 		panic(err)
 	}
 }

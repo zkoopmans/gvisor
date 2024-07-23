@@ -14,13 +14,6 @@
 
 package linux
 
-// EpollEvent is equivalent to struct epoll_event from epoll(2).
-type EpollEvent struct {
-	Events uint32
-	Fd     int32
-	Data   int32
-}
-
 // Event masks.
 const (
 	EPOLLIN     = 0x1
@@ -60,3 +53,6 @@ const (
 	EPOLL_CTL_DEL = 0x2
 	EPOLL_CTL_MOD = 0x3
 )
+
+// SizeOfEpollEvent is the size of EpollEvent struct.
+var SizeOfEpollEvent = (*EpollEvent)(nil).SizeBytes()

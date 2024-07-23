@@ -36,23 +36,44 @@ func DecodeDeviceID(rdev uint32) (uint16, uint32) {
 //
 // See Documentations/devices.txt and uapi/linux/major.h.
 const (
+	// UNNAMED_MAJOR is the major device number for "unnamed" devices, whose
+	// minor numbers are dynamically allocated by the kernel.
+	UNNAMED_MAJOR = 0
+
 	// MEM_MAJOR is the major device number for "memory" character devices.
 	MEM_MAJOR = 1
 
 	// TTYAUX_MAJOR is the major device number for alternate TTY devices.
 	TTYAUX_MAJOR = 5
 
+	// MISC_MAJOR is the major device number for non-serial mice, misc feature
+	// devices.
+	MISC_MAJOR = 10
+
 	// UNIX98_PTY_MASTER_MAJOR is the initial major device number for
 	// Unix98 PTY masters.
 	UNIX98_PTY_MASTER_MAJOR = 128
 
-	// UNIX98_PTY_SLAVE_MAJOR is the initial major device number for
-	// Unix98 PTY slaves.
-	UNIX98_PTY_SLAVE_MAJOR = 136
+	// UNIX98_PTY_REPLICA_MAJOR is the initial major device number for
+	// Unix98 PTY replicas.
+	UNIX98_PTY_REPLICA_MAJOR = 136
 )
 
 // Minor device numbers for TTYAUX_MAJOR.
 const (
 	// PTMX_MINOR is the minor device number for /dev/ptmx.
 	PTMX_MINOR = 2
+)
+
+// from Linux include/drm/drm_accel.h
+const (
+	// ACCEL_MAJOR is the major device number for compute accelerator devices.
+	ACCEL_MAJOR = 121
+)
+
+// Major device numbers for VFIO-based TPU.
+const (
+	// Major devices number between 243 and 254 are usually reserved for local use.
+	// The device number 245 is used by VFIO based TPU in GCP.
+	VFIO_MAJOR = 245
 )

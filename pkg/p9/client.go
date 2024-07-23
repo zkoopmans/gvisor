@@ -17,7 +17,6 @@ package p9
 import (
 	"errors"
 	"fmt"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/flipcall"
@@ -62,7 +61,7 @@ type response struct {
 }
 
 var responsePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &response{
 			done: make(chan error, 1),
 		}
@@ -104,7 +103,7 @@ type Client struct {
 	// efficient, and does not require tags).
 	sendRecv func(message, message) error
 
-	// -- below corresponds to sendRecvChannel --
+	//	-- below corresponds to sendRecvChannel --
 
 	// channelsMu protects channels.
 	channelsMu sync.Mutex
@@ -116,10 +115,10 @@ type Client struct {
 	// channels is the set of all initialized channels.
 	channels []*channel
 
-	// availableChannels is a FIFO of inactive channels.
+	// availableChannels is a LIFO of inactive channels.
 	availableChannels []*channel
 
-	// -- below corresponds to sendRecvLegacy --
+	//	-- below corresponds to sendRecvLegacy --
 
 	// pending is the set of pending messages.
 	pending   map[Tag]*response
@@ -174,13 +173,13 @@ func NewClient(socket *unet.Socket, messageSize uint32, version string) (*Client
 		// our sendRecv function to use that functionality.  Otherwise,
 		// we stick to sendRecvLegacy.
 		rversion := Rversion{}
-		err := c.sendRecvLegacy(&Tversion{
+		_, err := c.sendRecvLegacy(&Tversion{
 			Version: versionString(requested),
 			MSize:   messageSize,
 		}, &rversion)
 
 		// The server told us to try again with a lower version.
-		if err == syscall.EAGAIN {
+		if err == unix.EAGAIN {
 			if requested == lowestSupportedVersion {
 				return nil, ErrVersionsExhausted
 			}
@@ -219,11 +218,11 @@ func NewClient(socket *unet.Socket, messageSize uint32, version string) (*Client
 			c.sendRecv = c.sendRecvChannel
 		} else {
 			// Channel setup failed; fallback.
-			c.sendRecv = c.sendRecvLegacy
+			c.sendRecv = c.sendRecvLegacySyscallErr
 		}
 	} else {
 		// No channels available: use the legacy mechanism.
-		c.sendRecv = c.sendRecvLegacy
+		c.sendRecv = c.sendRecvLegacySyscallErr
 	}
 
 	// Ensure that the socket and channels are closed when the socket is shut
@@ -241,7 +240,7 @@ func (c *Client) watch(socket *unet.Socket) {
 	defer c.closedWg.Done()
 
 	events := []unix.PollFd{
-		unix.PollFd{
+		{
 			Fd:     int32(socket.FD()),
 			Events: unix.POLLHUP | unix.POLLRDHUP,
 		},
@@ -250,7 +249,7 @@ func (c *Client) watch(socket *unet.Socket) {
 	// Wait for a shutdown event.
 	for {
 		n, err := unix.Ppoll(events, nil, nil)
-		if err == syscall.EINTR || err == syscall.EAGAIN {
+		if err == unix.EINTR || err == unix.EAGAIN {
 			continue
 		}
 		if err != nil {
@@ -305,7 +304,7 @@ func (c *Client) openChannel(id int) error {
 	)
 
 	// Open the data channel.
-	if err := c.sendRecvLegacy(&Tchannel{
+	if _, err := c.sendRecvLegacy(&Tchannel{
 		ID:      uint32(id),
 		Control: 0,
 	}, &rchannel0); err != nil {
@@ -319,7 +318,7 @@ func (c *Client) openChannel(id int) error {
 	defer rchannel0.FilePayload().Close()
 
 	// Open the channel for file descriptors.
-	if err := c.sendRecvLegacy(&Tchannel{
+	if _, err := c.sendRecvLegacy(&Tchannel{
 		ID:      uint32(id),
 		Control: 1,
 	}, &rchannel1); err != nil {
@@ -391,7 +390,7 @@ func (c *Client) handleOne() {
 		for _, resp := range c.pending {
 			resp.done <- err
 		}
-		c.pending = make(map[Tag]*response)
+		clear(c.pending)
 		c.pendingMu.Unlock()
 	} else {
 		// Process the tag.
@@ -407,7 +406,7 @@ func (c *Client) handleOne() {
 	}
 }
 
-// waitAndRecv co-ordinates with other receivers to handle responses.
+// waitAndRecv coordinates with other receivers to handle responses.
 func (c *Client) waitAndRecv(done chan error) error {
 	for {
 		select {
@@ -431,13 +430,28 @@ func (c *Client) waitAndRecv(done chan error) error {
 	}
 }
 
+// sendRecvLegacySyscallErr is a wrapper for sendRecvLegacy that converts all
+// non-syscall errors to EIO.
+func (c *Client) sendRecvLegacySyscallErr(t message, r message) error {
+	received, err := c.sendRecvLegacy(t, r)
+	if !received {
+		log.Warningf("p9.Client.sendRecvChannel: %v", err)
+		return unix.EIO
+	}
+	return err
+}
+
 // sendRecvLegacy performs a roundtrip message exchange.
 //
+// sendRecvLegacy returns true if a message was received. This allows us to
+// differentiate between failed receives and successful receives where the
+// response was an error message.
+//
 // This is called by internal functions.
-func (c *Client) sendRecvLegacy(t message, r message) error {
+func (c *Client) sendRecvLegacy(t message, r message) (bool, error) {
 	tag, ok := c.tagPool.Get()
 	if !ok {
-		return ErrOutOfTags
+		return false, ErrOutOfTags
 	}
 	defer c.tagPool.Put(tag)
 
@@ -457,12 +471,12 @@ func (c *Client) sendRecvLegacy(t message, r message) error {
 	err := send(c.socket, Tag(tag), t)
 	c.sendMu.Unlock()
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	// Co-ordinate with other receivers.
+	// Coordinate with other receivers.
 	if err := c.waitAndRecv(resp.done); err != nil {
-		return err
+		return false, err
 	}
 
 	// Is it an error message?
@@ -470,14 +484,14 @@ func (c *Client) sendRecvLegacy(t message, r message) error {
 	// For convenience, we transform these directly
 	// into errors. Handlers need not handle this case.
 	if rlerr, ok := resp.r.(*Rlerror); ok {
-		return syscall.Errno(rlerr.Error)
+		return true, unix.Errno(rlerr.Error)
 	}
 
 	// At this point, we know it matches.
 	//
 	// Per recv call above, we will only allow a type
 	// match (and give our r) or an instance of Rlerror.
-	return nil
+	return true, nil
 }
 
 // sendRecvChannel uses channels to send a message.
@@ -486,7 +500,7 @@ func (c *Client) sendRecvChannel(t message, r message) error {
 	c.channelsMu.Lock()
 	if len(c.availableChannels) == 0 {
 		c.channelsMu.Unlock()
-		return c.sendRecvLegacy(t, r)
+		return c.sendRecvLegacySyscallErr(t, r)
 	}
 	idx := len(c.availableChannels) - 1
 	ch := c.availableChannels[idx]
@@ -509,12 +523,12 @@ func (c *Client) sendRecvChannel(t message, r message) error {
 			// Map all transport errors to EIO, but ensure that the real error
 			// is logged.
 			log.Warningf("p9.Client.sendRecvChannel: flipcall.Endpoint.Connect: %v", err)
-			return syscall.EIO
+			return unix.EIO
 		}
 	}
 
 	// Send the request and receive the server's response.
-	rsz, err := ch.send(t)
+	rsz, err := ch.send(t, false /* isServer */)
 	if err != nil {
 		// See above.
 		c.channelsMu.Lock()
@@ -522,11 +536,15 @@ func (c *Client) sendRecvChannel(t message, r message) error {
 		c.channelsMu.Unlock()
 		c.channelsWg.Done()
 		log.Warningf("p9.Client.sendRecvChannel: p9.channel.send: %v", err)
-		return syscall.EIO
+		return unix.EIO
 	}
 
 	// Parse the server's response.
-	_, retErr := ch.recv(r, rsz)
+	resp, retErr := ch.recv(r, rsz)
+	if resp == nil {
+		log.Warningf("p9.Client.sendRecvChannel: p9.channel.recv: %v", retErr)
+		retErr = unix.EIO
+	}
 
 	// Release the channel.
 	c.channelsMu.Lock()
@@ -551,6 +569,8 @@ func (c *Client) Version() uint32 {
 func (c *Client) Close() {
 	// unet.Socket.Shutdown() has no effect if unet.Socket.Close() has already
 	// been called (by c.watch()).
-	c.socket.Shutdown()
+	if err := c.socket.Shutdown(); err != nil {
+		log.Warningf("Socket.Shutdown() failed (FD: %d): %v", c.socket.FD(), err)
+	}
 	c.closedWg.Wait()
 }

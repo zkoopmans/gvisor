@@ -18,13 +18,13 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // copyTimespecIn copies a Timespec from the untrusted app range to the kernel.
-func copyTimespecIn(t *kernel.Task, addr usermem.Addr) (linux.Timespec, error) {
+func copyTimespecIn(t *kernel.Task, addr hostarch.Addr) (linux.Timespec, error) {
 	switch t.Arch().Width() {
 	case 8:
 		ts := linux.Timespec{}
@@ -33,30 +33,30 @@ func copyTimespecIn(t *kernel.Task, addr usermem.Addr) (linux.Timespec, error) {
 		if err != nil {
 			return ts, err
 		}
-		ts.Sec = int64(usermem.ByteOrder.Uint64(in[0:]))
-		ts.Nsec = int64(usermem.ByteOrder.Uint64(in[8:]))
+		ts.Sec = int64(hostarch.ByteOrder.Uint64(in[0:]))
+		ts.Nsec = int64(hostarch.ByteOrder.Uint64(in[8:]))
 		return ts, nil
 	default:
-		return linux.Timespec{}, syserror.ENOSYS
+		return linux.Timespec{}, linuxerr.ENOSYS
 	}
 }
 
 // copyTimespecOut copies a Timespec to the untrusted app range.
-func copyTimespecOut(t *kernel.Task, addr usermem.Addr, ts *linux.Timespec) error {
+func copyTimespecOut(t *kernel.Task, addr hostarch.Addr, ts *linux.Timespec) error {
 	switch t.Arch().Width() {
 	case 8:
 		out := t.CopyScratchBuffer(16)
-		usermem.ByteOrder.PutUint64(out[0:], uint64(ts.Sec))
-		usermem.ByteOrder.PutUint64(out[8:], uint64(ts.Nsec))
+		hostarch.ByteOrder.PutUint64(out[0:], uint64(ts.Sec))
+		hostarch.ByteOrder.PutUint64(out[8:], uint64(ts.Nsec))
 		_, err := t.CopyOutBytes(addr, out)
 		return err
 	default:
-		return syserror.ENOSYS
+		return linuxerr.ENOSYS
 	}
 }
 
 // copyTimevalIn copies a Timeval from the untrusted app range to the kernel.
-func copyTimevalIn(t *kernel.Task, addr usermem.Addr) (linux.Timeval, error) {
+func copyTimevalIn(t *kernel.Task, addr hostarch.Addr) (linux.Timeval, error) {
 	switch t.Arch().Width() {
 	case 8:
 		tv := linux.Timeval{}
@@ -65,25 +65,25 @@ func copyTimevalIn(t *kernel.Task, addr usermem.Addr) (linux.Timeval, error) {
 		if err != nil {
 			return tv, err
 		}
-		tv.Sec = int64(usermem.ByteOrder.Uint64(in[0:]))
-		tv.Usec = int64(usermem.ByteOrder.Uint64(in[8:]))
+		tv.Sec = int64(hostarch.ByteOrder.Uint64(in[0:]))
+		tv.Usec = int64(hostarch.ByteOrder.Uint64(in[8:]))
 		return tv, nil
 	default:
-		return linux.Timeval{}, syserror.ENOSYS
+		return linux.Timeval{}, linuxerr.ENOSYS
 	}
 }
 
 // copyTimevalOut copies a Timeval to the untrusted app range.
-func copyTimevalOut(t *kernel.Task, addr usermem.Addr, tv *linux.Timeval) error {
+func copyTimevalOut(t *kernel.Task, addr hostarch.Addr, tv *linux.Timeval) error {
 	switch t.Arch().Width() {
 	case 8:
 		out := t.CopyScratchBuffer(16)
-		usermem.ByteOrder.PutUint64(out[0:], uint64(tv.Sec))
-		usermem.ByteOrder.PutUint64(out[8:], uint64(tv.Usec))
+		hostarch.ByteOrder.PutUint64(out[0:], uint64(tv.Sec))
+		hostarch.ByteOrder.PutUint64(out[8:], uint64(tv.Usec))
 		_, err := t.CopyOutBytes(addr, out)
 		return err
 	default:
-		return syserror.ENOSYS
+		return linuxerr.ENOSYS
 	}
 }
 
@@ -94,16 +94,16 @@ func copyTimevalOut(t *kernel.Task, addr usermem.Addr, tv *linux.Timeval) error 
 // returned value is the maximum that Duration will allow.
 //
 // If timespecAddr is NULL, the returned value is negative.
-func copyTimespecInToDuration(t *kernel.Task, timespecAddr usermem.Addr) (time.Duration, error) {
+func copyTimespecInToDuration(t *kernel.Task, timespecAddr hostarch.Addr) (time.Duration, error) {
 	// Use a negative Duration to indicate "no timeout".
 	timeout := time.Duration(-1)
 	if timespecAddr != 0 {
-		timespec, err := copyTimespecIn(t, timespecAddr)
-		if err != nil {
+		var timespec linux.Timespec
+		if _, err := timespec.CopyIn(t, timespecAddr); err != nil {
 			return 0, err
 		}
 		if !timespec.Valid() {
-			return 0, syserror.EINVAL
+			return 0, linuxerr.EINVAL
 		}
 		timeout = time.Duration(timespec.ToNsecCapped())
 	}

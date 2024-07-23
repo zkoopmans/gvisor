@@ -3,20 +3,56 @@
 package bpf
 
 import (
+	"context"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Program) beforeSave() {}
-func (x *Program) save(m state.Map) {
-	x.beforeSave()
-	m.Save("instructions", &x.instructions)
+func (ins *Instruction) StateTypeName() string {
+	return "pkg/bpf.Instruction"
 }
 
-func (x *Program) afterLoad() {}
-func (x *Program) load(m state.Map) {
-	m.Load("instructions", &x.instructions)
+func (ins *Instruction) StateFields() []string {
+	return (*linux.BPFInstruction)(ins).StateFields()
+}
+
+// +checklocksignore
+func (ins *Instruction) StateSave(stateSinkObject state.Sink) {
+	(*linux.BPFInstruction)(ins).StateSave(stateSinkObject)
+}
+
+// +checklocksignore
+func (ins *Instruction) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	(*linux.BPFInstruction)(ins).StateLoad(ctx, stateSourceObject)
+}
+
+func (p *Program) StateTypeName() string {
+	return "pkg/bpf.Program"
+}
+
+func (p *Program) StateFields() []string {
+	return []string{
+		"instructions",
+	}
+}
+
+func (p *Program) beforeSave() {}
+
+// +checklocksignore
+func (p *Program) StateSave(stateSinkObject state.Sink) {
+	p.beforeSave()
+	stateSinkObject.Save(0, &p.instructions)
+}
+
+func (p *Program) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (p *Program) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &p.instructions)
 }
 
 func init() {
-	state.Register("pkg/bpf.Program", (*Program)(nil), state.Fns{Save: (*Program).save, Load: (*Program).load})
+	state.Register((*Instruction)(nil))
+	state.Register((*Program)(nil))
 }
