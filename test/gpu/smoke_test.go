@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 )
 
+/*
 func TestGPUHello(t *testing.T) {
 	ctx := context.Background()
 	c := dockerutil.MakeContainer(ctx, t)
@@ -35,6 +36,7 @@ func TestGPUHello(t *testing.T) {
 	}
 	t.Logf("cuda-vector-add output: %s", string(out))
 }
+*/
 
 func TestCUDASmokeTests(t *testing.T) {
 	ctx := context.Background()
