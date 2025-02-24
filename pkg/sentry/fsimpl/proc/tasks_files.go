@@ -27,7 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
@@ -40,6 +40,7 @@ type selfSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	pidns *kernel.PIDNamespace
 }
@@ -83,6 +84,7 @@ type threadSelfSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	pidns *kernel.PIDNamespace
 }
@@ -322,7 +324,7 @@ var _ dynamicInode = (*uptimeData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*uptimeData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	k := kernel.KernelFromContext(ctx)
-	now := time.NowFromContext(ctx)
+	now := ktime.NowFromContext(ctx)
 
 	// Pretend that we've spent zero time sleeping (second number).
 	fmt.Fprintf(buf, "%.2f 0.00\n", now.Sub(k.Timekeeper().BootTime()).Seconds())

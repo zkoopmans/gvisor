@@ -28,7 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -106,12 +106,30 @@ type Task struct {
 	// interruptChan is always notified after restore (see Task.run).
 	interruptChan chan struct{} `state:"nosave"`
 
-	// gosched contains the current scheduling state of the task goroutine.
+	// gostateSeq allows Task.TaskGoroutineStateTime() to read gostate and
+	// gostateTime atomically.
 	//
-	// gosched is protected by goschedSeq. gosched is owned by the task
-	// goroutine.
-	goschedSeq sync.SeqCount `state:"nosave"`
-	gosched    TaskGoroutineSchedInfo
+	// gostateSeq is owned by the task goroutine.
+	gostateSeq sync.SeqCount `state:"nosave"`
+
+	// gostate is the current scheduling state of the task goroutine.
+	//
+	// gostate is owned by the task goroutine.
+	gostate atomicbitops.Uint32
+
+	// gostateTime was the value of Kernel.cpuClock when gostate was last
+	// updated or refreshed.
+	//
+	// gostateTime is owned by the task goroutine.
+	gostateTime atomicbitops.Int64
+
+	// appCPUClock approximates the amount of time the task goroutine has spent
+	// in TaskGoroutineRunningApp.
+	appCPUClock ktime.SyntheticClock
+
+	// appSysCPUClock approximates the amount of time the task goroutine has
+	// spent in TaskGoroutineRunningApp or TaskGoroutineRunningSys.
+	appSysCPUClock ktime.SyntheticClock
 
 	// yieldCount is the number of times the task goroutine has called
 	// Task.InterruptibleSleepStart, Task.UninterruptibleSleepStart, or
@@ -286,13 +304,13 @@ type Task struct {
 	// this TaskImage is released.
 	//
 	// vforkParent is protected by the TaskSet mutex.
-	vforkParent *Task
+	vforkParent atomic.Pointer[Task] `state:".(*Task)"`
 
 	// exitState is the task's progress through the exit path.
 	//
 	// exitState is protected by the TaskSet mutex. exitState is owned by the
 	// task goroutine.
-	exitState TaskExitState
+	exitState atomicbitops.Uint32
 
 	// exitTracerNotified is true if the exit path has either signaled the
 	// task's tracer to indicate the exit, or determined that no such signal is
@@ -560,12 +578,14 @@ type Task struct {
 	// copyScratchBuffer is exclusive to the task goroutine.
 	copyScratchBuffer [copyScratchBufferLen]byte `state:"nosave"`
 
-	// blockingTimer is used for blocking timeouts. blockingTimerChan is the
-	// channel that is sent to when blockingTimer fires.
+	// blockingTimer is used for blocking timeouts from ktime.SampledClocks.
+	// blockingTimerListener sends to blockingTimerChan when blockingTimer
+	// expires.
 	//
 	// blockingTimer is exclusive to the task goroutine.
-	blockingTimer     *ktime.Timer    `state:"nosave"`
-	blockingTimerChan <-chan struct{} `state:"nosave"`
+	blockingTimer         *ktime.SampledTimer `state:"nosave"`
+	blockingTimerListener ktime.Listener      `state:"nosave"`
+	blockingTimerChan     <-chan struct{}     `state:"nosave"`
 
 	// futexWaiter is used for futex(FUTEX_WAIT) syscalls.
 	//
@@ -610,6 +630,10 @@ type Task struct {
 
 	// Origin is the origin of the task.
 	Origin TaskOrigin
+
+	// onDestroyAction is a set of callbacks that are executed when the
+	// task is destroyed.
+	onDestroyAction map[TaskDestroyAction]struct{}
 }
 
 // Task related metrics
@@ -631,22 +655,6 @@ var (
 		})
 )
 
-func (t *Task) savePtraceTracer() *Task {
-	return t.ptraceTracer.Load()
-}
-
-func (t *Task) loadPtraceTracer(_ gocontext.Context, tracer *Task) {
-	t.ptraceTracer.Store(tracer)
-}
-
-func (t *Task) saveSeccomp() *taskSeccomp {
-	return t.seccomp.Load()
-}
-
-func (t *Task) loadSeccomp(_ gocontext.Context, seccompData *taskSeccomp) {
-	t.seccomp.Store(seccompData)
-}
-
 // afterLoad is invoked by stateify.
 func (t *Task) afterLoad(gocontext.Context) {
 	t.updateInfoLocked()
@@ -654,7 +662,7 @@ func (t *Task) afterLoad(gocontext.Context) {
 		ts.populateCache(t)
 	}
 	t.interruptChan = make(chan struct{}, 1)
-	t.gosched.State = TaskGoroutineNonexistent
+	t.gostate.Store(uint32(TaskGoroutineNonexistent))
 	if t.stop != nil {
 		t.stopCount = atomicbitops.FromInt32(1)
 	}

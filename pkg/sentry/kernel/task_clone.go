@@ -201,7 +201,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	mntns := t.mountNamespace
 	if args.Flags&linux.CLONE_NEWNS != 0 {
 		var err error
-		mntns, err = t.k.vfs.CloneMountNamespace(t, creds, mntns, &fsContext.root, &fsContext.cwd, t.k)
+		mntns, err = t.k.vfs.CloneMountNamespace(t, userns, mntns, &fsContext.root, &fsContext.cwd, t.k)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -332,7 +332,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		nt.seccomp.Store(nil)
 	}
 	if args.Flags&linux.CLONE_VFORK != 0 {
-		nt.vforkParent = t
+		nt.vforkParent.Store(t)
 	}
 
 	if args.Flags&linux.CLONE_CHILD_CLEARTID != 0 {
@@ -396,30 +396,36 @@ func getCloneSeccheckInfo(t, nt *Task, flags uint64) (seccheck.FieldSet, *pb.Clo
 //
 // Preconditions: The caller must be running on t's task goroutine.
 func (t *Task) maybeBeginVforkStop(child *Task) {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
-	if t.killedLocked() {
-		child.vforkParent = nil
+	if child.vforkParent.Load() != t {
 		return
 	}
-	if child.vforkParent == t {
-		t.beginInternalStopLocked((*vforkStop)(nil))
+	t.tg.pidns.owner.mu.Lock()
+	defer t.tg.pidns.owner.mu.Unlock()
+	t.tg.signalHandlers.mu.Lock()
+	defer t.tg.signalHandlers.mu.Unlock()
+	if child.vforkParent.Load() != t {
+		return
 	}
+	if t.killedLocked() {
+		child.vforkParent.Store(nil)
+		return
+	}
+	t.beginInternalStopLocked((*vforkStop)(nil))
 }
 
 func (t *Task) unstopVforkParent() {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	if p := t.vforkParent; p != nil {
+	if t.vforkParent.Load() == nil {
+		return
+	}
+	t.tg.pidns.owner.mu.Lock()
+	defer t.tg.pidns.owner.mu.Unlock()
+	if p := t.vforkParent.Load(); p != nil {
+		t.vforkParent.Store(nil)
 		p.tg.signalHandlers.mu.Lock()
 		defer p.tg.signalHandlers.mu.Unlock()
 		if _, ok := p.stop.(*vforkStop); ok {
 			p.endInternalStopLocked()
 		}
-		// Parent no longer needs to be unstopped.
-		t.vforkParent = nil
 	}
 }
 
@@ -666,7 +672,7 @@ func (t *Task) Unshare(flags int32) error {
 			return linuxerr.EPERM
 		}
 		oldMountNS := t.mountNamespace
-		mntns, err := t.k.vfs.CloneMountNamespace(t, creds, oldMountNS, &t.fsContext.root, &t.fsContext.cwd, t.k)
+		mntns, err := t.k.vfs.CloneMountNamespace(t, creds.UserNamespace, oldMountNS, &t.fsContext.root, &t.fsContext.cwd, t.k)
 		if err != nil {
 			return err
 		}

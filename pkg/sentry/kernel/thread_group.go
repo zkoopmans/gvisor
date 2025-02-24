@@ -15,7 +15,6 @@
 package kernel
 
 import (
-	goContext "context"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -23,7 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -49,14 +48,23 @@ type ThreadGroup struct {
 	// signalHandlers. (This is analogous to Linux's use of struct
 	// sighand_struct::siglock.)
 	//
-	// The signalHandlers pointer can only be mutated during an execve
-	// (Task.finishExec). Consequently, when it's possible for a task in the
-	// thread group to be completing an execve, signalHandlers is protected by
-	// the owning TaskSet.mu. Otherwise, it is possible to read the
-	// signalHandlers pointer without synchronization. In particular,
-	// completing an execve requires that all other tasks in the thread group
-	// have exited, so task goroutines do not need the owning TaskSet.mu to
-	// read the signalHandlers pointer of their thread groups.
+	// The signalHandlers pointer is only mutated during execve
+	// (Task.finishExec), which occurs with TaskSet.mu and (the previous)
+	// signalHandlers.mu locked. Consequently:
+	//
+	// - Completing an execve requires that all other tasks in the thread group
+	// have exited, so task goroutines for non-exiting tasks in the thread
+	// group can read signalHandlers without a race condition.
+	//
+	// - If TaskSet.mu is locked (for reading or writing), any goroutine may
+	// read signalHandlers without a race condition.
+	//
+	// - If it is impossible for a task in the thread group to be completing an
+	// execve for another reason, any goroutine may read signalHandlers without
+	// a race condition.
+	//
+	// - Otherwise, ThreadGroup.signalLock() should be used to non-racily lock
+	// signalHandlers.mu; it also returns the locked signalHandlers.
 	signalHandlers *SignalHandlers
 
 	// pendingSignals is the set of pending signals that may be handled by any
@@ -161,31 +169,19 @@ type ThreadGroup struct {
 
 	timerMu threadGroupTimerMutex `state:"nosave"`
 
-	// itimerRealTimer implements ITIMER_REAL for the thread group.
-	itimerRealTimer *ktime.Timer
+	// ITIMER_* timers:
+	itimerRealTimer    *ktime.SampledTimer
+	itimerRealListener itimerRealListener
+	itimerVirtTimer    ktime.SyntheticTimer
+	itimerVirtListener itimerVirtListener
+	itimerProfTimer    ktime.SyntheticTimer
+	itimerProfListener itimerProfListener
 
-	// itimerVirtSetting is the ITIMER_VIRTUAL setting for the thread group.
-	//
-	// itimerVirtSetting is protected by the signal mutex.
-	itimerVirtSetting ktime.Setting
-
-	// itimerProfSetting is the ITIMER_PROF setting for the thread group.
-	//
-	// itimerProfSetting is protected by the signal mutex.
-	itimerProfSetting ktime.Setting
-
-	// rlimitCPUSoftSetting is the setting for RLIMIT_CPU soft limit
-	// notifications for the thread group.
-	//
-	// rlimitCPUSoftSetting is protected by the signal mutex.
-	rlimitCPUSoftSetting ktime.Setting
-
-	// cpuTimersEnabled is non-zero if itimerVirtSetting.Enabled is true,
-	// itimerProfSetting.Enabled is true, rlimitCPUSoftSetting.Enabled is true,
-	// or limits.Get(CPU) is finite.
-	//
-	// cpuTimersEnabled is protected by the signal mutex.
-	cpuTimersEnabled atomicbitops.Uint32
+	// RLIMIT_CPU timers:
+	rlimitCPUSoftTimer    ktime.SyntheticTimer
+	rlimitCPUSoftListener rlimitCPUSoftListener
+	rlimitCPUHardTimer    ktime.SyntheticTimer
+	rlimitCPUHardListener rlimitCPUHardListener
 
 	// timers is the thread group's POSIX interval timers. nextTimerID is the
 	// TimerID at which allocation should begin searching for an unused ID.
@@ -194,9 +190,25 @@ type ThreadGroup struct {
 	timers      map[linux.TimerID]*IntervalTimer
 	nextTimerID linux.TimerID
 
-	// exitedCPUStats is the CPU usage for all exited tasks in the thread
-	// group. exitedCPUStats is protected by the TaskSet mutex.
-	exitedCPUStats usage.CPUStats
+	// appCPUClockLast is the last task to have incremented appCPUClock or set
+	// a timer dependent on appCPUClock.
+	appCPUClockLast atomic.Pointer[Task] `state:".(*Task)"`
+
+	// appCPUClock is the sum of Task.appCPUClock for all past and present
+	// tasks in the thread group.
+	appCPUClock ktime.SyntheticClock
+
+	// appSysCPUClockLast is the last task to have incremented appSysCPUClock
+	// or set a timer dependent on appSysCPUClock.
+	appSysCPUClockLast atomic.Pointer[Task] `state:".(*Task)"`
+
+	// appSysCPUClock is the sum of Task.appSysCPUClock for all past and
+	// present tasks in the thread group.
+	appSysCPUClock ktime.SyntheticClock
+
+	// yieldCount is the sum of Task.yieldCount for all past and present tasks
+	// in the thread group.
+	yieldCount atomicbitops.Uint64
 
 	// childCPUStats is the CPU usage of all joined descendants of this thread
 	// group. childCPUStats is protected by the TaskSet mutex.
@@ -279,31 +291,37 @@ func (k *Kernel) NewThreadGroup(pidns *PIDNamespace, sh *SignalHandlers, termina
 		},
 		signalHandlers:    sh,
 		terminationSignal: terminationSignal,
+		timers:            make(map[linux.TimerID]*IntervalTimer),
 		ioUsage:           &usage.IO{},
 		limits:            limits,
 	}
-	tg.itimerRealTimer = ktime.NewTimer(k.timekeeper.monotonicClock, &itimerRealListener{tg: tg})
-	tg.timers = make(map[linux.TimerID]*IntervalTimer)
+	tg.itimerRealTimer = ktime.NewSampledTimer(k.timekeeper.monotonicClock, &tg.itimerRealListener)
+	tg.itimerRealListener.tg = tg
+	tg.itimerVirtTimer.Init(&tg.appCPUClock, &tg.itimerVirtListener)
+	tg.itimerVirtListener.tg = tg
+	tg.itimerProfTimer.Init(&tg.appSysCPUClock, &tg.itimerProfListener)
+	tg.itimerProfListener.tg = tg
+	tg.rlimitCPUSoftTimer.Init(&tg.appSysCPUClock, &tg.rlimitCPUSoftListener)
+	tg.rlimitCPUSoftListener.tg = tg
+	tg.rlimitCPUHardTimer.Init(&tg.appSysCPUClock, &tg.rlimitCPUHardListener)
+	tg.rlimitCPUHardListener.tg = tg
 	tg.oldRSeqCritical.Store(&OldRSeqCriticalRegion{})
 	return tg
 }
 
-// saveOldRSeqCritical is invoked by stateify.
-func (tg *ThreadGroup) saveOldRSeqCritical() *OldRSeqCriticalRegion {
-	return tg.oldRSeqCritical.Load()
-}
-
-// loadOldRSeqCritical is invoked by stateify.
-func (tg *ThreadGroup) loadOldRSeqCritical(_ goContext.Context, r *OldRSeqCriticalRegion) {
-	tg.oldRSeqCritical.Store(r)
-}
-
-// SignalHandlers returns the signal handlers used by tg.
-//
-// Preconditions: The caller must provide the synchronization required to read
-// tg.signalHandlers, as described in the field's comment.
-func (tg *ThreadGroup) SignalHandlers() *SignalHandlers {
-	return tg.signalHandlers
+// signalLock atomically locks tg.SignalHandlers().mu and returns the
+// SignalHandlers.
+func (tg *ThreadGroup) signalLock() *SignalHandlers {
+	sh := tg.SignalHandlers()
+	for {
+		sh.mu.Lock()
+		sh2 := tg.SignalHandlers()
+		if sh == sh2 {
+			return sh
+		}
+		sh.mu.Unlock()
+		sh = sh2
+	}
 }
 
 // Limits returns tg's limits.
@@ -316,24 +334,33 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 	// Timers must be destroyed without holding the TaskSet or signal mutexes
 	// since timers send signals with Timer.mu locked.
 	tg.itimerRealTimer.Destroy()
+	tg.itimerVirtTimer.Destroy()
+	tg.itimerProfTimer.Destroy()
+	tg.rlimitCPUSoftTimer.Destroy()
+	tg.rlimitCPUHardTimer.Destroy()
 	var its []*IntervalTimer
-	tg.pidns.owner.mu.Lock()
 	tg.signalHandlers.mu.Lock()
 	for _, it := range tg.timers {
 		its = append(its, it)
 	}
 	clear(tg.timers) // nil maps can't be saved
 	// Disassociate from the tty if we have one.
+	var tty *TTY
 	if tg.tty != nil {
-		tg.tty.mu.Lock()
-		if tg.tty.tg == tg {
-			tg.tty.tg = nil
-		}
-		tg.tty.mu.Unlock()
-		tg.tty = nil
+		// Can't lock tty.mu due to lock ordering.
+		tty = tg.tty
 	}
 	tg.signalHandlers.mu.Unlock()
-	tg.pidns.owner.mu.Unlock()
+	if tty != nil {
+		tty.mu.Lock()
+		tg.signalHandlers.mu.Lock()
+		tg.tty = nil
+		if tty.tg == tg {
+			tty.tg = nil
+		}
+		tg.signalHandlers.mu.Unlock()
+		tty.mu.Unlock()
+	}
 	for _, it := range its {
 		it.DestroyTimer()
 	}
@@ -372,8 +399,16 @@ func (tg *ThreadGroup) walkDescendantThreadGroupsLocked(visitor func(*ThreadGrou
 	}
 }
 
+// TTY returns the thread group's controlling terminal. If nil, there is no
+// controlling terminal.
+func (tg *ThreadGroup) TTY() *TTY {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	return tg.tty
+}
+
 // SetControllingTTY sets tty as the controlling terminal of tg.
-func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) error {
+func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bool, isReadable bool) error {
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -391,11 +426,9 @@ func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) 
 	}
 	if tg.tty == tty {
 		return nil
-	} else if tg.tty != nil {
-		return linuxerr.EINVAL
 	}
 
-	creds := auth.CredentialsFromContext(tg.leader)
+	creds := auth.CredentialsFromContext(ctx)
 	hasAdmin := creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, creds.UserNamespace.Root())
 
 	// "If this terminal is already the controlling terminal of a different
@@ -494,24 +527,34 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 	return lastErr
 }
 
-// ForegroundProcessGroupID returns the foreground process group ID of the
-// thread group.
-func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error) {
+// ForegroundProcessGroup returns the foreground process group of the thread
+// group.
+func (tg *ThreadGroup) ForegroundProcessGroup(tty *TTY) (*ProcessGroup, error) {
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
-	tg.pidns.owner.mu.Lock()
-	defer tg.pidns.owner.mu.Unlock()
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
 
 	// fd must refer to the controlling terminal of the calling process.
 	// See tcgetpgrp(3)
 	if tg.tty != tty {
-		return 0, linuxerr.ENOTTY
+		return nil, linuxerr.ENOTTY
 	}
 
-	return tg.processGroup.session.foreground.id, nil
+	return tg.processGroup.session.foreground, nil
+}
+
+// ForegroundProcessGroupID returns the foreground process group ID of the
+// thread group.
+func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error) {
+	pg, err := tg.ForegroundProcessGroup(tty)
+	if err != nil {
+		return 0, err
+	}
+	return pg.id, nil
 }
 
 // SetForegroundProcessGroupID sets the foreground process group of tty to
@@ -609,15 +652,10 @@ func (tg *ThreadGroup) isInitInLocked(pidns *PIDNamespace) bool {
 	return pidns.tgids[tg] == initTID
 }
 
-// itimerRealListener implements ktime.Listener for ITIMER_REAL expirations.
-//
-// +stateify savable
-type itimerRealListener struct {
-	tg *ThreadGroup
-}
-
-// NotifyTimer implements ktime.TimerListener.NotifyTimer.
-func (l *itimerRealListener) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
-	l.tg.SendSignal(SignalInfoPriv(linux.SIGALRM))
-	return ktime.Setting{}, false
+// Execed returns whether this ThreadGroup has execed since creation.
+func (tg *ThreadGroup) Execed() bool {
+	ts := tg.TaskSet()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return tg.execed
 }

@@ -23,10 +23,11 @@
 //			dentry.dirMu
 //		    dentry.copyMu
 //		      filesystem.devMu
-//		      *** "memmap.Mappable locks" below this point
+//		      *** "memmap.Mappable/MappingIdentity locks" below this point
 //		      dentry.mapsMu
 //		        *** "memmap.Mappable locks taken by Translate" below this point
 //		        dentry.dataMu
+//		      filesystem.ancestryMu
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -116,6 +117,10 @@ type filesystem struct {
 	// ensure consistent lock ordering between dentry.dirMu in different
 	// dentries.
 	renameMu renameRWMutex `state:"nosave"`
+
+	// ancestryMu additionally protects dentry.parent and dentry.name as
+	// required by genericfstree.
+	ancestryMu ancestryRWMutex `state:"nosave"`
 
 	// dirInoCache caches overlay-private directory inode numbers by mapped
 	// bottommost device numbers and inode number. dirInoCache is protected by
@@ -360,7 +365,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		root.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 		// For root dir, it is okay to use top most level's stat to compute inode
 		// number because we don't allow copy ups on root dentries.
-		root.ino.Store(fs.newDirIno(rootStat.DevMajor, rootStat.DevMinor, rootStat.Ino))
+		orig := layerDevNoAndIno{
+			layerDevNumber: layerDevNumber{rootStat.DevMajor, rootStat.DevMinor},
+			ino:            rootStat.Ino,
+		}
+		root.ino.Store(fs.newDirIno(orig))
+		root.dirInoHash = orig
 	} else if !root.upperVD.Ok() {
 		root.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
 		rootDevMinor, err := fs.getLowerDevMinor(rootStat.DevMajor, rootStat.DevMinor)
@@ -451,13 +461,9 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 	return fsstat, nil
 }
 
-func (fs *filesystem) newDirIno(layerMajor, layerMinor uint32, layerIno uint64) uint64 {
+func (fs *filesystem) newDirIno(orig layerDevNoAndIno) uint64 {
 	fs.dirInoCacheMu.Lock()
 	defer fs.dirInoCacheMu.Unlock()
-	orig := layerDevNoAndIno{
-		layerDevNumber: layerDevNumber{layerMajor, layerMinor},
-		ino:            layerIno,
-	}
 	if ino, ok := fs.dirInoCache[orig]; ok {
 		return ino
 	}
@@ -465,6 +471,12 @@ func (fs *filesystem) newDirIno(layerMajor, layerMinor uint32, layerIno uint64) 
 	newIno := fs.lastDirIno
 	fs.dirInoCache[orig] = newIno
 	return newIno
+}
+
+func (fs *filesystem) releaseDirIno(orig layerDevNoAndIno) {
+	fs.dirInoCacheMu.Lock()
+	defer fs.dirInoCacheMu.Unlock()
+	delete(fs.dirInoCache, orig)
 }
 
 func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
@@ -480,11 +492,6 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 	}
 	fs.lowerDevMinors[orig] = minor
 	return minor, nil
-}
-
-// IsDescendant implements vfs.FilesystemImpl.IsDescendant.
-func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
-	return genericIsDescendant(vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
 }
 
 // dentry implements vfs.DentryImpl.
@@ -587,6 +594,10 @@ type dentry struct {
 	// watches, due to the fact that we do not have inode structures in this
 	// overlay implementation.
 	watches vfs.Watches
+
+	// dirInoHash is the entry hash in fs.dirInoCache. This is only set for
+	// directories.
+	dirInoHash layerDevNoAndIno
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -748,13 +759,13 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 	// that d was deleted.
 	deleted := d.vfsd.IsDead()
 
-	d.fs.renameMu.RLock()
+	d.fs.ancestryMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
 	if parent := d.parent.Load(); parent != nil {
 		parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
 	}
 	d.watches.Notify(ctx, "", events, cookie, et, deleted)
-	d.fs.renameMu.RUnlock()
+	d.fs.ancestryMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.

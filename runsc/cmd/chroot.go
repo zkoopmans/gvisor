@@ -19,10 +19,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/tpu"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -81,9 +82,79 @@ func copyFile(dst, src string) error {
 	return err
 }
 
+// setupMinimalProcfs creates a minimal procfs-like tree at `${chroot}/proc`.
+func setupMinimalProcfs(chroot string) error {
+	// We can't always directly mount procfs because it may be obstructed
+	// by submounts within it. See https://gvisor.dev/issue/10944.
+	// All we really need from procfs is /proc/self and a few kernel
+	// parameter files, which are typically not obstructed.
+	// So we create a tmpfs at /proc and manually copy the kernel parameter
+	// files into it. Then, to get /proc/self, we mount either a new
+	// instance of procfs (if possible), or a recursive bind mount of the
+	// procfs we do have access to (which still contains the obstructed
+	// submounts but /proc/self is not obstructed), and we symlink
+	// our /proc/self to the one in that mount.
+	//
+	// Why not try to mount the new procfs instance at /proc directly?
+	// Because that would cause the set of files at /proc to differ
+	// between the "new procfs instance" case and the "recursive bind
+	// mount" case. Thus, this could introduce a bug whereby gVisor starts
+	// to depend on a /proc file that is present in one case but not the
+	// other, without decent test coverage to catch it.
+	procRoot := filepath.Join(chroot, "/proc")
+	if err := os.Mkdir(procRoot, 0755); err != nil {
+		return fmt.Errorf("error creating /proc in chroot: %v", err)
+	}
+	if err := specutils.SafeMount("runsc-proc", procRoot, "tmpfs",
+		unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "", "/proc"); err != nil {
+		return fmt.Errorf("error mounting tmpfs in /proc: %v", err)
+	}
+	flags := uint32(unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC | unix.MS_RDONLY)
+	procSubmountDir := "sandbox-proc"
+	if newProcfsErr := mountInChroot(chroot, "proc", "/proc/"+procSubmountDir, "proc", flags); newProcfsErr != nil {
+		log.Debugf("Unable to mount a new instance of the procfs file system at %q (%v); trying a recursive bind mount instead.", filepath.Join(procRoot, procSubmountDir), newProcfsErr)
+		procSubmountDir = "host-proc"
+		if bindErr := mountInChroot(chroot, "/proc", "/proc/"+procSubmountDir, "bind",
+			unix.MS_BIND|unix.MS_REC|flags); bindErr != nil {
+			return fmt.Errorf("error recursively bind-mounting proc at %q (%w) after also failing to mount a new procfs instance there (%v)", filepath.Join(procRoot, procSubmountDir), bindErr, newProcfsErr)
+		}
+		log.Debugf("Successfully mounted a recursive bind mount of procfs at %q; continuing.", filepath.Join(procRoot, procSubmountDir))
+	}
+	// Create needed directories.
+	for _, d := range []string{
+		"/proc/sys",
+		"/proc/sys/kernel",
+		"/proc/sys/vm",
+	} {
+		if err := os.Mkdir(filepath.Join(chroot, d), 0755); err != nil {
+			return fmt.Errorf("error creating directory %q: %v", filepath.Join(chroot, d), err)
+		}
+	}
+	// Copy needed files.
+	for _, f := range []string{
+		"/proc/sys/vm/mmap_min_addr",
+		"/proc/sys/kernel/cap_last_cap",
+	} {
+		if err := copyFile(filepath.Join(chroot, f), f); err != nil {
+			return fmt.Errorf("failed to copy %q -> %q: %w", f, filepath.Join(chroot, f), err)
+		}
+	}
+	// Create symlink for /proc/self.
+	if err := os.Symlink(procSubmountDir+"/self", filepath.Join(procRoot, "self")); err != nil {
+		return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, "self"), procSubmountDir+"/self", err)
+	}
+	if err := os.Symlink(procSubmountDir+"/cpuinfo", filepath.Join(procRoot, "cpuinfo")); err != nil {
+		return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, "cpuinfo"), procSubmountDir+"/cpuinfo", err)
+	}
+	if err := os.Chmod(procRoot, 0o111); err != nil {
+		return fmt.Errorf("error chmodding %q: %v", procRoot, err)
+	}
+	return nil
+}
+
 // setUpChroot creates an empty directory with runsc mounted at /runsc and proc
 // mounted at /proc.
-func setUpChroot(pidns bool, spec *specs.Spec, conf *config.Config) error {
+func setUpChroot(spec *specs.Spec, conf *config.Config) error {
 	// We are a new mount namespace, so we can use /tmp as a directory to
 	// construct a new root.
 	chroot := os.TempDir()
@@ -108,18 +179,11 @@ func setUpChroot(pidns bool, spec *specs.Spec, conf *config.Config) error {
 		log.Warningf("Failed to copy /etc/localtime: %v. UTC timezone will be used.", err)
 	}
 
-	if pidns {
-		flags := uint32(unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC | unix.MS_RDONLY)
-		if err := mountInChroot(chroot, "proc", "/proc", "proc", flags); err != nil {
-			return fmt.Errorf("error mounting proc in chroot: %v", err)
-		}
-	} else {
-		if err := mountInChroot(chroot, "/proc", "/proc", "bind", unix.MS_BIND|unix.MS_RDONLY|unix.MS_REC); err != nil {
-			return fmt.Errorf("error mounting proc in chroot: %v", err)
-		}
+	if err := setupMinimalProcfs(chroot); err != nil {
+		return fmt.Errorf("error setting up minimal procfs in chroot %q: %v", chroot, err)
 	}
 
-	if err := tpuProxyUpdateChroot(chroot, spec, conf); err != nil {
+	if err := tpuProxyUpdateChroot("/", chroot, spec, conf); err != nil {
 		return fmt.Errorf("error configuring chroot for TPU devices: %w", err)
 	}
 
@@ -130,87 +194,60 @@ func setUpChroot(pidns bool, spec *specs.Spec, conf *config.Config) error {
 	return pivotRoot(chroot)
 }
 
-// Mount the path that dest points to for TPU at chroot, the mounted path is returned in absolute form.
-func mountTPUSyslinkInChroot(chroot, dest, relativePath string, validator func(link string) bool) (string, error) {
-	src, err := os.Readlink(dest)
-	if err != nil {
-		return "", fmt.Errorf("error reading %v: %v", src, err)
-	}
-	// Ensure the link is in the form we expect.
-	if !validator(src) {
-		return "", fmt.Errorf("unexpected link %q -> %q", dest, src)
-	}
-	path, err := filepath.Abs(path.Join(filepath.Dir(dest), src, relativePath))
-	if err != nil {
-		return "", fmt.Errorf("error parsing path %q: %v", src, err)
-	}
-	if err := mountInChroot(chroot, path, path, "bind", unix.MS_BIND|unix.MS_RDONLY); err != nil {
-		return "", fmt.Errorf("error mounting %q in chroot: %v", dest, err)
-	}
-	return path, nil
-}
-
-func mountTPUDeviceInfoInChroot(chroot, devicePath, sysfsFormat, pciDeviceFormat string) error {
-	deviceNum, valid, err := util.ExtractTpuDeviceMinor(devicePath)
-	if err != nil {
-		return fmt.Errorf("extracting TPU device minor: %w", err)
-	}
-	if !valid {
-		return nil
-	}
-	// Multiple paths link to the /sys/devices/pci0000:00/<pci_address>
-	// directory that contains all relevant sysfs accel/vfio device info that we need
-	// bind mounted into the sandbox chroot. We can construct this path by
-	// reading the link below, which points to
-	//   * /sys/devices/pci0000:00/<pci_address>/accel/accel#
-	//   * or /sys/devices/pci0000:00/<pci_address>/vfio-dev/vfio# for VFIO-based TPU
-	// and traversing up 2 directories.
-	// The sysDevicePath itself is a soft link to the deivce directory.
-	sysDevicePath := fmt.Sprintf(sysfsFormat, deviceNum)
-	sysPCIDeviceDir, err := mountTPUSyslinkInChroot(chroot, sysDevicePath, "../..", func(link string) bool {
-		sysDeviceLinkMatcher := regexp.MustCompile(fmt.Sprintf(pciDeviceFormat, deviceNum))
-		return sysDeviceLinkMatcher.MatchString(link)
-	})
-	if err != nil {
-		return err
-	}
-
-	// Mount the device's IOMMU group if available.
-	iommuGroupPath := path.Join(sysPCIDeviceDir, "iommu_group")
-	if _, err := os.Stat(iommuGroupPath); err == nil {
-		if _, err := mountTPUSyslinkInChroot(chroot, iommuGroupPath, "", func(link string) bool {
-			return fmt.Sprintf("../../../kernel/iommu_groups/%d", deviceNum) == link
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func tpuProxyUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config) error {
+func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *config.Config) error {
 	if !specutils.TPUProxyIsEnabled(spec, conf) {
 		return nil
 	}
-	// When a path glob is added to pathGlobToSysfsFormat, the corresponding pciDeviceFormat has to be added to pathGlobToPciDeviceFormat.
-	pathGlobToSysfsFormat := map[string]string{
-		"/dev/accel*": "/sys/class/accel/accel%d",
-		"/dev/vfio/*": "/sys/class/vfio-dev/vfio%d"}
-	pathGlobToPciDeviceFormat := map[string]string{
-		"/dev/accel*": `../../devices/pci0000:00/(\d+:\d+:\d+\.\d+)/accel/accel%d`,
-		"/dev/vfio/*": `../../devices/pci0000:00/(\d+:\d+:\d+\.\d+)/vfio-dev/vfio%d`}
-	// Bind mount device info directories for all TPU devices on the host.
-	// For v4 TPU, the directory /sys/devices/pci0000:00/<pci_address>/accel/accel# is mounted;
-	// For v5e TPU, the directory /sys/devices/pci0000:00/<pci_address>/vfio-dev/vfio# is mounted.
-	for pathGlob, sysfsFormat := range pathGlobToSysfsFormat {
-		paths, err := filepath.Glob(pathGlob)
+	allowedDeviceIDs := map[uint64]struct{}{}
+	paths, err := filepath.Glob(path.Join(hostRoot, "dev/vfio/*"))
+	if err != nil {
+		return fmt.Errorf("enumerating TPU device files: %w", err)
+	}
+	vfioDevicePath := path.Join(hostRoot, "dev/vfio/vfio")
+	for _, devPath := range paths {
+		if devPath == vfioDevicePath {
+			continue
+		}
+		devNum := path.Base(devPath)
+		iommuGroupPath := path.Join("/sys/kernel/iommu_groups", devNum)
+		if err := mountInChroot(chroot, path.Join(hostRoot, iommuGroupPath), iommuGroupPath, "bind", unix.MS_BIND|unix.MS_RDONLY); err != nil {
+			return fmt.Errorf("error mounting %q in chroot: %v", iommuGroupPath, err)
+		}
+		allowedDeviceIDs[tpu.TPUV5pDeviceID] = struct{}{}
+		allowedDeviceIDs[tpu.TPUV5eDeviceID] = struct{}{}
+		allowedDeviceIDs[tpu.TPUV6eDeviceID] = struct{}{}
+	}
+	if len(allowedDeviceIDs) == 0 {
+		paths, err = filepath.Glob(path.Join(hostRoot, "dev/accel*"))
 		if err != nil {
 			return fmt.Errorf("enumerating TPU device files: %w", err)
 		}
-		for _, devPath := range paths {
-			if err := mountTPUDeviceInfoInChroot(chroot, devPath, sysfsFormat, pathGlobToPciDeviceFormat[pathGlob]); err != nil {
-				return err
+		if len(paths) == 0 {
+			return fmt.Errorf("could not find any TPU devices on the host")
+		}
+		allowedDeviceIDs[tpu.TPUV4DeviceID] = struct{}{}
+		allowedDeviceIDs[tpu.TPUV4liteDeviceID] = struct{}{}
+	}
+	if len(allowedDeviceIDs) == 0 {
+		return fmt.Errorf("no TPU devices found on the host")
+	}
+	sysDevicesGlob := path.Join(hostRoot, "/sys/devices/pci*")
+	sysDevicesPaths, err := filepath.Glob(sysDevicesGlob)
+	if err != nil {
+		return fmt.Errorf("enumerating PCI device files: %w", err)
+	}
+	for _, sysDevicesPath := range sysDevicesPaths {
+		if err := filepath.WalkDir(sysDevicesPath, func(path string, d os.DirEntry, err error) error {
+			if d.Type().IsDir() && util.IsPCIDeviceDirTPU(path, allowedDeviceIDs) {
+				chrootPath := strings.Replace(path, hostRoot, "/", 1)
+				if err := mountInChroot(chroot, path, chrootPath, "bind", unix.MS_BIND|unix.MS_RDONLY); err != nil {
+					return fmt.Errorf("error mounting %q in chroot: %v", path, err)
+				}
 			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("walking %q: %w", sysDevicesPath, err)
 		}
 	}
-	return nil
+	return err
 }

@@ -28,10 +28,9 @@ const maxErrno = 134
 
 var linuxHostTranslations [maxErrno]*Error
 
-// FromHost translates a unix.Errno to a corresponding Error value.
-func FromHost(err unix.Errno) *Error {
-	if int(err) >= len(linuxHostTranslations) || linuxHostTranslations[err] == nil {
-		panic(fmt.Sprintf("unknown host errno %q (%d)", err.Error(), err))
+func getHostTranslation(err unix.Errno) *Error {
+	if uint64(err) >= uint64(len(linuxHostTranslations)) {
+		return nil
 	}
 	return linuxHostTranslations[err]
 }
@@ -81,7 +80,9 @@ var (
 	ErrShouldRestart             = newWithHost("interrupted system call should be restarted", errno.ERESTART, unix.ERESTART)
 	ErrStreamPipe                = newWithHost("streams pipe error", errno.ESTRPIPE, unix.ESTRPIPE)
 	ErrStructureNeedsCleaning    = newWithHost("structure needs cleaning", errno.EUCLEAN, unix.EUCLEAN)
-	ErrIsNamedFile               = newWithHost("is a named type file", errno.ENOTNAM, unix.ENOTNAM)
+	ErrIsNotNamedFile            = newWithHost("not a XENIX named type file", errno.ENOTNAM, unix.ENOTNAM)
+	ErrNotAvailable              = newWithHost("no XENIX semaphores available", errno.ENAVAIL, unix.ENAVAIL)
+	ErrIsNamedFile               = newWithHost("is a named type file", errno.EISNAM, unix.EISNAM)
 	ErrRemoteIO                  = newWithHost("remote I/O error", errno.EREMOTEIO, unix.EREMOTEIO)
 	ErrNoMedium                  = newWithHost("no medium found", errno.ENOMEDIUM, unix.ENOMEDIUM)
 	ErrWrongMediumType           = newWithHost("wrong medium type", errno.EMEDIUMTYPE, unix.EMEDIUMTYPE)
@@ -89,4 +90,6 @@ var (
 	ErrKeyExpired                = newWithHost("key has expired", errno.EKEYEXPIRED, unix.EKEYEXPIRED)
 	ErrKeyRevoked                = newWithHost("key has been revoked", errno.EKEYREVOKED, unix.EKEYREVOKED)
 	ErrKeyRejected               = newWithHost("key was rejected by service", errno.EKEYREJECTED, unix.EKEYREJECTED)
+	ErrRFKill                    = newWithHost("operation not possible due to RF-kill", errno.ERFKILL, unix.ERFKILL)
+	ErrHwPoison                  = newWithHost("memory page has hardware error", errno.EHWPOISON, unix.EHWPOISON)
 )

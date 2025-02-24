@@ -25,11 +25,12 @@
 //	        dentry.childrenMu
 //	        filesystem.syncMu
 //	        dentry.metadataMu
-//	          *** "memmap.Mappable locks" below this point
+//	          *** "memmap.Mappable/MappingIdentity locks" below this point
 //	          dentry.mapsMu
 //	            *** "memmap.Mappable locks taken by Translate" below this point
 //	            dentry.handleMu
 //	              dentry.dataMu
+//	          filesystem.ancestryMu
 //	          filesystem.inoMu
 //	specialFileFD.mu
 //	  specialFileFD.bufMu
@@ -60,7 +61,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
@@ -217,6 +218,10 @@ type filesystem struct {
 	//		is reachable from its children), or if it is a child dentry (such that
 	//		it is reachable from its parent).
 	renameMu sync.RWMutex `state:"nosave"`
+
+	// ancestryMu additionally protects dentry.parent and dentry.name as
+	// required by genericfstree.
+	ancestryMu sync.RWMutex `state:"nosave"`
 
 	dentryCache *dentryCache
 
@@ -379,6 +384,9 @@ type InternalFilesystemOptions struct {
 
 	// If OpenSocketsByConnecting is true, silently translate attempts to open
 	// files identifying as sockets to connect RPCs.
+	//
+	// TODO(b/354724938): Remove this option once there are no callers who
+	// rely on this behavior.
 	OpenSocketsByConnecting bool
 }
 
@@ -714,7 +722,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 	// root dentry failed in GetFilesystem.
 	if refs.GetLeakMode() != refs.NoLeakChecking && fs.root != nil {
 		fs.renameMu.Lock()
-		fs.root.releaseSyntheticRecursiveLocked(ctx)
+		fs.root.releaseExtraRefsRecursiveLocked(ctx)
 		fs.evictAllCachedDentriesLocked(ctx)
 		fs.renameMu.Unlock()
 
@@ -733,13 +741,14 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 }
 
-// releaseSyntheticRecursiveLocked traverses the tree with root d and decrements
-// the reference count on every synthetic dentry. Synthetic dentries have one
-// reference for existence that should be dropped during filesystem.Release.
+// releaseExtraRefsRecursiveLocked traverses the tree with root d and
+// decrements the reference count on every synthetic dentry and dentry with
+// endpoint != nil. Such dentries have one reference for existence that should
+// be dropped during filesystem.Release.
 //
 // Precondition: d.fs.renameMu is locked for writing.
-func (d *dentry) releaseSyntheticRecursiveLocked(ctx context.Context) {
-	if d.isSynthetic() {
+func (d *dentry) releaseExtraRefsRecursiveLocked(ctx context.Context) {
+	if d.isSynthetic() || d.endpoint != nil {
 		d.decRefNoCaching()
 		d.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
 	}
@@ -752,7 +761,7 @@ func (d *dentry) releaseSyntheticRecursiveLocked(ctx context.Context) {
 		d.childrenMu.Unlock()
 		for _, child := range children {
 			if child != nil {
-				child.releaseSyntheticRecursiveLocked(ctx)
+				child.releaseExtraRefsRecursiveLocked(ctx)
 			}
 		}
 	}
@@ -791,10 +800,12 @@ type dentry struct {
 
 	// refs is the reference count. Each dentry holds a reference on its
 	// parent, even if disowned. An additional reference is held on all
-	// synthetic dentries until they are unlinked or invalidated. When refs
-	// reaches 0, the dentry may be added to the cache or destroyed. If refs ==
-	// -1, the dentry has already been destroyed. refs is accessed using atomic
-	// memory operations.
+	// synthetic dentries, and all dentries for which endpoint is non-nil,
+	// until they are unlinked or invalidated. (Only a single additional
+	// reference is held on synthetic dentries that also have endpoint != nil.)
+	// When refs reaches 0, the dentry may be added to the cache or destroyed.
+	// If refs == -1, the dentry has already been destroyed. refs is accessed
+	// using atomic memory operations.
 	refs atomicbitops.Int64
 
 	// fs is the owning filesystem. fs is immutable.
@@ -976,8 +987,13 @@ type dentry struct {
 	haveTarget bool
 	target     string
 
-	// If this dentry represents a synthetic socket file, endpoint is the
-	// transport endpoint bound to this file.
+	// If this dentry represents a socket file, endpoint is the transport
+	// endpoint bound to this file.
+	//
+	// endpoint often originates from vfs.MknodOptions.Endpoint, in which case
+	// it can't be recovered if the dentry is evicted from the dentry cache.
+	// Consequently, an extra reference is held on dentries for which endpoint
+	// is non-nil to prevent eviction.
 	endpoint transport.BoundEndpoint
 
 	// If this dentry represents a synthetic named pipe, pipe is the pipe
@@ -1536,13 +1552,13 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 		events |= linux.IN_ISDIR
 	}
 
-	d.fs.renameMu.RLock()
+	d.fs.ancestryMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
 	if parent := d.parent.Load(); parent != nil {
 		parent.watches.Notify(ctx, d.name, events, cookie, et, d.isDeleted())
 	}
 	d.watches.Notify(ctx, "", events, cookie, et, d.isDeleted())
-	d.fs.renameMu.RUnlock()
+	d.fs.ancestryMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.

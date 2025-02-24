@@ -31,6 +31,21 @@ import (
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
+// Reused flag names.
+const (
+	flagDebug             = "debug"
+	flagDebugToUserLog    = "debug-to-user-log"
+	flagStrace            = "strace"
+	flagStraceSyscalls    = "strace-syscalls"
+	flagStraceLogSize     = "strace-log-size"
+	flagHostUDS           = "host-uds"
+	flagNetDisconnectOK   = "net-disconnect-ok"
+	flagReproduceNFTables = "reproduce-nftables"
+	flagOCISeccomp        = "oci-seccomp"
+	flagOverlay2          = "overlay2"
+	flagAllowFlagOverride = "allow-flag-override"
+)
+
 // RegisterFlags registers flags used to populate Config.
 func RegisterFlags(flagSet *flag.FlagSet) {
 	// Although these flags are not part of the OCI spec, they are used by
@@ -38,7 +53,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("root", "", "root directory for storage of container state.")
 	flagSet.String("log", "", "file path where internal debug information is written, default is stdout.")
 	flagSet.String("log-format", "text", "log format: text (default), json, or json-k8s.")
-	flagSet.Bool("debug", false, "enable debug logging.")
+	flagSet.Bool(flagDebug, false, "enable debug logging.")
 	flagSet.Bool("systemd-cgroup", false, "EXPERIMENTAL. Use systemd for cgroups.")
 
 	// These flags are unique to runsc, and are used to configure parts of the
@@ -52,24 +67,25 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("log-packets", false, "enable network packet logging.")
 	flagSet.String("pcap-log", "", "location of PCAP log file.")
 	flagSet.String("debug-log-format", "text", "log format: text (default), json, or json-k8s.")
-	flagSet.Bool("debug-to-user-log", false, "also emit Sentry logs to user-visible logs")
+	flagSet.Bool(flagDebugToUserLog, false, "also emit Sentry logs to user-visible logs")
 	// Only register -alsologtostderr flag if it is not already defined on this flagSet.
 	if flagSet.Lookup("alsologtostderr") == nil {
 		flagSet.Bool("alsologtostderr", false, "send log messages to stderr.")
 	}
-	flagSet.Bool("allow-flag-override", false, "allow OCI annotations (dev.gvisor.flag.<name>) to override flags for debugging.")
+	flagSet.Bool(flagAllowFlagOverride, false, "allow OCI annotations (dev.gvisor.flag.<name>) to override flags for debugging.")
 	flagSet.String("traceback", "system", "golang runtime's traceback level")
 
 	// Metrics flags.
 	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%ID%' will be replaced by the container ID, and '%RUNTIME_ROOT%' by the root. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
+	flagSet.String("final-metrics-log", "", "if set, write all metric data to this file upon sandbox termination")
 	flagSet.String("profiling-metrics", "", "comma separated list of metric names which are going to be written to the profiling-metrics-log file from within the sentry in CSV format. profiling-metrics will be snapshotted at a rate specified by profiling-metrics-rate-us. Requires profiling-metrics-log to be set. (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profiling-metrics-log", "", "file name to use for profiling-metrics output; use the special value '-' to write to the user-visible logs. (DO NOT USE IN PRODUCTION)")
 	flagSet.Int("profiling-metrics-rate-us", 1000, "the target rate (in microseconds) at which profiling metrics will be snapshotted.")
 
 	// Debugging flags: strace related
-	flagSet.Bool("strace", false, "enable strace.")
-	flagSet.String("strace-syscalls", "", "comma-separated list of syscalls to trace. If --strace is true and this list is empty, then all syscalls will be traced.")
-	flagSet.Uint("strace-log-size", 1024, "default size (in bytes) to log data argument blobs.")
+	flagSet.Bool(flagStrace, false, "enable strace.")
+	flagSet.String(flagStraceSyscalls, "", "comma-separated list of syscalls to trace. If --strace is true and this list is empty, then all syscalls will be traced.")
+	flagSet.Uint(flagStraceLogSize, 1024, "default size (in bytes) to log data argument blobs.")
 	flagSet.Bool("strace-event", false, "send strace to event.")
 
 	// Flags that control sandbox runtime behavior.
@@ -86,9 +102,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("rootless", false, "it allows the sandbox to be started with a user that is not root. Sandbox and Gofer processes may run with same privileges as current user.")
 	flagSet.Var(leakModePtr(refs.NoLeakChecking), "ref-leak-mode", "sets reference leak check mode: disabled (default), log-names, log-traces.")
 	flagSet.Bool("cpu-num-from-quota", false, "set cpu number to cpu quota (least integer greater or equal to quota value, but not less than 2)")
-	flagSet.Bool("oci-seccomp", false, "Enables loading OCI seccomp filters inside the sandbox.")
+	flagSet.Bool(flagOCISeccomp, false, "Enables loading OCI seccomp filters inside the sandbox.")
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
 	flagSet.String("pod-init-config", "", "path to configuration file with additional steps to take during pod creation.")
+	flagSet.Var(HostSettingsCheck.Ptr(), "host-settings", "how to handle non-optimal host kernel settings: check (default, advisory-only), ignore (do not check), adjust (best-effort auto-adjustment), or enforce (auto-adjustment must succeed).")
+	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
@@ -97,15 +115,15 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
 	flagSet.Var(fileAccessTypePtr(FileAccessShared), "file-access-mounts", "specifies which filesystem validation to use for volumes other than the root mount: shared (default), exclusive.")
 	flagSet.Bool("overlay", false, "DEPRECATED: use --overlay2=all:memory to achieve the same effect")
-	flagSet.Var(defaultOverlay2(), "overlay2", "wrap mounts with overlayfs. Format is {mount}:{medium}, where 'mount' can be 'root' or 'all' and medium can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created. 'none' will turn overlay mode off.")
+	flagSet.Var(defaultOverlay2(), flagOverlay2, "wrap mounts with overlayfs. Format is {mount}:{medium}, where 'mount' can be 'root' or 'all' and medium can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created. 'none' will turn overlay mode off.")
 	flagSet.Bool("fsgofer-host-uds", false, "DEPRECATED: use host-uds=all")
-	flagSet.Var(hostUDSPtr(HostUDSNone), "host-uds", "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
+	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
 
 	flagSet.Bool("vfs2", true, "DEPRECATED: this flag has no effect.")
 	flagSet.Bool("fuse", true, "DEPRECATED: this flag has no effect.")
 	flagSet.Bool("lisafs", true, "DEPRECATED: this flag has no effect.")
-	flagSet.Bool("cgroupfs", false, "Automatically mount cgroupfs.")
+	flagSet.Bool("cgroupfs", false, "DEPRECATED: this flag has no effect.")
 	flagSet.Bool("ignore-cgroups", false, "don't configure cgroups.")
 	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
@@ -127,13 +145,14 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(&xdpConfig, "EXPERIMENTAL-xdp", `whether and how to use XDP. Can be one of: "off" (default), "ns", "redirect:<device name>", or "tunnel:<device name>"`)
 	flagSet.Bool("EXPERIMENTAL-xdp-need-wakeup", true, "EXPERIMENTAL. Use XDP_USE_NEED_WAKEUP with XDP sockets.") // TODO(b/240191988): Figure out whether this helps and remove it as a flag.
 	flagSet.Bool("reproduce-nat", false, "Scrape the host netns NAT table and reproduce it in the sandbox.")
-	flagSet.Bool("reproduce-nftables", false, "Attempt to scrape and reproduce nftable rules inside the sandbox. Overrides reproduce-nat when true.")
-	flagSet.Bool("net-disconnect-ok", false, "Indicates whether the link endpoint capability CapabilityDisconnectOk should be set. This allows open connections to be disconnected upon save.")
+	flagSet.Bool(flagReproduceNFTables, false, "Attempt to scrape and reproduce nftable rules inside the sandbox. Overrides reproduce-nat when true.")
+	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "EXPERIMENTAL: enable support for Nvidia GPUs")
 	flagSet.Bool("nvproxy-docker", false, "DEPRECATED: use nvidia-container-runtime or `docker run --gpus` directly. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
+	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("tpuproxy", false, "EXPERIMENTAL: enable support for TPU device passthrough.")
 
 	// Test flags, not to be used outside tests, ever.
@@ -143,6 +162,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
+	flagSet.Bool("TESTONLY-save-restore-netstack", false, "TEST ONLY; enable save/restore for netstack.")
 }
 
 // overrideAllowlist lists all flags that can be changed using OCI
@@ -152,15 +172,31 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 var overrideAllowlist = map[string]struct {
 	check func(name string, value string) error
 }{
-	"debug":             {},
-	"debug-to-user-log": {},
-	"strace":            {},
-	"strace-syscalls":   {},
-	"strace-log-size":   {},
-	"host-uds":          {},
-	"net-disconnect-ok": {},
+	flagDebug:             {},
+	flagDebugToUserLog:    {},
+	flagStrace:            {},
+	flagStraceSyscalls:    {},
+	flagStraceLogSize:     {},
+	flagHostUDS:           {},
+	flagNetDisconnectOK:   {},
+	flagReproduceNFTables: {},
+	flagOverlay2:          {check: checkOverlay2},
+	flagOCISeccomp:        {check: checkOciSeccomp},
+}
 
-	"oci-seccomp": {check: checkOciSeccomp},
+// checkOverlay2 ensures that overlay2 can only be enabled using "memory" or
+// "self" mediums.
+func checkOverlay2(name string, value string) error {
+	var o Overlay2
+	if err := o.Set(value); err != nil {
+		return fmt.Errorf("invalid overlay2 annotation: %w", err)
+	}
+	switch o.medium {
+	case NoOverlay, MemoryOverlay, SelfOverlay:
+		return nil
+	default:
+		return fmt.Errorf("%q overlay medium requires flag %q to be enabled", value, flagAllowFlagOverride)
+	}
 }
 
 // checkOciSeccomp ensures that seccomp can be enabled but not disabled.
@@ -170,7 +206,7 @@ func checkOciSeccomp(name string, value string) error {
 		return err
 	}
 	if !enable {
-		return fmt.Errorf("disabling %q requires flag %q to be enabled", name, "allow-flag-override")
+		return fmt.Errorf("disabling %q requires flag %q to be enabled", name, flagAllowFlagOverride)
 	}
 	return nil
 }

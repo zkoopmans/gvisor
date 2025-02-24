@@ -50,7 +50,10 @@ func (fd *frontendFD) StateFields() []string {
 		"containerName",
 		"hostFD",
 		"memmapFile",
-		"queue",
+		"internalQueue",
+		"internalEntry",
+		"cachedEvents",
+		"appQueue",
 		"clients",
 	}
 }
@@ -66,8 +69,11 @@ func (fd *frontendFD) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(5, &fd.containerName)
 	stateSinkObject.Save(6, &fd.hostFD)
 	stateSinkObject.Save(7, &fd.memmapFile)
-	stateSinkObject.Save(8, &fd.queue)
-	stateSinkObject.Save(9, &fd.clients)
+	stateSinkObject.Save(8, &fd.internalQueue)
+	stateSinkObject.Save(9, &fd.internalEntry)
+	stateSinkObject.Save(10, &fd.cachedEvents)
+	stateSinkObject.Save(11, &fd.appQueue)
+	stateSinkObject.Save(12, &fd.clients)
 }
 
 // +checklocksignore
@@ -80,8 +86,11 @@ func (fd *frontendFD) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(5, &fd.containerName)
 	stateSourceObject.Load(6, &fd.hostFD)
 	stateSourceObject.Load(7, &fd.memmapFile)
-	stateSourceObject.Load(8, &fd.queue)
-	stateSourceObject.Load(9, &fd.clients)
+	stateSourceObject.Load(8, &fd.internalQueue)
+	stateSourceObject.Load(9, &fd.internalEntry)
+	stateSourceObject.Load(10, &fd.cachedEvents)
+	stateSourceObject.Load(11, &fd.appQueue)
+	stateSourceObject.Load(12, &fd.clients)
 	stateSourceObject.AfterLoad(func() { fd.afterLoad(ctx) })
 }
 
@@ -120,6 +129,7 @@ func (nvp *nvproxy) StateTypeName() string {
 func (nvp *nvproxy) StateFields() []string {
 	return []string{
 		"version",
+		"capsEnabled",
 		"frontendFDs",
 		"clients",
 	}
@@ -129,15 +139,17 @@ func (nvp *nvproxy) StateFields() []string {
 func (nvp *nvproxy) StateSave(stateSinkObject state.Sink) {
 	nvp.beforeSave()
 	stateSinkObject.Save(0, &nvp.version)
-	stateSinkObject.Save(1, &nvp.frontendFDs)
-	stateSinkObject.Save(2, &nvp.clients)
+	stateSinkObject.Save(1, &nvp.capsEnabled)
+	stateSinkObject.Save(2, &nvp.frontendFDs)
+	stateSinkObject.Save(3, &nvp.clients)
 }
 
 // +checklocksignore
 func (nvp *nvproxy) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &nvp.version)
-	stateSourceObject.Load(1, &nvp.frontendFDs)
-	stateSourceObject.Load(2, &nvp.clients)
+	stateSourceObject.Load(1, &nvp.capsEnabled)
+	stateSourceObject.Load(2, &nvp.frontendFDs)
+	stateSourceObject.Load(3, &nvp.clients)
 	stateSourceObject.AfterLoad(func() { nvp.afterLoad(ctx) })
 }
 
@@ -151,6 +163,7 @@ func (o *object) StateFields() []string {
 		"client",
 		"class",
 		"handle",
+		"parent",
 		"impl",
 		"deps",
 		"rdeps",
@@ -167,10 +180,11 @@ func (o *object) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &o.client)
 	stateSinkObject.Save(2, &o.class)
 	stateSinkObject.Save(3, &o.handle)
-	stateSinkObject.Save(4, &o.impl)
-	stateSinkObject.Save(5, &o.deps)
-	stateSinkObject.Save(6, &o.rdeps)
-	stateSinkObject.Save(7, &o.objectFreeEntry)
+	stateSinkObject.Save(4, &o.parent)
+	stateSinkObject.Save(5, &o.impl)
+	stateSinkObject.Save(6, &o.deps)
+	stateSinkObject.Save(7, &o.rdeps)
+	stateSinkObject.Save(8, &o.objectFreeEntry)
 }
 
 func (o *object) afterLoad(context.Context) {}
@@ -181,10 +195,11 @@ func (o *object) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(1, &o.client)
 	stateSourceObject.Load(2, &o.class)
 	stateSourceObject.Load(3, &o.handle)
-	stateSourceObject.Load(4, &o.impl)
-	stateSourceObject.Load(5, &o.deps)
-	stateSourceObject.Load(6, &o.rdeps)
-	stateSourceObject.Load(7, &o.objectFreeEntry)
+	stateSourceObject.Load(4, &o.parent)
+	stateSourceObject.Load(5, &o.impl)
+	stateSourceObject.Load(6, &o.deps)
+	stateSourceObject.Load(7, &o.rdeps)
+	stateSourceObject.Load(8, &o.objectFreeEntry)
 }
 
 func (c *capturedRmAllocParams) StateTypeName() string {

@@ -15,21 +15,20 @@
 package fuse
 
 import (
-	"fmt"
-	gotime "time"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -51,6 +50,7 @@ type inode struct {
 	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	kernfs.CachedMappable
+	kernfs.InodeFSOwned
 
 	// the owning filesystem. fs is immutable.
 	fs *filesystem
@@ -66,13 +66,13 @@ type inode struct {
 	// that attrMu is locked. Writing entryTime requires that attrMu is locked
 	// and that entryTimeSeq is in a writer critical section.
 	entryTimeSeq sync.SeqCount `state:"nosave"`
-	entryTime    time.Time
+	entryTime    ktime.Time
 
 	// attrVersion is the version of the last attribute change.
 	attrVersion atomicbitops.Uint64
 
 	// attrTime is the time at which the attributes become invalid.
-	attrTime time.Time
+	attrTime ktime.Time
 
 	// link is result of following a symbolic link.
 	link string
@@ -113,14 +113,6 @@ type inode struct {
 
 	// +checklocks:attrMu
 	blockSize atomicbitops.Uint32 // 0 if unknown.
-}
-
-func blockerFromContext(ctx context.Context) context.Blocker {
-	kernelTask := kernel.TaskFromContext(ctx)
-	if kernelTask == nil {
-		return ctx
-	}
-	return kernelTask
 }
 
 func pidFromContext(ctx context.Context) uint32 {
@@ -179,12 +171,9 @@ func (i *inode) touchAtime() {
 	i.atime.Store(i.fs.clock.Now().Nanoseconds())
 }
 
+// Precondition: isValidType(mode) == true.
 // +checklocks:i.attrMu
 func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid uint64, mode linux.FileMode, nlink uint32) {
-	if mode.FileType() == 0 {
-		panic(fmt.Sprintf("No file type specified in 'mode' for InodeAttrs.Init(): mode=0%o", mode))
-	}
-
 	i.nodeID = nodeid
 	i.ino.Store(nodeid)
 	i.mode.Store(uint32(mode))
@@ -201,7 +190,7 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 
 // +checklocks:i.attrMu
 func (i *inode) updateEntryTime(entrySec, entryNSec int64) {
-	entryTime := time.FromTimespec(linux.Timespec{Sec: entrySec, Nsec: entryNSec})
+	entryTime := ktime.FromTimespec(linux.Timespec{Sec: entrySec, Nsec: entryNSec})
 	SeqAtomicStoreTime(&i.entryTimeSeq, &i.entryTime, i.fs.clock.Now().AddTime(entryTime))
 }
 
@@ -280,7 +269,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fdImpl vfs.FileDescriptionImpl
 		opcode linux.FUSEOpcode
 	)
-	switch i.filemode().FileType() {
+	switch ft := i.filemode().FileType(); ft {
 	case linux.S_IFREG:
 		regularFD := &regularFileFD{}
 		fd = &(regularFD.fileDescription)
@@ -302,6 +291,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		opcode = linux.FUSE_OPENDIR
 	case linux.S_IFLNK:
 		return nil, linuxerr.ELOOP
+	default:
+		log.Warningf("Open on unknown file type: %v", ft)
+		return nil, linuxerr.EINVAL
 	}
 
 	fd.LockFD.Init(&i.locks)
@@ -565,7 +557,10 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}
-	child := i.fs.newInode(ctx, out.FUSEEntryOut)
+	child, err := i.fs.newInode(ctx, out.FUSEEntryOut)
+	if err != nil {
+		return nil, err
+	}
 	if opcode == linux.FUSE_CREATE {
 		// File handler is returned by fuse server at a time of file create.
 		// Save it temporary in a created child, so Open could return it when invoked
@@ -601,7 +596,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 		}
 		i.link = string(res.data[res.hdr.SizeBytes():])
 		if !mnt.Options().ReadOnly {
-			i.attrTime = time.ZeroTime
+			i.attrTime = ktime.ZeroTime
 		}
 	}
 	return i.link, nil
@@ -611,7 +606,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 //
 // +checklocks:i.attrMu
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
-	ns := gotime.Second.Nanoseconds()
+	ns := time.Second.Nanoseconds()
 	return linux.FUSEAttr{
 		Ino:       i.nodeID,
 		UID:       i.uid.Load(),
@@ -875,7 +870,7 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
 	i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 	i.fs.conn.mu.Unlock()
-	i.attrTime = i.fs.clock.Now().AddTime(time.FromTimespec(linux.Timespec{Sec: validSec, Nsec: validNSec}))
+	i.attrTime = i.fs.clock.Now().AddTime(ktime.FromTimespec(linux.Timespec{Sec: validSec, Nsec: validNSec}))
 
 	i.ino.Store(attr.Ino)
 

@@ -111,6 +111,10 @@ type Filesystem struct {
 	//   fs.deferDecRef(dentry)
 	mu filesystemRWMutex `state:"nosave"`
 
+	// ancestryMu additionally protects dentry.parent and dentry.name as
+	// required by genericfstree.
+	ancestryMu ancestryRWMutex `state:"nosave"`
+
 	// nextInoMinusOne is used to to allocate inode numbers on this
 	// filesystem. Must be accessed by atomic operations.
 	nextInoMinusOne atomicbitops.Uint64
@@ -313,6 +317,27 @@ func (d *Dentry) decRefLocked(ctx context.Context) {
 	}
 }
 
+// Invalidate invalidates the dentry and its children.
+func (d *Dentry) Invalidate(ctx context.Context) {
+	d.fs.mu.RLock()
+	defer d.fs.processDeferredDecRefs(ctx)
+	defer d.fs.mu.RUnlock()
+	parent := d.parent.Load()
+	if parent == nil {
+		return
+	}
+	parent.dirMu.Lock()
+	child := parent.children[d.name]
+	if child != d {
+		parent.dirMu.Unlock()
+		return
+	}
+	delete(parent.children, d.name)
+	parent.dirMu.Unlock()
+
+	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
+}
+
 // cacheLocked should be called after d's reference count becomes 0. The ref
 // count check may happen before acquiring d.fs.mu so there might be a race
 // condition where the ref count is increased again by the time the caller
@@ -447,6 +472,7 @@ func (d *Dentry) destroy(ctx context.Context) {
 		panic("dentry.destroy() called with references on the dentry")
 	}
 
+	d.inode.UnregisterDentry(d)
 	d.inode.DecRef(ctx) // IncRef from Init.
 
 	refs.Unregister(d)
@@ -501,6 +527,7 @@ func (d *Dentry) Init(fs *Filesystem, inode Inode) {
 		d.flags = atomicbitops.FromUint32(d.flags.RacyLoad() | dflagsIsSymlink)
 	}
 	refs.Register(d)
+	inode.RegisterDentry(d)
 }
 
 // VFSDentry returns the generic vfs dentry for this kernfs dentry.
@@ -537,11 +564,11 @@ func (d *Dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 	// Don't bother looking for a parent if the inode is anonymous. It
 	// won't have one.
 	if !d.inode.Anonymous() {
-		d.fs.mu.RLock()
+		d.fs.ancestryMu.RLock()
 		if parent := d.parent.Load(); parent != nil {
 			parent.inode.Watches().Notify(ctx, d.name, events, cookie, et, d.isDeleted())
 		}
-		d.fs.mu.RUnlock()
+		d.fs.ancestryMu.RUnlock()
 	}
 
 	d.inode.Watches().Notify(ctx, "", events, cookie, et, d.isDeleted())
@@ -597,7 +624,7 @@ func (d *Dentry) Inode() Inode {
 // filesystem.
 func (d *Dentry) FSLocalPath() string {
 	var b fspath.Builder
-	_ = genericPrependPath(vfs.VirtualDentry{}, nil, d, &b)
+	_ = genericPrependPath(d.fs, vfs.VirtualDentry{}, nil, d, &b)
 	b.PrependByte('/')
 	return b.String()
 }
@@ -728,6 +755,13 @@ type Inode interface {
 	// Anonymous indicates that the Inode is anonymous. It will never have
 	// a name or parent.
 	Anonymous() bool
+
+	// RegisterDentry is called when a new dentry representing the inode is
+	// created.
+	RegisterDentry(d *Dentry)
+
+	// UnregisterDentry is called when the specified dentry is destroyed.
+	UnregisterDentry(d *Dentry)
 }
 
 type inodeRefs interface {

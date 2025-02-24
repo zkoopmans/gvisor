@@ -233,6 +233,7 @@ func (rf *regularFile) StateFields() []string {
 		"writableMappingPages",
 		"data",
 		"seals",
+		"initiallyUnlinked",
 		"size",
 	}
 }
@@ -248,7 +249,8 @@ func (rf *regularFile) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &rf.writableMappingPages)
 	stateSinkObject.Save(4, &rf.data)
 	stateSinkObject.Save(5, &rf.seals)
-	stateSinkObject.Save(6, &rf.size)
+	stateSinkObject.Save(6, &rf.initiallyUnlinked)
+	stateSinkObject.Save(7, &rf.size)
 }
 
 func (rf *regularFile) afterLoad(context.Context) {}
@@ -261,7 +263,8 @@ func (rf *regularFile) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(3, &rf.writableMappingPages)
 	stateSourceObject.Load(4, &rf.data)
 	stateSourceObject.Load(5, &rf.seals)
-	stateSourceObject.Load(6, &rf.size)
+	stateSourceObject.Load(6, &rf.initiallyUnlinked)
+	stateSourceObject.Load(7, &rf.size)
 }
 
 func (fd *regularFileFD) StateTypeName() string {
@@ -387,6 +390,7 @@ func (fs *filesystem) StateFields() []string {
 		"maxSizeInPages",
 		"pagesUsed",
 		"allowXattrPrefix",
+		"ovlWhiteout",
 	}
 }
 
@@ -409,6 +413,7 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(9, &fs.maxSizeInPages)
 	stateSinkObject.Save(10, &fs.pagesUsed)
 	stateSinkObject.Save(11, &fs.allowXattrPrefix)
+	stateSinkObject.Save(12, &fs.ovlWhiteout)
 }
 
 func (fs *filesystem) afterLoad(context.Context) {}
@@ -426,6 +431,7 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(9, &fs.maxSizeInPages)
 	stateSourceObject.Load(10, &fs.pagesUsed)
 	stateSourceObject.Load(11, &fs.allowXattrPrefix)
+	stateSourceObject.Load(12, &fs.ovlWhiteout)
 	stateSourceObject.LoadValue(1, new(string), func(y any) { fs.loadMf(ctx, y.(string)) })
 }
 

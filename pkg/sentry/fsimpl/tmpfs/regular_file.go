@@ -80,6 +80,15 @@ type regularFile struct {
 	// Protected by dataMu.
 	seals uint32
 
+	// initiallyUnlinked is true if this file was created using NewZeroFile or
+	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
+	// be true when the equivalent shmem file in Linux would use
+	// shmem_anon_vm_ops rather than shmem_vm_ops.
+	//
+	// initiallyUnlinked is immutable, but stored here since it fits into
+	// alignment padding.
+	initiallyUnlinked bool
+
 	// size is the size of data.
 	//
 	// Protected by both dataMu and inode.mu; reading it requires holding
@@ -114,6 +123,7 @@ func newUnlinkedRegularFileDescription(ctx context.Context, creds *auth.Credenti
 	}
 
 	inode := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777, nil /* parentDir */)
+	inode.impl.(*regularFile).initiallyUnlinked = true
 	d := fs.newDentry(inode)
 	defer d.DecRef(ctx)
 	d.name = name
@@ -298,6 +308,19 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	}
 	if optional.End > pgend {
 		optional.End = pgend
+	}
+	// Constrain allocation to at most maxOptionalBytes or required.Length(),
+	// whichever is greater.
+	const maxOptionalBytes = 64 << 10 // 64 KB, arbitrarily matches Linux's default fault_around_pages
+	if required.Length() >= maxOptionalBytes {
+		optional = required
+	} else {
+		if optional.Length() > maxOptionalBytes {
+			optional.Start = required.Start
+			if optional.Length() > maxOptionalBytes {
+				optional.End = optional.Start + maxOptionalBytes
+			}
+		}
 	}
 	pagesToFill := rf.data.PagesToFill(required, optional)
 	if !rf.inode.fs.accountPages(pagesToFill) {
@@ -588,6 +611,9 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
 	file := fd.inode().impl.(*regularFile)
 	opts.SentryOwnedContent = true
+	if file.initiallyUnlinked {
+		opts.NameMut = memmap.NameMutAnonShmem
+	}
 	return vfs.GenericConfigureMMap(&fd.vfsfd, file, opts)
 }
 
@@ -819,11 +845,15 @@ func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.Blo
 		// causes a lot of context switching. Use write(2) host syscall instead,
 		// which makes one context switch and faults all the pages that are touched
 		// during the write.
+		fd, err := rw.file.inode.fs.mf.DataFD(fr)
+		if err != nil {
+			return 0, err
+		}
 		return hostfd.Pwritev2(
-			int32(rw.file.inode.fs.mf.FD()), // fd
-			srcs.TakeFirst64(fr.Length()),   // srcs
-			int64(fr.Start),                 // offset
-			0,                               // flags
+			int32(fd),                     // fd
+			srcs.TakeFirst64(fr.Length()), // srcs
+			int64(fr.Start),               // offset
+			0,                             // flags
 		)
 	}
 	// Get internal mappings.

@@ -20,7 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -37,7 +37,7 @@ type TimerFileDescription struct {
 	vfs.NoLockFD
 
 	events waiter.Queue
-	timer  *ktime.Timer
+	timer  ktime.Timer
 
 	// val is the number of timer expirations since the last successful
 	// call to PRead, or SetTime. val must be accessed using atomic memory
@@ -53,7 +53,7 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, 
 	vd := vfsObj.NewAnonVirtualDentry("[timerfd]")
 	defer vd.DecRef(ctx)
 	tfd := &TimerFileDescription{}
-	tfd.timer = ktime.NewTimer(clock, tfd)
+	tfd.timer = clock.NewTimer(tfd)
 	if err := tfd.vfsfd.Init(tfd, flags, vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		DenyPRead:         true,
@@ -98,7 +98,7 @@ func (tfd *TimerFileDescription) GetTime() (ktime.Time, ktime.Setting) {
 // of expirations to 0, and returns the previous setting and the time at which
 // it was observed.
 func (tfd *TimerFileDescription) SetTime(s ktime.Setting) (ktime.Time, ktime.Setting) {
-	return tfd.timer.SwapAnd(s, func() { tfd.val.Store(0) })
+	return tfd.timer.Set(s, func() { tfd.val.Store(0) })
 }
 
 // Readiness implements waiter.Waitable.Readiness.
@@ -142,8 +142,7 @@ func (tfd *TimerFileDescription) Release(context.Context) {
 }
 
 // NotifyTimer implements ktime.TimerListener.NotifyTimer.
-func (tfd *TimerFileDescription) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
+func (tfd *TimerFileDescription) NotifyTimer(exp uint64) {
 	tfd.val.Add(exp)
 	tfd.events.Notify(waiter.ReadableEvents)
-	return ktime.Setting{}, false
 }

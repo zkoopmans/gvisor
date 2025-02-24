@@ -27,6 +27,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -64,7 +65,7 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 	if err != nil {
 		panic(fmt.Sprintf("failed to allocate a new subprocess context memory region"))
 	}
-	addr, _, errno := unix.RawSyscall6(
+	addr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		uintptr(fr.Length()),
@@ -80,7 +81,7 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 
 func saveFPState(ctx *sharedContext, ac *arch.Context64) {
 	fpState := ac.FloatingPointData().BytePointer()
-	dst := unsafeSlice(uintptr(unsafe.Pointer(fpState)), archState.FpLen())
+	dst := unsafe.Slice(fpState, archState.FpLen())
 	src := ctx.shared.FPState[:]
 	copy(dst, src)
 }
@@ -95,7 +96,7 @@ func restoreFPState(ctx *sharedContext, c *platformContext, ac *arch.Context64) 
 	ctx.setFPStateChanged()
 
 	fpState := ac.FloatingPointData().BytePointer()
-	src := unsafeSlice(uintptr(unsafe.Pointer(fpState)), archState.FpLen())
+	src := unsafe.Slice(fpState, archState.FpLen())
 	dst := ctx.shared.FPState[:]
 	copy(dst, src)
 }

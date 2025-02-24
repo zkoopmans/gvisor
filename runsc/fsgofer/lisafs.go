@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 
@@ -64,6 +65,18 @@ type Config struct {
 	// DonateMountPointFD indicates whether a host FD to the mount point should
 	// be donated to the client on Mount RPC.
 	DonateMountPointFD bool
+
+	// Gofer process's RUID.
+	RUID int
+
+	// Gofer process's EUID.
+	EUID int
+
+	// Gofer process's RGID.
+	RGID int
+
+	// Gofer process's EGID.
+	EGID int
 }
 
 var procSelfFD *rwfd.FD
@@ -178,6 +191,7 @@ func (s *LisafsServer) SupportedMessages() []lisafs.MID {
 		lisafs.BindAt,
 		lisafs.Listen,
 		lisafs.Accept,
+		lisafs.ConnectWithCreds,
 	}
 }
 
@@ -288,12 +302,17 @@ func (fd *controlFDLisa) Stat() (linux.Statx, error) {
 // SetStat implements lisafs.ControlFDImpl.SetStat.
 func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, failureErr error) {
 	if stat.Mask&unix.STATX_MODE != 0 {
-		if fd.IsSocket() {
-			// fchmod(2) on socket files created via bind(2) fails. We need to
-			// fchmodat(2) it from its parent.
+		switch fd.FileType() {
+		case unix.S_IFLNK:
+			// Linux does not support changing the mode of symlinks. See
+			// fs/attr.c:notify_change().
+			failureMask |= unix.STATX_MODE
+			failureErr = unix.EOPNOTSUPP
+		case unix.S_IFSOCK:
+			// Sockets use O_PATH host FDs. However, fchmod(2) fails with EBADF for
+			// O_PATH FDs. Try to fchmodat(2) it from its parent.
 			parent, sockName, err := fd.getParentFD()
 			if err == nil {
-				// Note that AT_SYMLINK_NOFOLLOW flag is not currently supported.
 				err = unix.Fchmodat(parent, sockName, stat.Mode&^unix.S_IFMT, 0 /* flags */)
 				unix.Close(parent)
 			}
@@ -302,7 +321,7 @@ func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, fa
 				failureMask |= unix.STATX_MODE
 				failureErr = err
 			}
-		} else {
+		default:
 			if err := unix.Fchmod(fd.hostFD, stat.Mode&^unix.S_IFMT); err != nil {
 				log.Warningf("SetStat fchmod failed %q, err: %v", fd.Node().FilePath(), err)
 				failureMask |= unix.STATX_MODE
@@ -376,15 +395,15 @@ func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, fa
 	if stat.Mask&(unix.STATX_UID|unix.STATX_GID) != 0 {
 		// "If the owner or group is specified as -1, then that ID is not changed"
 		// - chown(2)
-		uid := -1
+		uid := lisafs.NoUID
 		if stat.Mask&unix.STATX_UID != 0 {
-			uid = int(stat.UID)
+			uid = stat.UID
 		}
-		gid := -1
+		gid := lisafs.NoGID
 		if stat.Mask&unix.STATX_GID != 0 {
-			gid = int(stat.GID)
+			gid = stat.GID
 		}
-		if err := unix.Fchownat(fd.hostFD, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err := fchown(fd.hostFD, uid, gid); err != nil {
 			log.Warningf("SetStat fchown failed %q, err: %v", fd.Node().FilePath(), err)
 			failureMask |= stat.Mask & (unix.STATX_UID | unix.STATX_GID)
 			failureErr = err
@@ -556,7 +575,7 @@ func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lis
 	defer cu.Clean()
 
 	// Set the owners as requested by the client.
-	if err := unix.Fchownat(childHostFD, "", int(uid), int(gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fchown(childHostFD, uid, gid); err != nil {
 		return nil, linux.Statx{}, nil, -1, err
 	}
 
@@ -609,7 +628,7 @@ func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	if err != nil {
 		return nil, linux.Statx{}, err
 	}
-	if err := unix.Fchownat(childDirFd, "", int(uid), int(gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fchown(childDirFd, uid, gid); err != nil {
 		unix.Close(childDirFd)
 		return nil, linux.Statx{}, err
 	}
@@ -652,7 +671,7 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	if err != nil {
 		return nil, linux.Statx{}, err
 	}
-	if err := unix.Fchownat(childFD, "", int(uid), int(gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fchown(childFD, uid, gid); err != nil {
 		unix.Close(childFD)
 		return nil, linux.Statx{}, err
 	}
@@ -686,7 +705,7 @@ func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid
 	if err != nil {
 		return nil, linux.Statx{}, err
 	}
-	if err := unix.Fchownat(symlinkFD, "", int(uid), int(gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fchown(symlinkFD, uid, gid); err != nil {
 		unix.Close(symlinkFD)
 		return nil, linux.Statx{}, err
 	}
@@ -818,6 +837,67 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	return sock, nil
 }
 
+// ConnectWithCreds implements lisafs.ControlFDImpl.ConnectWithCreds.
+func (fd *controlFDLisa) ConnectWithCreds(sockType uint32, uid lisafs.UID, gid lisafs.GID) (int, error) {
+	serverConfig := fd.Conn().ServerImpl().(*LisafsServer).config
+	if !serverConfig.HostUDS.AllowOpen() {
+		logRejectedUdsConnectOnce.Do(func() {
+			log.Warningf("Rejecting attempt to connect to unix domain socket from host filesystem: %q. If you want to allow this, set flag --host-uds=open", fd.ControlFD.Node().FilePath())
+		})
+		return -1, unix.EPERM
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// As per capabilities(7), "If the effective user ID is changed from 0 to
+	// nonzero, then all capabilities are cleared from the effective set. If the
+	// effective user ID is changed from nonzero to 0, then the permitted set is
+	// copied to the effective set." Below, we temporarily change the effective
+	// UID and GID. So the effective capability set is cleared and restored; the
+	// permitted set stays the same. We change GID first, and then UID. Because
+	// once the UID is changed, capabilities needed to change GID are dropped.
+	uidChanged, gidChanged := false, false
+	if int(gid) != serverConfig.EGID {
+		_, _, err := unix.Syscall(unix.SYS_SETREGID, uintptr(serverConfig.RGID), uintptr(gid), 0)
+		if err != 0 {
+			log.Warningf("Failed to set egid; err: %v", err)
+		} else {
+			log.Debugf("Successfully set egid to %d", gid)
+			gidChanged = true
+		}
+	}
+
+	if int(uid) != serverConfig.EUID {
+		_, _, err := unix.Syscall(unix.SYS_SETREUID, uintptr(serverConfig.RUID), uintptr(uid), 0)
+		if err != 0 {
+			log.Warningf("Failed to set euid; err: %v", err)
+		} else {
+			log.Debugf("Successfully set euid to %d", uid)
+			uidChanged = true
+		}
+	}
+
+	defer func() {
+		if uidChanged {
+			_, _, err := unix.Syscall(unix.SYS_SETREUID, uintptr(serverConfig.RUID), uintptr(serverConfig.EUID), 0)
+			if err != 0 {
+				panic(fmt.Sprintf("Failed to restore euid; err: %v", err))
+			}
+			log.Debugf("Successfully restored euid to %d", serverConfig.EUID)
+		}
+
+		if gidChanged {
+			_, _, err := unix.Syscall(unix.SYS_SETREGID, uintptr(serverConfig.RGID), uintptr(serverConfig.EGID), 0)
+			if err != 0 {
+				panic(fmt.Sprintf("Failed to restore egid; err: %v", err))
+			}
+			log.Debugf("Successfully restored egid to %d", serverConfig.EGID)
+		}
+	}()
+
+	return fd.Connect(sockType)
+}
+
 // BindAt implements lisafs.ControlFDImpl.BindAt.
 func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMode, uid lisafs.UID, gid lisafs.GID) (*lisafs.ControlFD, linux.Statx, *lisafs.BoundSocketFD, int, error) {
 	if !fd.Conn().ServerImpl().(*LisafsServer).config.HostUDS.AllowCreate() {
@@ -879,7 +959,7 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 		_ = unix.Close(sockFileFD)
 	})
 
-	if err := unix.Fchownat(sockFileFD, "", int(uid), int(gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fchown(sockFileFD, uid, gid); err != nil {
 		return nil, linux.Statx{}, nil, -1, err
 	}
 
@@ -923,6 +1003,12 @@ func (fd *controlFDLisa) Renamed() {
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
 	data := getValueBuf(size)
+	if fd.IsSocket() || fd.IsSymlink() {
+		// Sockets and symlinks use O_PATH host FDs. However, fgetxattr(2) fails
+		// with EBADF for O_PATH FDs. Use lgetxattr(2) instead.
+		xattrSize, err := unix.Lgetxattr(fd.Node().FilePath(), name, data)
+		return uint16(xattrSize), err
+	}
 	xattrSize, err := unix.Fgetxattr(fd.hostFD, name, data)
 	return uint16(xattrSize), err
 }
@@ -1135,6 +1221,23 @@ func tryOpen(open func(int) (int, error)) (hostFD int, err error) {
 		}
 	}
 	return
+}
+
+func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
+	// "If the owner or group is specified as -1, then that ID is not changed"
+	// - chown(2). Only bother making the syscall if the owner is changing.
+	if !uid.Ok() && !gid.Ok() {
+		return nil
+	}
+	u := -1
+	g := -1
+	if uid.Ok() {
+		u = int(uid)
+	}
+	if gid.Ok() {
+		g = int(gid)
+	}
+	return unix.Fchownat(hostFD, "", u, g, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func fstatTo(hostFD int) (linux.Statx, error) {

@@ -17,9 +17,13 @@ package kernel
 // Accounting, limits, timers.
 
 import (
+	"math"
+	"sync/atomic"
+	"time"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
@@ -28,24 +32,18 @@ import (
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) Getitimer(id int32) (linux.ItimerVal, error) {
-	var tm ktime.Time
-	var s ktime.Setting
+	var timer ktime.Timer
 	switch id {
 	case linux.ITIMER_REAL:
-		tm, s = t.tg.itimerRealTimer.Get()
+		timer = t.tg.itimerRealTimer
 	case linux.ITIMER_VIRTUAL:
-		tm = t.tg.UserCPUClock().Now()
-		t.tg.signalHandlers.mu.Lock()
-		s, _ = t.tg.itimerVirtSetting.At(tm)
-		t.tg.signalHandlers.mu.Unlock()
+		timer = &t.tg.itimerVirtTimer
 	case linux.ITIMER_PROF:
-		tm = t.tg.CPUClock().Now()
-		t.tg.signalHandlers.mu.Lock()
-		s, _ = t.tg.itimerProfSetting.At(tm)
-		t.tg.signalHandlers.mu.Unlock()
+		timer = &t.tg.itimerProfTimer
 	default:
 		return linux.ItimerVal{}, linuxerr.EINVAL
 	}
+	tm, s := timer.Get()
 	val, iv := ktime.SpecFromSetting(tm, s)
 	return linux.ItimerVal{
 		Value:    linux.DurationToTimeval(val),
@@ -57,51 +55,110 @@ func (t *Task) Getitimer(id int32) (linux.ItimerVal, error) {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) Setitimer(id int32, newitv linux.ItimerVal) (linux.ItimerVal, error) {
-	var tm ktime.Time
-	var olds ktime.Setting
+	var (
+		timer ktime.Timer
+		last  *atomic.Pointer[Task]
+	)
 	switch id {
 	case linux.ITIMER_REAL:
-		news, err := ktime.SettingFromSpec(newitv.Value.ToDuration(), newitv.Interval.ToDuration(), t.tg.itimerRealTimer.Clock())
-		if err != nil {
-			return linux.ItimerVal{}, err
-		}
-		tm, olds = t.tg.itimerRealTimer.Swap(news)
+		timer = t.tg.itimerRealTimer
 	case linux.ITIMER_VIRTUAL:
-		c := t.tg.UserCPUClock()
-		t.k.cpuClockMu.Lock()
-		defer t.k.cpuClockMu.Unlock()
-		tm = c.Now()
-		news, err := ktime.SettingFromSpecAt(newitv.Value.ToDuration(), newitv.Interval.ToDuration(), tm)
-		if err != nil {
-			return linux.ItimerVal{}, err
-		}
-		t.tg.signalHandlers.mu.Lock()
-		olds = t.tg.itimerVirtSetting
-		t.tg.itimerVirtSetting = news
-		t.tg.updateCPUTimersEnabledLocked()
-		t.tg.signalHandlers.mu.Unlock()
+		timer = &t.tg.itimerVirtTimer
+		last = &t.tg.appCPUClockLast
 	case linux.ITIMER_PROF:
-		c := t.tg.CPUClock()
-		t.k.cpuClockMu.Lock()
-		defer t.k.cpuClockMu.Unlock()
-		tm = c.Now()
-		news, err := ktime.SettingFromSpecAt(newitv.Value.ToDuration(), newitv.Interval.ToDuration(), tm)
-		if err != nil {
-			return linux.ItimerVal{}, err
-		}
-		t.tg.signalHandlers.mu.Lock()
-		olds = t.tg.itimerProfSetting
-		t.tg.itimerProfSetting = news
-		t.tg.updateCPUTimersEnabledLocked()
-		t.tg.signalHandlers.mu.Unlock()
+		timer = &t.tg.itimerProfTimer
+		last = &t.tg.appSysCPUClockLast
 	default:
 		return linux.ItimerVal{}, linuxerr.EINVAL
 	}
+	news, err := ktime.SettingFromSpec(newitv.Value.ToDuration(), newitv.Interval.ToDuration(), timer.Clock())
+	if err != nil {
+		return linux.ItimerVal{}, err
+	}
+	if last != nil {
+		last.Store(t)
+	}
+	tm, olds := timer.Set(news, nil)
 	oldval, oldiv := ktime.SpecFromSetting(tm, olds)
 	return linux.ItimerVal{
 		Value:    linux.DurationToTimeval(oldval),
 		Interval: linux.DurationToTimeval(oldiv),
 	}, nil
+}
+
+// NotifyRlimitCPUUpdated is called by setrlimit.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) NotifyRlimitCPUUpdated() {
+	t.tg.notifyRlimitCPUUpdated(t)
+}
+
+func (tg *ThreadGroup) notifyRlimitCPUUpdated(t *Task) {
+	// Lock tg.timerMu to synchronize updates to these timers between tasks in
+	// tg.
+	tg.timerMu.Lock()
+	defer tg.timerMu.Unlock()
+	rlimitCPU := tg.limits.Get(limits.CPU)
+	tg.appSysCPUClockLast.Store(t)
+	tg.rlimitCPUSoftTimer.Set(ktime.Setting{
+		Enabled: rlimitCPU.Cur != limits.Infinity,
+		Next:    ktime.FromSeconds(int64(min(rlimitCPU.Cur, math.MaxInt64))),
+		Period:  time.Second,
+	}, nil)
+	tg.rlimitCPUHardTimer.Set(ktime.Setting{
+		Enabled: rlimitCPU.Max != limits.Infinity,
+		Next:    ktime.FromSeconds(int64(min(rlimitCPU.Max, math.MaxInt64))),
+	}, nil)
+}
+
+// +stateify savable
+type itimerRealListener struct {
+	tg *ThreadGroup
+}
+
+// NotifyTimer implements ktime.Listener.NotifyTimer.
+func (l *itimerRealListener) NotifyTimer(exp uint64) {
+	l.tg.SendSignal(SignalInfoPriv(linux.SIGALRM))
+}
+
+// +stateify savable
+type itimerVirtListener struct {
+	tg *ThreadGroup
+}
+
+// NotifyTimer implements ktime.Listener.NotifyTimer.
+func (l *itimerVirtListener) NotifyTimer(exp uint64) {
+	l.tg.appCPUClockLast.Load().SendGroupSignal(SignalInfoPriv(linux.SIGVTALRM))
+}
+
+// +stateify savable
+type itimerProfListener struct {
+	tg *ThreadGroup
+}
+
+// NotifyTimer implements ktime.Listener.NotifyTimer.
+func (l *itimerProfListener) NotifyTimer(exp uint64) {
+	l.tg.appSysCPUClockLast.Load().SendGroupSignal(SignalInfoPriv(linux.SIGPROF))
+}
+
+// +stateify savable
+type rlimitCPUSoftListener struct {
+	tg *ThreadGroup
+}
+
+// NotifyTimer implements ktime.Listener.NotifyTimer.
+func (l *rlimitCPUSoftListener) NotifyTimer(exp uint64) {
+	l.tg.appSysCPUClockLast.Load().SendGroupSignal(SignalInfoPriv(linux.SIGXCPU))
+}
+
+// +stateify savable
+type rlimitCPUHardListener struct {
+	tg *ThreadGroup
+}
+
+// NotifyTimer implements ktime.Listener.NotifyTimer.
+func (l *rlimitCPUHardListener) NotifyTimer(exp uint64) {
+	l.tg.appSysCPUClockLast.Load().SendGroupSignal(SignalInfoPriv(linux.SIGKILL))
 }
 
 // IOUsage returns the io usage of the thread.

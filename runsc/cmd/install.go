@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -53,8 +52,7 @@ func (*Install) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Install) Usage() string {
-	return `install [--runtime=<name>] [flags] [-- [args...]] -- if provided, args are passed to the runtime
-`
+	return "install [--runtime=<name>] [flags] [-- [args...]] -- if provided, args are passed to the runtime\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -94,7 +92,7 @@ func (i *Install) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcomma
 	// Extract the executable.
 	path, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Error reading current exectuable: %v", err)
+		log.Fatalf("Error reading current executable: %v", err)
 	}
 
 	i.executablePath = path
@@ -213,8 +211,7 @@ func (*Uninstall) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Uninstall) Usage() string {
-	return `uninstall [flags] <name>
-`
+	return "uninstall [flags] <name>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -273,7 +270,7 @@ type configReaderWriter struct {
 
 func defaultReadConfig(path string) ([]byte, error) {
 	// Read the configuration data.
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -288,13 +285,13 @@ func defaultWriteConfig(c map[string]any, filename string) error {
 	}
 
 	// Copy the old configuration.
-	old, err := ioutil.ReadFile(filename)
+	old, err := os.ReadFile(filename)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("error reading config file %q: %v", filename, err)
 		}
 	} else {
-		if err := ioutil.WriteFile(filename+"~", old, 0644); err != nil {
+		if err := os.WriteFile(filename+"~", old, 0644); err != nil {
 			return fmt.Errorf("error backing up config file %q: %v", filename, err)
 		}
 	}
@@ -305,7 +302,7 @@ func defaultWriteConfig(c map[string]any, filename string) error {
 	}
 
 	// Write the new configuration.
-	if err := ioutil.WriteFile(filename, b, 0644); err != nil {
+	if err := os.WriteFile(filename, b, 0644); err != nil {
 		return fmt.Errorf("error writing config file %q: %v", filename, err)
 	}
 

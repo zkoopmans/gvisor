@@ -159,6 +159,11 @@ func (s *TestStack) RouteTable() []Route {
 	return s.RouteList
 }
 
+// RemoveRoute implements Stack.
+func (s *TestStack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return nil
+}
+
 // NewRoute implements Stack.
 func (s *TestStack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	return syserr.ErrNotPermitted
@@ -169,6 +174,9 @@ func (s *TestStack) Pause() {}
 
 // Restore implements Stack.
 func (s *TestStack) Restore() {}
+
+// ReplaceConfig implements Stack.
+func (s *TestStack) ReplaceConfig(_ Stack) {}
 
 // Resume implements Stack.
 func (s *TestStack) Resume() {}
@@ -214,4 +222,22 @@ func (*TestStack) GROTimeout(NICID int32) (time.Duration, error) {
 func (*TestStack) SetGROTimeout(NICID int32, timeout time.Duration) error {
 	// No-op.
 	return nil
+}
+
+// EnableSaveRestore implements Stack.
+func (*TestStack) EnableSaveRestore() error {
+	// No-op.
+	return nil
+}
+
+// IsSaveRestoreEnabled implements Stack.
+func (*TestStack) IsSaveRestoreEnabled() bool {
+	// No-op.
+	return false
+}
+
+// Stats implements Stack.
+func (*TestStack) Stats() tcpip.Stats {
+	// No-op.
+	return tcpip.Stats{}
 }

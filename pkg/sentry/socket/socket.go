@@ -29,7 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -516,8 +516,8 @@ func BytesToIPAddress(addr []byte) tcpip.Address {
 }
 
 // AddressAndFamily reads an sockaddr struct from the given address and
-// converts it to the FullAddress format. It supports AF_UNIX, AF_INET,
-// AF_INET6, and AF_PACKET addresses.
+// converts it to the FullAddress format. It supports AF_INET, AF_INET6, and
+// AF_PACKET addresses.
 //
 // AddressAndFamily returns an address and its family.
 func AddressAndFamily(addr []byte) (tcpip.FullAddress, uint16, *syserr.Error) {

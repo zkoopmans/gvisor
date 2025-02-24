@@ -30,6 +30,7 @@ import (
 	"strconv"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -41,7 +42,7 @@ import (
 // TaskExitState represents a step in the task exit path.
 //
 // "Exiting" and "exited" are often ambiguous; prefer to name specific states.
-type TaskExitState int
+type TaskExitState uint32
 
 const (
 	// TaskExitNone indicates that the task has not begun exiting.
@@ -109,6 +110,7 @@ func (t *Task) killed() bool {
 	return t.killedLocked()
 }
 
+// Preconditions: The signal mutex must be locked.
 func (t *Task) killedLocked() bool {
 	return t.pendingSignals.pendingSet&linux.SignalSetOf(linux.SIGKILL) != 0
 }
@@ -192,17 +194,26 @@ func (ts *TaskSet) Kill(ws linux.WaitStatus) {
 	}
 }
 
+// IsExiting returns true if all tasks in ts are exiting or have exited.
+func (ts *TaskSet) IsExiting() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.Root.exiting
+}
+
 // advanceExitStateLocked checks that t's current exit state is oldExit, then
 // sets it to newExit. If t's current exit state is not oldExit,
 // advanceExitStateLocked panics.
 //
-// Preconditions: The TaskSet mutex must be locked.
+// Preconditions: The TaskSet mutex must be locked for writing.
 func (t *Task) advanceExitStateLocked(oldExit, newExit TaskExitState) {
-	if t.exitState != oldExit {
-		panic(fmt.Sprintf("Transitioning from exit state %v to %v: unexpected preceding state %v", oldExit, newExit, t.exitState))
+	// This doesn't need to use atomic CAS (or load) since we hold the TaskSet
+	// mutex.
+	if curExit := t.exitStateLocked(); curExit != oldExit {
+		panic(fmt.Sprintf("Transitioning from exit state %v to %v: unexpected preceding state %v", oldExit, newExit, curExit))
 	}
 	t.Debugf("Transitioning from exit state %v to %v", oldExit, newExit)
-	t.exitState = newExit
+	t.exitState.Store(uint32(newExit))
 }
 
 // runExit is the entry point into the task exit path.
@@ -305,14 +316,15 @@ func (*runExitMain) execute(t *Task) taskRunState {
 		t.tg.Release(t)
 	}
 
+	t.tg.pidns.owner.mu.Lock()
 	// Detach tracees.
-	t.exitPtrace()
-
+	t.exitPtraceLocked()
 	// Reparent the task's children.
-	t.exitChildren()
+	t.exitChildrenLocked()
+	t.tg.pidns.owner.mu.Unlock()
 
-	// Don't tail-call runExitNotify, as exitChildren may have initiated a stop
-	// to wait for a PID namespace to die.
+	// Don't tail-call runExitNotify, as exitChildrenLocked may have initiated
+	// a stop to wait for a PID namespace to die.
 	return (*runExitNotify)(nil)
 }
 
@@ -350,9 +362,8 @@ func (t *Task) exitThreadGroup() bool {
 	return last
 }
 
-func (t *Task) exitChildren() {
-	t.tg.pidns.owner.mu.Lock()
-	defer t.tg.pidns.owner.mu.Unlock()
+// Preconditions: The TaskSet mutex must be locked for writing.
+func (t *Task) exitChildrenLocked() {
 	newParent := t.findReparentTargetLocked()
 	if newParent == nil {
 		// "If the init process of a PID namespace terminates, the kernel
@@ -441,9 +452,10 @@ func (t *Task) findReparentTargetLocked() *Task {
 	return nil
 }
 
+// Preconditions: The TaskSet mutex must be locked.
 func (tg *ThreadGroup) anyNonExitingTaskLocked() *Task {
 	for t := tg.tasks.Front(); t != nil; t = t.Next() {
-		if t.exitState == TaskExitNone {
+		if t.exitStateLocked() == TaskExitNone {
 			return t
 		}
 	}
@@ -617,7 +629,7 @@ func (*runExitNotify) execute(t *Task) taskRunState {
 //
 // Preconditions: The TaskSet mutex must be locked for writing.
 func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
-	if t.exitState != TaskExitZombie {
+	if t.exitStateLocked() != TaskExitZombie {
 		return
 	}
 	if !t.exitTracerNotified {
@@ -726,13 +738,12 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 			ns.deleteTask(t)
 		}
 		t.userCounters.decRLimitNProc()
-		t.tg.exitedCPUStats.Accumulate(t.CPUStats())
-		t.tg.ioUsage.Accumulate(t.ioUsage)
 		t.tg.signalHandlers.mu.Lock()
 		t.tg.tasks.Remove(t)
 		t.tg.tasksCount--
 		tc := t.tg.tasksCount
 		t.tg.signalHandlers.mu.Unlock()
+		t.tg.ioUsage.Accumulate(t.ioUsage)
 		if tc == 1 && t != t.tg.leader {
 			// Our fromPtraceDetach doesn't matter here (in Linux terms, this
 			// is via a call to release_task()).
@@ -746,7 +757,57 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 			// Do not clear t.parent. It may be still be needed after the task has exited
 			// (for example, to perform ptrace access checks on /proc/[pid] files).
 		}
+		t.execOnDestroyActions()
 	}
+}
+
+// TaskDestroyAction defines an action to be executed when a task is destroyed.
+type TaskDestroyAction interface {
+	TaskDestroyAction(ctx context.Context)
+}
+
+// RegisterOnDestroyAction registers an action to be executed when the task
+// is destroyed.
+//
+// It returns true if the action was successfully registered.
+// If the task is already terminated, it returns false.
+func (t *Task) RegisterOnDestroyAction(act TaskDestroyAction) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.onDestroyAction == nil {
+		return false
+	}
+	t.onDestroyAction[act] = struct{}{}
+	return true
+}
+
+// UnregisterOnDestroyAction unregisters an action previously registered with
+// RegisterOnDestroyAction.
+func (t *Task) UnregisterOnDestroyAction(key TaskDestroyAction) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.onDestroyAction, key)
+}
+
+func (t *Task) execOnDestroyActions() {
+	t.mu.Lock()
+	actions := t.onDestroyAction
+	t.onDestroyAction = nil
+	t.mu.Unlock()
+
+	if len(actions) == 0 {
+		return
+	}
+	ctx := t.k.SupervisorContext()
+	// Block S/R until all actions is executed.
+	t.k.tasks.aioGoroutines.Add(1)
+	// Run in another goroutine to avoid extra lock dependencies.
+	go func() {
+		defer t.k.tasks.aioGoroutines.Done()
+		for act := range actions {
+			act.TaskDestroyAction(ctx)
+		}
+	}()
 }
 
 // Preconditions: The TaskSet mutex must be locked.
@@ -787,10 +848,8 @@ func getExitNotifyParentSeccheckInfo(t *Task) (seccheck.FieldSet, *pb.ExitNotify
 // ExitStatus returns t's exit status, which is only guaranteed to be
 // meaningful if t.ExitState() != TaskExitNone.
 func (t *Task) ExitStatus() linux.WaitStatus {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
+	sh := t.tg.signalLock()
+	defer sh.mu.Unlock()
 	return t.exitStatus
 }
 
@@ -1013,7 +1072,7 @@ func (t *Task) waitParentLocked(opts *WaitOptions, parent *Task) (*WaitResult, b
 		if opts.Events&(EventChildGroupStop|EventGroupContinue) == 0 {
 			continue
 		}
-		if child.exitState >= TaskExitInitiated {
+		if child.exitStateLocked() >= TaskExitInitiated {
 			continue
 		}
 		// If the waiter is in the same thread group as the task's
@@ -1053,7 +1112,7 @@ func (t *Task) waitParentLocked(opts *WaitOptions, parent *Task) (*WaitResult, b
 		if opts.Events&(EventTraceeStop|EventGroupContinue) == 0 {
 			continue
 		}
-		if tracee.exitState >= TaskExitInitiated {
+		if tracee.exitStateLocked() >= TaskExitInitiated {
 			continue
 		}
 		anyWaitableTasks = true
@@ -1117,14 +1176,7 @@ func (t *Task) waitCollectZombieLocked(target *Task, opts *WaitOptions, asPtrace
 	if target.parent != nil && target.parent.tg == t.tg && target.exitParentNotified {
 		target.exitParentAcked = true
 		if target == target.tg.leader {
-			// target.tg.exitedCPUStats doesn't include target.CPUStats() yet,
-			// and won't until after target.exitNotifyLocked() (maybe). Include
-			// target.CPUStats() explicitly. This is consistent with Linux,
-			// which accounts an exited task's cputime to its thread group in
-			// kernel/exit.c:release_task() => __exit_signal(), and uses
-			// thread_group_cputime_adjusted() in wait_task_zombie().
-			t.tg.childCPUStats.Accumulate(target.CPUStats())
-			t.tg.childCPUStats.Accumulate(target.tg.exitedCPUStats)
+			t.tg.childCPUStats.Accumulate(target.tg.CPUStats())
 			t.tg.childCPUStats.Accumulate(target.tg.childCPUStats)
 			// Update t's child max resident set size. The size will be the maximum
 			// of this thread's size and all its childrens' sizes.
@@ -1228,9 +1280,12 @@ func (t *Task) waitCollectTraceeStopLocked(target *Task, opts *WaitOptions) *Wai
 
 // ExitState returns t's current progress through the exit path.
 func (t *Task) ExitState() TaskExitState {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	return t.exitState
+	return TaskExitState(t.exitState.Load())
+}
+
+// Preconditions: The TaskSet mutex must be locked.
+func (t *Task) exitStateLocked() TaskExitState {
+	return TaskExitState(t.exitState.RacyLoad())
 }
 
 // ParentDeathSignal returns t's parent death signal.

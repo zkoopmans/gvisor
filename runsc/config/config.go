@@ -27,6 +27,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/version"
@@ -107,6 +108,9 @@ type Config struct {
 	// HostFifo controls permission to access host FIFO (or named pipes).
 	HostFifo HostFifo `flag:"host-fifo"`
 
+	// HostSettings controls how host settings are handled.
+	HostSettings HostSettingsPolicy `flag:"host-settings"`
+
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
 
@@ -162,6 +166,10 @@ type Config struct {
 	// an indication that the container being created wishes that its metrics should be exported).
 	// The value of this flag must also match across the two command lines.
 	MetricServer string `flag:"metric-server"`
+
+	// FinalMetricsLog is the file to which all metric data should be written
+	// upon sandbox termination.
+	FinalMetricsLog string `flag:"final-metrics-log"`
 
 	// ProfilingMetrics is a comma separated list of metric names which are
 	// going to be written to the ProfilingMetricsLog file from within the
@@ -325,6 +333,10 @@ type Config struct {
 	// the latest supported NVIDIA driver ABI.
 	NVProxyDriverVersion string `flag:"nvproxy-driver-version"`
 
+	// NVProxyAllowUnsupportedCapabilities is a comma-separated list of driver
+	// capabilities that are allowed to be requested by the container.
+	NVProxyAllowedDriverCapabilities string `flag:"nvproxy-allowed-driver-capabilities"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -359,9 +371,8 @@ type Config struct {
 	// present, and reproduce them in the sandbox.
 	ReproduceNftables bool `flag:"reproduce-nftables"`
 
-	// NetDisconnectOk indicates whether the link endpoint capability
-	// CapabilityDisconnectOk should be set. This allows open connections to be
-	// disconnected upon save.
+	// Indicates whether open network connections and open unix domain
+	// sockets should be disconnected upon save."
 	NetDisconnectOk bool `flag:"net-disconnect-ok"`
 
 	// TestOnlyAutosaveImagePath if not empty enables auto save for syscall tests
@@ -370,6 +381,13 @@ type Config struct {
 
 	// TestOnlyAutosaveResume indicates save resume for syscall tests.
 	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
+
+	// TestOnlySaveRestoreNetstack indicates netstack should be saved and restored.
+	TestOnlySaveRestoreNetstack bool `flag:"TESTONLY-save-restore-netstack"`
+
+	// RestoreSpecValidation indicates the level of spec validation to be
+	// performed during restore.
+	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 }
 
 func (c *Config) validate() error {
@@ -404,6 +422,13 @@ func (c *Config) validate() error {
 	}
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
+	}
+	allowedCaps, _, err := nvconf.DriverCapsFromString(c.NVProxyAllowedDriverCapabilities)
+	if err != nil {
+		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: %w", c.NVProxyAllowedDriverCapabilities, err)
+	}
+	if unsupported := allowedCaps & ^nvconf.SupportedDriverCaps; unsupported != 0 {
+		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: unsupported capabilities: %v", c.NVProxyAllowedDriverCapabilities, unsupported)
 	}
 	return nil
 }
@@ -594,6 +619,9 @@ const (
 
 	// NetworkNone sets up just loopback using netstack.
 	NetworkNone
+
+	// NetworkPlugin uses third-party network stack.
+	NetworkPlugin
 )
 
 func networkTypePtr(v NetworkType) *NetworkType {
@@ -609,6 +637,8 @@ func (n *NetworkType) Set(v string) error {
 		*n = NetworkHost
 	case "none":
 		*n = NetworkNone
+	case "plugin":
+		*n = NetworkPlugin
 	default:
 		return fmt.Errorf("invalid network type %q", v)
 	}
@@ -629,6 +659,8 @@ func (n NetworkType) String() string {
 		return "host"
 	case NetworkNone:
 		return "none"
+	case NetworkPlugin:
+		return "plugin"
 	}
 	panic(fmt.Sprintf("Invalid network type %d", n))
 }
@@ -944,6 +976,148 @@ func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+// Medium returns the overlay medium config.
+func (o Overlay2) Medium() OverlayMedium {
+	return o.medium
+}
+
+// HostSettingsPolicy dictates how host settings should be handled.
+type HostSettingsPolicy int
+
+// HostSettingsPolicy values.
+const (
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise only log
+	// warnings. It never attempts to modify host settings.
+	HostSettingsCheck HostSettingsPolicy = iota
+
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise not log
+	// anything about non-mandatory settings.
+	// It never attempts to modify host settings.
+	HostSettingsCheckMandatory
+
+	// HostSettingsIgnore does not check nor adjust any host settings.
+	// This is useful in case the host settings are already known to be
+	// optimal, or to avoid errors if `runsc` is running within a seccomp
+	// or AppArmor policy that prevents it from checking host settings.
+	HostSettingsIgnore
+
+	// HostSettingsAdjust automatically adjusts host settings if they are not
+	// optimal. It will fail if any setting is mandatory but cannot be adjusted.
+	// For non-mandatory settings, it logs a warning if adjustment fails.
+	HostSettingsAdjust
+
+	// HostSettingsEnforce automatically adjusts host settings if they are not
+	// optimal, and fails if adjustment of any setting fails.
+	HostSettingsEnforce
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *HostSettingsPolicy) Set(v string) error {
+	switch v {
+	case "check":
+		*p = HostSettingsCheck
+	case "check_mandatory":
+		*p = HostSettingsCheckMandatory
+	case "ignore":
+		*p = HostSettingsIgnore
+	case "adjust":
+		*p = HostSettingsAdjust
+	case "enforce":
+		*p = HostSettingsEnforce
+	default:
+		return fmt.Errorf("invalid host settings policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p HostSettingsPolicy) Ptr() *HostSettingsPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *HostSettingsPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p HostSettingsPolicy) String() string {
+	switch p {
+	case HostSettingsCheck:
+		return "check"
+	case HostSettingsCheckMandatory:
+		return "check_mandatory"
+	case HostSettingsAdjust:
+		return "adjust"
+	case HostSettingsIgnore:
+		return "ignore"
+	case HostSettingsEnforce:
+		return "enforce"
+	default:
+		panic(fmt.Sprintf("Invalid host settings policy %d", p))
+	}
+}
+
+// RestoreSpecValidationPolicy dictates how spec validation should be handled.
+type RestoreSpecValidationPolicy int
+
+// RestoreSpecValidationPolicy values.
+const (
+	// RestoreSpecValidationIgnore does not validate the spec during restore.
+	RestoreSpecValidationIgnore RestoreSpecValidationPolicy = iota
+
+	// RestoreSpecValidationWarning will perform spec validation and logs a warning
+	// if the validation fails, however the restore will continue.
+	RestoreSpecValidationWarning
+
+	// RestoreSpecValidationEnforce will perform spec validation and returns an
+	// error if the validation fails and aborts restoring the containers.
+	RestoreSpecValidationEnforce
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *RestoreSpecValidationPolicy) Set(v string) error {
+	switch v {
+	case "ignore":
+		*p = RestoreSpecValidationIgnore
+	case "warning":
+		*p = RestoreSpecValidationWarning
+	case "enforce":
+		*p = RestoreSpecValidationEnforce
+	default:
+		return fmt.Errorf("invalid restore spec validation policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p RestoreSpecValidationPolicy) Ptr() *RestoreSpecValidationPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *RestoreSpecValidationPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p RestoreSpecValidationPolicy) String() string {
+	switch p {
+	case RestoreSpecValidationIgnore:
+		return "ignore"
+	case RestoreSpecValidationWarning:
+		return "warning"
+	case RestoreSpecValidationEnforce:
+		return "enforce"
+	default:
+		panic(fmt.Sprintf("invalid restore spec validation policy %d", p))
+	}
+}
+
 // XDP holds configuration for whether and how to use XDP.
 type XDP struct {
 	Mode      XDPMode
@@ -965,7 +1139,7 @@ const (
 	// Linux network stack.
 	XDPModeRedirect
 
-	// XDPModeTunnel uses XDP_REDIRECT to redirect packets directy from the
+	// XDPModeTunnel uses XDP_REDIRECT to redirect packets directly from the
 	// host NIC to the VETH device inside the container's network
 	// namespace. Packets are read from the VETH via AF_XDP, as in
 	// XDPModeNS.

@@ -33,7 +33,7 @@ import (
 
 // outOfRangeSyscallNumber is used to represent a syscall number that is out of the
 // range [0, maxSyscallNum] in monitoring.
-var outOfRangeSyscallNumber = []*metric.FieldValue{&metric.FieldValue{"-1"}}
+var outOfRangeSyscallNumber = []*metric.FieldValue{{"-1"}}
 
 // SyscallSupportLevel is a syscall support levels.
 type SyscallSupportLevel int
@@ -500,8 +500,6 @@ type SyscallInfo struct {
 // FIXME(gvisor.dev/issue/10556): checkescape can't distinguish between this
 // file and files named syscalls.go in other directories, resulting in false
 // positives, so this function cannot be +checkescape:all.
-//
-//go:nosplit
 func IncrementUnimplementedSyscallCounter(sysno uintptr) {
 	s, found := unimplementedSyscallNumbers[sysno]
 	if !found {

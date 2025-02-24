@@ -32,7 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -40,8 +40,6 @@ import (
 )
 
 // Proc includes task-related functions.
-//
-// At the moment, this is limited to exec support.
 type Proc struct {
 	Kernel *kernel.Kernel
 }
@@ -274,6 +272,10 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		return nil, 0, nil, err
 	}
 
+	if ttyFile != nil {
+		initArgs.TTY = ttyFile.TTY()
+	}
+
 	// Set cgroups to the new exec task if cgroups are mounted.
 	cgroupRegistry := proc.Kernel.CgroupRegistry()
 	initialCgrps := map[kernel.Cgroup]struct{}{}
@@ -292,11 +294,6 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
 	if err != nil {
 		return nil, 0, nil, err
-	}
-
-	// Set the foreground process group on the TTY before starting the process.
-	if ttyFile != nil {
-		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
 	}
 
 	// Start the newly created process.
@@ -471,7 +468,7 @@ func ttyName(tty *kernel.TTY) string {
 	if tty == nil {
 		return "?"
 	}
-	return fmt.Sprintf("pts/%d", tty.Index)
+	return fmt.Sprintf("pts/%d", tty.Index())
 }
 
 // ContainerUsage retrieves per-container CPU usage.
@@ -518,4 +515,22 @@ func (args *ExecArgs) unpackFiles() (map[int]*fd.FD, *fd.FD, error) {
 		fdMap[appFD] = hostFD
 	}
 	return fdMap, execFD, nil
+}
+
+// SignalProcessArgs is the arguments to SignalProcess.
+type SignalProcessArgs struct {
+	// Signal number to send.
+	Signo int `json:"signo"`
+
+	// Process ID (in the root PID namespace) to signal.
+	PID int `json:"pid"`
+}
+
+// SignalProcess sends a signal to the process with the given PID.
+func (proc *Proc) SignalProcess(args *SignalProcessArgs, _ *struct{}) error {
+	tg := proc.Kernel.RootPIDNamespace().ThreadGroupWithID(kernel.ThreadID(args.PID))
+	if tg == nil {
+		return fmt.Errorf("no such process with PID %d", args.PID)
+	}
+	return proc.Kernel.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(args.Signo)})
 }

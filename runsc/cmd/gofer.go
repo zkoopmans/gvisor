@@ -30,11 +30,13 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 	"gvisor.dev/gvisor/runsc/fsgofer/filter"
@@ -51,6 +53,11 @@ var caps = []string{
 	"CAP_SYS_CHROOT",
 }
 
+var udsOpenCaps = []string{
+	"CAP_SETUID",
+	"CAP_SETGID",
+}
+
 // goferCaps is the minimal set of capabilities needed by the Gofer to operate
 // on files.
 var goferCaps = &specs.LinuxCapabilities{
@@ -59,14 +66,21 @@ var goferCaps = &specs.LinuxCapabilities{
 	Permitted: caps,
 }
 
+var goferUdsOpenCaps = &specs.LinuxCapabilities{
+	Bounding:  udsOpenCaps,
+	Effective: udsOpenCaps,
+	Permitted: udsOpenCaps,
+}
+
 // goferSyncFDs contains file descriptors that are used for synchronization
 // of the Gofer startup process against other processes.
 type goferSyncFDs struct {
-	// nvproxyFD is a file descriptor that is used to wait until
-	// nvproxy-related setup is done. This setup involves creating mounts in the
-	// Gofer process's mount namespace.
+	// chrootFD is a file descriptor that is used to wait until container
+	// filesystem related setup is done. This setup involves creating files and
+	// mounts in the Gofer process's mount namespace and needs to be done before
+	// the Gofer chroots.
 	// If this is set, this FD is the first that the Gofer waits for.
-	nvproxyFD int
+	chrootFD int
 	// usernsFD is a file descriptor that is used to wait until
 	// user namespace ID mappings are established in the Gofer's userns.
 	// If this is set, this FD is the second that the Gofer waits for.
@@ -89,11 +103,12 @@ type Gofer struct {
 	setUpRoot  bool
 	mountConfs boot.GoferMountConfFlags
 
-	specFD        int
-	mountsFD      int
-	profileFDs    profile.FDArgs
-	syncFDs       goferSyncFDs
-	stopProfiling func()
+	specFD           int
+	mountsFD         int
+	goferToHostRPCFD int
+	profileFDs       profile.FDArgs
+	syncFDs          goferSyncFDs
+	stopProfiling    func()
 }
 
 // Name implements subcommands.Command.
@@ -108,7 +123,7 @@ func (g *Gofer) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*Gofer) Usage() string {
-	return `gofer [flags]`
+	return "gofer [flags]\n"
 }
 
 // SetFlags implements subcommands.Command.
@@ -123,6 +138,7 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&g.devIoFD, "dev-io-fd", -1, "optional FD to connect /dev gofer server")
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
+	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
 
 	// Add synchronization FD flags.
 	g.syncFDs.setFlags(f)
@@ -150,11 +166,19 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("reading spec: %v", err)
 	}
 
-	g.syncFDs.syncNVProxy()
+	g.syncFDs.syncChroot()
 	g.syncFDs.syncUsernsForRootless()
 
+	goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
+	if err != nil {
+		util.Fatalf("creating rpc socket: %v", err)
+	}
+
+	goferToHostRPC := urpc.NewClient(goferToHostRPCSock)
+	defer goferToHostRPC.Close()
+
 	if g.setUpRoot {
-		if err := g.setupRootFS(spec, conf); err != nil {
+		if err := g.setupRootFS(spec, conf, goferToHostRPC); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
 		if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
@@ -162,12 +186,17 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 			defer cleanupUnmounter()
 		}
 	}
+	goferToHostRPC.Close()
 	if g.applyCaps {
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
 		args := prepareArgs(g.Name(), f, overrides)
-		util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, goferCaps, setCapsAndCallSelf(args, goferCaps))
+		capsToApply := goferCaps
+		if conf.GetHostUDS().AllowOpen() {
+			capsToApply = specutils.MergeCapabilities(capsToApply, goferUdsOpenCaps)
+		}
+		util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, capsToApply, setCapsAndCallSelf(args, capsToApply))
 		panic("unreachable")
 	}
 
@@ -239,18 +268,25 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	log.Infof("Process chroot'd to %q", root)
 
+	ruid := unix.Getuid()
+	euid := unix.Geteuid()
+	rgid := unix.Getgid()
+	egid := unix.Getegid()
+	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d", ruid, euid, rgid, egid)
+
 	// Initialize filters.
 	opts := filter.Options{
 		UDSOpenEnabled:   conf.GetHostUDS().AllowOpen(),
 		UDSCreateEnabled: conf.GetHostUDS().AllowCreate(),
 		ProfileEnabled:   len(profileOpts) > 0,
 		DirectFS:         conf.DirectFS,
+		CgoEnabled:       config.CgoEnabled,
 	}
 	if err := filter.Install(opts); err != nil {
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid)
 }
 
 func newSocket(ioFD int) *unet.Socket {
@@ -261,7 +297,7 @@ func newSocket(ioFD int) *unet.Socket {
 	return socket
 }
 
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock      *unet.Socket
 		mountPath string
@@ -274,6 +310,10 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string) subcom
 		HostUDS:            conf.GetHostUDS(),
 		HostFifo:           conf.HostFifo,
 		DonateMountPointFD: conf.DirectFS,
+		RUID:               ruid,
+		EUID:               euid,
+		RGID:               rgid,
+		EGID:               egid,
 	})
 
 	ioFDs := g.ioFDs
@@ -368,7 +408,7 @@ func (g *Gofer) writeMounts(mounts []specs.Mount) error {
 // It is protected by selinux rules.
 const procFDBindMount = "/proc/fs"
 
-func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
+func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config, goferToHostRPC *urpc.Client) error {
 	// Convert all shared mounts into slaves to be sure that nothing will be
 	// propagated outside of our namespace.
 	procPath := "/proc"
@@ -436,7 +476,7 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 	}
 
 	// Replace the current spec, with the clean spec with symlinks resolved.
-	if err := g.setupMounts(conf, spec.Mounts, root, procPath); err != nil {
+	if err := g.setupMounts(conf, spec.Mounts, root, procPath, goferToHostRPC); err != nil {
 		util.Fatalf("error setting up FS: %v", err)
 	}
 
@@ -486,7 +526,7 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 // setupMounts bind mounts all mounts specified in the spec in their correct
 // location inside root. It will resolve relative paths and symlinks. It also
 // creates directories as needed.
-func (g *Gofer) setupMounts(conf *config.Config, mounts []specs.Mount, root, procPath string) error {
+func (g *Gofer) setupMounts(conf *config.Config, mounts []specs.Mount, root, procPath string, goferToHostRPC *urpc.Client) error {
 	mountIdx := 1 // First index is for rootfs.
 	for _, m := range mounts {
 		if !specutils.IsGoferMount(m) {
@@ -510,7 +550,22 @@ func (g *Gofer) setupMounts(conf *config.Config, mounts []specs.Mount, root, pro
 		}
 
 		log.Infof("Mounting src: %q, dst: %q, flags: %#x", m.Source, dst, flags)
-		if err := specutils.SafeSetupAndMount(m.Source, dst, m.Type, flags, procPath); err != nil {
+		src := m.Source
+		var srcFile *os.File
+		if err := unix.Access(src, unix.R_OK); err != nil {
+			// The current process doesn't have enough permissions
+			// to open the mount, so let's try to open it in the
+			// parent user namespace.
+			var res container.OpenMountResult
+			if err := goferToHostRPC.Call("goferToHostRPC.OpenMount", &m, &res); err != nil {
+				return fmt.Errorf("opening %s: %w", m.Source, err)
+			}
+			srcFile = res.Files[0]
+			src = fmt.Sprintf("%s/self/fd/%d", procPath, srcFile.Fd())
+		}
+		err = specutils.SafeSetupAndMount(src, dst, m.Type, flags, procPath)
+		srcFile.Close()
+		if err != nil {
 			return fmt.Errorf("mounting %+v: %v", m, err)
 		}
 
@@ -541,9 +596,9 @@ func shouldExposeNvidiaDevice(path string) bool {
 }
 
 // shouldExposeVfioDevice returns true if path refers to an VFIO device
-// which shuold be exposed to the container.
+// which should be exposed to the container.
 func shouldExposeVFIODevice(path string) bool {
-	return strings.HasPrefix(path, filepath.Dir(tpuproxy.VFIOPath))
+	return strings.HasPrefix(path, filepath.Dir(vfio.VFIOPath))
 }
 
 // shouldExposeTpuDevice returns true if path refers to a TPU device which
@@ -551,7 +606,7 @@ func shouldExposeVFIODevice(path string) bool {
 //
 // Precondition: tpuproxy is enabled.
 func shouldExposeTpuDevice(path string) bool {
-	_, valid, _ := util.ExtractTpuDeviceMinor(path)
+	valid, _ := util.IsTPUDeviceValid(path)
 	return valid || shouldExposeVFIODevice(path)
 }
 
@@ -686,12 +741,12 @@ func adjustMountOptions(conf *config.Config, path string, opts []string) ([]stri
 	switch statfs.Type {
 	case unix.OVERLAYFS_SUPER_MAGIC:
 		rv = append(rv, "overlayfs_stale_read")
-	case unix.NFS_SUPER_MAGIC:
+	case unix.NFS_SUPER_MAGIC, unix.FUSE_SUPER_MAGIC:
 		// The gofer client implements remote file handle sharing for performance.
-		// However, remote filesystems like NFS rely on close(2) syscall for
-		// flushing file data to the server. Such handle sharing prevents the
+		// However, remote filesystems like NFS and FUSE rely on close(2) syscall
+		// for flushing file data to the server. Such handle sharing prevents the
 		// application's close(2) syscall from being propagated to the host. Hence
-		// disable file handle sharing, so NFS files are flushed correctly.
+		// disable file handle sharing, so remote files are flushed correctly.
 		rv = append(rv, "disable_file_handle_sharing")
 	}
 	return rv, nil
@@ -699,7 +754,7 @@ func adjustMountOptions(conf *config.Config, path string, opts []string) ([]stri
 
 // setFlags sets sync FD flags on the given FlagSet.
 func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
-	f.IntVar(&g.nvproxyFD, "sync-nvproxy-fd", -1, "file descriptor that the gofer waits on until nvproxy setup is done")
+	f.IntVar(&g.chrootFD, "sync-chroot-fd", -1, "file descriptor that the gofer waits on until container filesystem setup is done")
 	f.IntVar(&g.usernsFD, "sync-userns-fd", -1, "file descriptor the gofer waits on until userns mappings are set up")
 	f.IntVar(&g.procMountFD, "proc-mount-sync-fd", -1, "file descriptor that the gofer writes to when /proc isn't needed anymore and can be unmounted")
 }
@@ -708,7 +763,7 @@ func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
 // to a re-executed version of this process.
 func (g *goferSyncFDs) flags() map[string]string {
 	return map[string]string{
-		"sync-nvproxy-fd":    fmt.Sprintf("%d", g.nvproxyFD),
+		"sync-chroot-fd":     fmt.Sprintf("%d", g.chrootFD),
 		"sync-userns-fd":     fmt.Sprintf("%d", g.usernsFD),
 		"proc-mount-sync-fd": fmt.Sprintf("%d", g.procMountFD),
 	}
@@ -798,16 +853,16 @@ func syncUsernsForRootless(fd int) {
 	}
 }
 
-// syncNVProxy waits on nvproxyFD to be closed.
-// Used for synchronization during nvproxy setup which is done from the
-// non-gofer process.
-// This function is a no-op if nvProxySyncFD is -1.
-func (g *goferSyncFDs) syncNVProxy() {
-	if g.nvproxyFD < 0 {
+// syncChroot waits on chrootFD to be closed.
+// Used for synchronization during container filesystem setup which is done
+// from the non-gofer process.
+// This function is a no-op if chrootFD is -1.
+func (g *goferSyncFDs) syncChroot() {
+	if g.chrootFD < 0 {
 		return
 	}
-	if err := waitForFD(g.nvproxyFD, "nvproxy sync FD"); err != nil {
-		util.Fatalf("failed to sync on NVProxy FD: %v", err)
+	if err := waitForFD(g.chrootFD, "chroot sync FD"); err != nil {
+		util.Fatalf("failed to sync on chroot FD: %v", err)
 	}
-	g.nvproxyFD = -1
+	g.chrootFD = -1
 }

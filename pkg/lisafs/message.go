@@ -172,13 +172,17 @@ const (
 
 	// Accept is analogous to accept4(2).
 	Accept MID = 31
+
+	// ConnectWithCreds is analogous to connect(2) but it asks the server
+	// to connect with the provided effective uid/gid.
+	ConnectWithCreds MID = 32
 )
 
 const (
-	// NoUID is a sentinel used to indicate no valid UID.
+	// NoUID is a sentinel used to indicate no valid UID. See auth.NoID.
 	NoUID UID = math.MaxUint32
 
-	// NoGID is a sentinel used to indicate no valid GID.
+	// NoGID is a sentinel used to indicate no valid GID. See auth.NoID.
 	NoGID GID = math.MaxUint32
 )
 
@@ -1316,6 +1320,21 @@ type ConnectResp struct{ EmptyMessage }
 // String implements fmt.Stringer.String.
 func (*ConnectResp) String() string {
 	return "ConnectResp{}"
+}
+
+// ConnectWithCredsReq is used to make a ConnectWithCreds request. The response is also ConnectResp.
+//
+// +marshal boundCheck
+type ConnectWithCredsReq struct {
+	ConnectReq
+	// UID and GID are used to specify the credentials to connect with.
+	UID UID
+	GID GID
+}
+
+// String implements fmt.Stringer.String.
+func (c *ConnectWithCredsReq) String() string {
+	return fmt.Sprintf("ConnectWithCredsReq{FD: %d, SockType: %d, UID: %d, GID: %d}", c.FD, c.SockType, c.UID, c.GID)
 }
 
 // BindAtReq is used to make BindAt requests.

@@ -28,7 +28,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
-	"gvisor.dev/gvisor/pkg/abi/tpu"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -36,10 +35,10 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/devices/accel"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
@@ -73,11 +72,6 @@ const (
 // SelfFilestorePrefix is the prefix of the self filestore file name.
 const SelfFilestorePrefix = ".gvisor.filestore."
 
-const (
-	pciPathGlobTPUv4 = "/sys/devices/pci0000:00/*/accel/accel*"
-	pciPathGlobTPUv5 = "/sys/devices/pci0000:00/*/vfio-dev/vfio*"
-)
-
 // SelfFilestorePath returns the path at which the self filestore file is
 // stored for a given mount.
 func SelfFilestorePath(mountSrc, sandboxID string) string {
@@ -104,9 +98,7 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 		AllowUserList:  true,
 	})
 	vfsObj.MustRegisterFilesystemType(devpts.Name, &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserList: true,
-		// TODO(b/29356795): Users may mount this once the terminals are in a
-		//  usable state.
+		AllowUserList:  true,
 		AllowUserMount: true,
 	})
 	vfsObj.MustRegisterFilesystemType(dev.Name, &dev.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{})
@@ -163,10 +155,6 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 	}
 
 	if err := nvproxyRegisterDevices(info, vfsObj); err != nil {
-		return err
-	}
-
-	if err := tpuProxyRegisterDevices(info, vfsObj); err != nil {
 		return err
 	}
 
@@ -1018,7 +1006,7 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 	for _, m := range c.mounts {
 		// m.Destination has been cleaned, so it's to use equality here.
 		if m.Destination == "/tmp" {
-			log.Debugf(`Explict "/tmp" mount found, skipping internal tmpfs, mount: %+v`, m)
+			log.Debugf(`Explicit "/tmp" mount found, skipping internal tmpfs, mount: %+v`, m)
 			return nil
 		}
 	}
@@ -1320,8 +1308,8 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 		// spec.Linux.Devices. So manually create appropriate device files.
 		mode := os.FileMode(0666)
 		nvidiaDevs := []specs.LinuxDevice{
-			specs.LinuxDevice{Path: "/dev/nvidiactl", Type: "c", Major: nvgpu.NV_MAJOR_DEVICE_NUMBER, Minor: nvgpu.NV_CONTROL_DEVICE_MINOR, FileMode: &mode},
-			specs.LinuxDevice{Path: "/dev/nvidia-uvm", Type: "c", Major: int64(info.nvidiaUVMDevMajor), Minor: nvgpu.NVIDIA_UVM_PRIMARY_MINOR_NUMBER, FileMode: &mode},
+			{Path: "/dev/nvidiactl", Type: "c", Major: nvgpu.NV_MAJOR_DEVICE_NUMBER, Minor: nvgpu.NV_CONTROL_DEVICE_MINOR, FileMode: &mode},
+			{Path: "/dev/nvidia-uvm", Type: "c", Major: int64(info.nvidiaUVMDevMajor), Minor: nvgpu.NVIDIA_UVM_PRIMARY_MINOR_NUMBER, FileMode: &mode},
 		}
 		devClient := devutil.GoferClientFromContext(ctx)
 		if devClient == nil {
@@ -1370,7 +1358,28 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 	default:
 		return fmt.Errorf("specified device at %q has invalid type %q", devSpec.Path, devSpec.Type)
 	}
-	if devSpec.Path == "/dev/nvidia-uvm" && info.nvidiaUVMDevMajor != 0 && major != info.nvidiaUVMDevMajor {
+	if strings.HasPrefix(devSpec.Path, "/dev/vfio") || strings.HasPrefix(devSpec.Path, "/dev/accel") {
+		if devSpec.Path == "/dev/vfio/vfio" {
+			if err := vfio.RegisterVFIODevice(vfsObj, true /* useDevGofer */); err != nil {
+				return fmt.Errorf("registering vfio driver: %w", err)
+			}
+		} else if tpuproxy.TPUv4DeviceRegex.MatchString(devSpec.Path) {
+
+			if err := tpuproxy.RegisterTPUv4Device(ctx, creds, root, vfsObj, devSpec.Path, minor); err != nil {
+				return fmt.Errorf("registering TPUv4 device: %w", err)
+			}
+		} else if tpuproxy.TPUv5DeviceRegex.MatchString(devSpec.Path) {
+			if err := tpuproxy.RegisterTPUv5Device(vfsObj, devSpec.Path, minor); err != nil {
+				return fmt.Errorf("registering TPUv5 device: %w", err)
+			}
+			log.Infof("Switching %v device major number from %d to %d", devSpec.Path, devSpec.Major, major)
+			var err error
+			major, err = vfio.GetTPUDeviceMajor(vfsObj)
+			if err != nil {
+				return fmt.Errorf("getting TPU device major number: %w", err)
+			}
+		}
+	} else if devSpec.Path == "/dev/nvidia-uvm" && info.nvidiaUVMDevMajor != 0 && major != info.nvidiaUVMDevMajor {
 		// nvidia-uvm's major device number is dynamically assigned, so the
 		// number that it has on the host may differ from the number that
 		// it has in sentry VFS; switch from the former to the latter.
@@ -1380,75 +1389,19 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 	return dev.CreateDeviceFile(ctx, vfsObj, creds, root, devSpec.Path, major, minor, mode, devSpec.UID, devSpec.GID)
 }
 
-// registerTPUDevice registers a TPU device in vfsObj based on the given device ID.
-func registerTPUDevice(vfsObj *vfs.VirtualFilesystem, minor uint32, deviceID int64) error {
-	switch deviceID {
-	case tpu.TPUV4DeviceID, tpu.TPUV4liteDeviceID:
-		return accel.RegisterTPUDevice(vfsObj, minor, deviceID == tpu.TPUV4liteDeviceID)
-	case tpu.TPUV5eDeviceID:
-		return tpuproxy.RegisterTPUDevice(vfsObj, minor)
-	default:
-		return fmt.Errorf("unsupported TPU device with ID: 0x%x", deviceID)
-	}
-}
-
-// pathGlobToPathRegex is a map that points a TPU PCI path glob to its path regex.
-// TPU v4 devices are accessible via /sys/devices/pci0000:00/<pci_address>/accel/accel# on the host.
-// TPU v5 devices are accessible via at /sys/devices/pci0000:00/<pci_address>/vfio-dev/vfio# on the host.
-var pathGlobToPathRegex = map[string]string{
-	pciPathGlobTPUv4: `^/sys/devices/pci0000:00/\d+:\d+:\d+\.\d+/accel/accel(\d+)$`,
-	pciPathGlobTPUv5: `^/sys/devices/pci0000:00/\d+:\d+:\d+\.\d+/vfio-dev/vfio(\d+)$`,
-}
-
-func tpuProxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
-	if !specutils.TPUProxyIsEnabled(info.spec, info.conf) {
-		return nil
-	}
-	// Enumerate all potential PCI paths where TPU devices are available and register the found TPU devices.
-	for pciPathGlobal, pathRegex := range pathGlobToPathRegex {
-		pciAddrs, err := filepath.Glob(pciPathGlobal)
-		if err != nil {
-			return fmt.Errorf("enumerating PCI device files: %w", err)
-		}
-		pciPathRegex := regexp.MustCompile(pathRegex)
-		for _, pciPath := range pciAddrs {
-			ms := pciPathRegex.FindStringSubmatch(pciPath)
-			if ms == nil {
-				continue
-			}
-			deviceNum, err := strconv.ParseUint(ms[1], 10, 32)
-			if err != nil {
-				return fmt.Errorf("parsing PCI device number: %w", err)
-			}
-			var deviceIDBytes []byte
-			if deviceIDBytes, err = os.ReadFile(path.Join(pciPath, "device/device")); err != nil {
-				return fmt.Errorf("reading PCI device ID: %w", err)
-			}
-			deviceIDStr := strings.Replace(string(deviceIDBytes), "0x", "", -1)
-			deviceID, err := strconv.ParseInt(strings.TrimSpace(deviceIDStr), 16, 64)
-			if err != nil {
-				return fmt.Errorf("parsing PCI device ID: %w", err)
-			}
-			if err := registerTPUDevice(vfsObj, uint32(deviceNum), deviceID); err != nil {
-				return fmt.Errorf("registering TPU driver: %w", err)
-			}
-		}
-	}
-	if err := tpuproxy.RegisterVfioDevice(vfsObj); err != nil {
-		return fmt.Errorf("registering vfio driver: %w", err)
-	}
-	return nil
-}
-
 func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
 	if !specutils.NVProxyEnabled(info.spec, info.conf) {
 		return nil
+	}
+	driverCaps, err := specutils.NVProxyDriverCapsAllowed(info.conf)
+	if err != nil {
+		return fmt.Errorf("NVIDIA driver capabilities: %w", err)
 	}
 	uvmDevMajor, err := vfsObj.GetDynamicCharDevMajor()
 	if err != nil {
 		return fmt.Errorf("reserving device major number for nvidia-uvm: %w", err)
 	}
-	if err := nvproxy.Register(vfsObj, info.nvidiaDriverVersion, uvmDevMajor); err != nil {
+	if err := nvproxy.Register(vfsObj, info.nvidiaDriverVersion, driverCaps, uvmDevMajor); err != nil {
 		return fmt.Errorf("registering nvproxy driver: %w", err)
 	}
 	info.nvidiaUVMDevMajor = uvmDevMajor

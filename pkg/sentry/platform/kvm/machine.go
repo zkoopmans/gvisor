@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -118,7 +119,7 @@ var (
 		"/kvm/host_exits",
 		metric.Uint64Metadata{
 			Cumulative:  true,
-			Description: "The number of times the sentry performed a host to guest world switch.",
+			Description: "KVM host-to-guest world switch by Sentry.",
 		})
 
 	// userExitCounter is a metric that tracks how many times the sentry has
@@ -127,7 +128,7 @@ var (
 		"/kvm/user_exits",
 		metric.Uint64Metadata{
 			Cumulative:  true,
-			Description: "The number of times the sentry has had an exit from userspace.",
+			Description: "KVM sentry exits from userspace.",
 		})
 
 	// interruptCounter is a metric that tracks how many times execution returned
@@ -136,7 +137,7 @@ var (
 		"/kvm/interrupts",
 		metric.Uint64Metadata{
 			Cumulative:  true,
-			Description: "The number of times the signal handler was invoked.",
+			Description: "KVM signal handler invocations.",
 		})
 
 	// mmapCallCounter is a metric that tracks how many times the function
@@ -145,7 +146,7 @@ var (
 		"/kvm/mmap_calls",
 		metric.Uint64Metadata{
 			Cumulative:  true,
-			Description: "The number of times seccompMmapSyscall has been called.",
+			Description: "KVM seccompMmapSyscall calls.",
 		})
 
 	// getVCPUCounter is a metric that tracks how many times different paths of
@@ -154,7 +155,7 @@ var (
 		"/kvm/get_vcpu",
 		metric.Uint64Metadata{
 			Cumulative:  true,
-			Description: "The number of times that machine.Get() was called, split by path the function took.",
+			Description: "KVM machine.Get() calls per CPU acquisition path.",
 			Fields: []metric.Field{
 				metric.NewField("acquisition_type", &getVCPUAcquisitionFastReused, &getVCPUAcquisitionReused, &getVCPUAcquisitionUnused, &getVCPUAcquisitionStolen),
 			},
@@ -163,7 +164,7 @@ var (
 	// asInvalidateDuration are durations of calling addressSpace.invalidate().
 	asInvalidateDuration = KVMProfiling.MustCreateNewTimerMetric("/kvm/address_space_invalidate",
 		metric.NewExponentialBucketer(15, uint64(time.Nanosecond*100), 1, 2),
-		"Duration of calling addressSpace.invalidate().")
+		"Duration of KVM addressSpace.invalidate().")
 )
 
 // vCPU is a single KVM vCPU.
@@ -228,7 +229,7 @@ type dieState struct {
 // Precondition: mu must be held.
 func (m *machine) createVCPU(id int) *vCPU {
 	// Create the vCPU.
-	fd, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CREATE_VCPU, uintptr(id))
+	fd, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CREATE_VCPU, uintptr(id))
 	if errno != 0 {
 		panic(fmt.Sprintf("error creating new vCPU: %v", errno))
 	}
@@ -261,11 +262,19 @@ func (m *machine) createVCPU(id int) *vCPU {
 	return c // Done.
 }
 
+// forceMappingEntireAddressSpace forces mapping the entire process address
+// space to the VM.
+var forceMappingEntireAddressSpace = false
+
 // newMachine returns a new VM context.
-func newMachine(vm int) (*machine, error) {
+func newMachine(vm int, config *Config) (*machine, error) {
 	// Create the machine.
 	m := &machine{fd: vm}
 	m.available.L = &m.mu
+
+	if err := m.applyConfig(config); err != nil {
+		panic(fmt.Sprintf("error setting config parameters: %s", err))
+	}
 
 	// Pull the maximum vCPUs.
 	m.getMaxVCPU()
@@ -275,7 +284,7 @@ func newMachine(vm int) (*machine, error) {
 	m.kernel.Init(m.maxVCPUs)
 
 	// Pull the maximum slots.
-	maxSlots, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
+	maxSlots, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
 	if errno != 0 {
 		m.maxSlots = _KVM_NR_MEMSLOTS
 	} else {
@@ -285,7 +294,7 @@ func newMachine(vm int) (*machine, error) {
 	m.usedSlots = make([]uintptr, m.maxSlots)
 
 	// Check TSC Scaling
-	hasTSCControl, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
+	hasTSCControl, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
 	m.tscControl = errno == 0 && hasTSCControl == 1
 	log.Debugf("TSC scaling support: %t.", m.tscControl)
 
@@ -296,9 +305,32 @@ func newMachine(vm int) (*machine, error) {
 	m.upperSharedPageTables.MarkReadOnlyShared()
 	m.kernel.PageTables = pagetables.NewWithUpper(newAllocator(), m.upperSharedPageTables, ring0.KernelStartAddress)
 
-	// Install seccomp rules to trap runtime mmap system calls. They will
-	// be handled by seccompMmapHandler.
-	seccompMmapRules(m)
+	// On x86_64, we prefer not to map the entire sentry address space into
+	// the VM due to memory overhead. It is about 3MB for a 40-bit address
+	// space and about 250MB for 46-bit address spaces (modern CPUs).
+	//
+	// Before version 6.9, the memory overhead was two bytes per page.
+	// This issue was fixed by commit a364c014a2c1 ("kvm/x86: allocate the
+	// write-tracking metadata on-demand").
+	//
+	// If the entire address space isn't mapped into the VM, we need to
+	// trap mmap system calls and map sentry memory regions on demand. This
+	// introduces some overhead for mmap system calls, but considering that
+	// mmap isn't called frequently, it seems better than the memory and
+	// startup time overhead introduced by mapping the entire address
+	// space.
+	mapEntireAddressSpace := forceMappingEntireAddressSpace ||
+		runtime.GOARCH != "amd64"
+	if mapEntireAddressSpace {
+		// Increase faultBlockSize to be sure that we will not reach the limit.
+		// faultBlockSize has to equal or less than KVM_MEM_MAX_NR_PAGES.
+		faultBlockSize = uintptr(1) << 42
+		faultBlockMask = ^uintptr(faultBlockSize - 1)
+	} else {
+		// Install seccomp rules to trap runtime mmap system calls. They will
+		// be handled by seccompMmapHandler.
+		seccompMmapRules(m)
+	}
 
 	// Apply the physical mappings. Note that these mappings may point to
 	// guest physical addresses that are not actually available. These
@@ -343,7 +375,7 @@ func newMachine(vm int) (*machine, error) {
 			}
 
 			// Ensure the physical range is mapped.
-			m.mapPhysical(physical, length, physicalRegions)
+			m.mapPhysical(physical, length)
 			virtual += length
 		}
 	}
@@ -352,6 +384,7 @@ func newMachine(vm int) (*machine, error) {
 	// seccompMmapHandler, so here we have to guarantee that mmap is not
 	// called while we hold the slot spinlock.
 	disableAsyncPreemption()
+
 	applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			return // skip region.
@@ -365,8 +398,12 @@ func newMachine(vm int) (*machine, error) {
 		mapRegion(vr, 0)
 
 	})
+	if mapEntireAddressSpace {
+		for _, r := range physicalRegions {
+			m.mapPhysical(r.physical, r.length)
+		}
+	}
 	enableAsyncPreemption()
-
 	// Initialize architecture state.
 	if err := m.initArchState(); err != nil {
 		m.Destroy()
@@ -405,9 +442,9 @@ func (m *machine) hasSlot(physical uintptr) bool {
 // This throws on error.
 //
 //go:nosplit
-func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalRegion) {
+func (m *machine) mapPhysical(physical, length uintptr) {
 	for end := physical + length; physical < end; {
-		_, physicalStart, length, pr := calculateBluepillFault(physical, phyRegions)
+		virtualStart, physicalStart, length, pr := calculateBluepillFault(physical)
 		if pr == nil {
 			// Should never happen.
 			throw("mapPhysical on unknown physical address")
@@ -415,9 +452,7 @@ func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalReg
 
 		// Is this already mapped? Check the usedSlots.
 		if !m.hasSlot(physicalStart) {
-			if _, ok := handleBluepillFault(m, physical, phyRegions); !ok {
-				throw("handleBluepillFault failed")
-			}
+			m.mapMemorySlot(virtualStart, physicalStart, length, pr.readOnly)
 		}
 
 		// Move to the next chunk.
@@ -796,7 +831,7 @@ func seccompMmapRules(m *machine) {
 	seccompMmapRulesOnce.Do(func() {
 		// Install the handler.
 		if err := sighandling.ReplaceSignalHandler(unix.SIGSYS, addrOfSigsysHandler(), &savedSigsysHandler); err != nil {
-			panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
+			panic(fmt.Sprintf("Unable to set handler for signal %d: %v", unix.SIGSYS, err))
 		}
 		rules := []seccomp.RuleSet{
 			// Trap mmap system calls and handle them in sigsysGoHandler
@@ -844,4 +879,11 @@ func seccompMmapRules(m *machine) {
 	machinePool[i].Store(m)
 	m.machinePoolIndex = i
 	machinePoolMu.Unlock()
+}
+
+type kvmEnableCap struct {
+	capability uint32
+	flags      uint32
+	args       [4]uint64
+	pad        [64]uint8
 }

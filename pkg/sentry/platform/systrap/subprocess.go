@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/pool"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -149,8 +150,8 @@ type subprocess struct {
 	// within the sentry address space.
 	threadContextRegion uintptr
 
-	// memoryFile is used to allocate a sysmsg stack which is shared
-	// between a stub process and the Sentry.
+	// memoryFile is used to allocate a sysmsg stack which is shared between a
+	// stub process and the Sentry.
 	memoryFile *pgalloc.MemoryFile
 
 	// usertrap is the state of the usertrap table which contains syscall
@@ -181,7 +182,7 @@ type subprocess struct {
 var seccompNotifyIsSupported = false
 
 func initSeccompNotify() {
-	_, _, errno := unix.Syscall(seccomp.SYS_SECCOMP, linux.SECCOMP_SET_MODE_FILTER, linux.SECCOMP_FILTER_FLAG_NEW_LISTENER, 0)
+	errno := hostsyscall.RawSyscallErrno(seccomp.SYS_SECCOMP, linux.SECCOMP_SET_MODE_FILTER, linux.SECCOMP_FILTER_FLAG_NEW_LISTENER, 0)
 	switch errno {
 	case unix.EFAULT:
 		// seccomp unotify is supported.
@@ -285,7 +286,7 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 		}
 		t.sysmsgStackID = id
 
-		if _, _, e := unix.RawSyscall(unix.SYS_TGKILL, uintptr(t.tgid), uintptr(t.tid), uintptr(unix.SIGSTOP)); e != 0 {
+		if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(t.tgid), uintptr(t.tid), uintptr(unix.SIGSTOP)); e != 0 {
 			handlePtraceSyscallRequestError(req, "tkill failed: %v", e)
 			return
 		}
@@ -423,7 +424,7 @@ func (s *subprocess) mapSharedRegions() {
 	if err != nil {
 		panic(fmt.Sprintf("failed to allocate a new subprocess context memory region"))
 	}
-	sentryThreadContextRegionAddr, _, errno := unix.RawSyscall6(
+	sentryThreadContextRegionAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		uintptr(threadContextFR.Length()),
@@ -503,7 +504,7 @@ func (s *subprocess) release() {
 
 // attach attaches to the thread.
 func (t *thread) attach() error {
-	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_ATTACH, uintptr(t.tid), 0); errno != 0 {
 		return fmt.Errorf("unable to attach: %v", errno)
 	}
 
@@ -537,7 +538,7 @@ func (t *thread) grabInitRegs() {
 //
 // Because the SIGSTOP is not suppressed, the thread will enter group-stop.
 func (t *thread) detach() {
-	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(t.tid), 0, uintptr(unix.SIGSTOP), 0, 0); errno != 0 {
+	if errno := hostsyscall.RawSyscallErrno6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(t.tid), 0, uintptr(unix.SIGSTOP), 0, 0); errno != 0 {
 		panic(fmt.Sprintf("can't detach new clone: %v", errno))
 	}
 }
@@ -682,7 +683,7 @@ func (t *thread) init() {
 	// Set the TRACESYSGOOD option to differentiate real SIGTRAP.
 	// set PTRACE_O_EXITKILL to ensure that the unexpected exit of the
 	// sentry will immediately kill the associated stubs.
-	_, _, errno := unix.RawSyscall6(
+	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_PTRACE,
 		unix.PTRACE_SETOPTIONS,
 		uintptr(t.tid),
@@ -709,7 +710,7 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 		// Execute the syscall instruction. The task has to stop on the
 		// trap instruction which is right after the syscall
 		// instruction.
-		if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+		if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(t.tid), 0); errno != 0 {
 			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
 		}
 
@@ -781,7 +782,7 @@ func (s *subprocess) decAwakeContexts() {
 // This function returns true on a system call, false on a signal.
 // The second return value is true if a syscall instruction can be replaced on
 // a function call.
-func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSyscall bool, shouldPatchSyscall bool, err *platform.ContextError) {
+func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSyscall bool, shouldPatchSyscall bool, at hostarch.AccessType, err *platform.ContextError) {
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	s.resetSysemuRegs(regs)
@@ -794,7 +795,7 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 		// Pending interrupt; simulate.
 		ctx.clearInterrupt()
 		c.signalInfo = linux.SignalInfo{Signo: int32(platform.SignalInterrupt)}
-		return false, false, nil
+		return false, false, hostarch.NoAccess, nil
 	}
 	defer func() {
 		ctx.clearInterrupt()
@@ -810,20 +811,20 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	}
 	ctx.setState(sysmsg.ContextStateNone)
 	if err := s.contextQueue.add(ctx); err != nil {
-		return false, false, err
+		return false, false, hostarch.NoAccess, err
 	}
 
 	if err := s.waitOnState(ctx); err != nil {
-		return false, false, corruptedSharedMemoryErr(err.Error())
+		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(err.Error())
 	}
 
 	// Check if there's been an error.
 	threadID := ctx.threadID()
 	if threadID != invalidThreadID {
 		if sysThread, ok := s.sysmsgThreads[threadID]; ok && sysThread.msg.Err != 0 {
-			return false, false, sysThread.msg.ConvertSysmsgErr()
+			return false, false, hostarch.NoAccess, sysThread.msg.ConvertSysmsgErr()
 		}
-		return false, false, corruptedSharedMemoryErr(fmt.Sprintf("found unexpected ThreadContext.ThreadID field, expected %d found %d", invalidThreadID, threadID))
+		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("found unexpected ThreadContext.ThreadID field, expected %d found %d", invalidThreadID, threadID))
 	}
 
 	// Copy register state locally.
@@ -842,15 +843,19 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 
 	if ctxState == sysmsg.ContextStateSyscall || ctxState == sysmsg.ContextStateSyscallTrap {
 		if maybePatchSignalInfo(regs, &c.signalInfo) {
-			return false, false, nil
+			return false, false, hostarch.Execute, nil
 		}
 		updateSyscallRegs(regs)
-		return true, shouldPatchSyscall, nil
+		return true, shouldPatchSyscall, hostarch.NoAccess, nil
 	} else if ctxState != sysmsg.ContextStateFault {
-		return false, false, corruptedSharedMemoryErr(fmt.Sprintf("unknown context state: %v", ctxState))
+		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("unknown context state: %v", ctxState))
 	}
 
-	return false, false, nil
+	at = hostarch.NoAccess
+	if c.signalInfo.Signo == int32(linux.SIGSEGV) {
+		at = sigErrorToAccessType(ctx.shared.SigError)
+	}
+	return false, false, at, nil
 }
 
 func (s *subprocess) waitOnState(ctx *sharedContext) error {
@@ -967,41 +972,27 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	fd, err := f.DataFD(fr)
+	if err != nil {
+		return err
+	}
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE
 	}
-	_, err := s.syscall(
+	_, err = s.syscall(
 		unix.SYS_MMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
 		arch.SyscallArgument{Value: uintptr(fr.Length())},
 		arch.SyscallArgument{Value: uintptr(at.Prot())},
 		arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
-		arch.SyscallArgument{Value: uintptr(f.FD())},
+		arch.SyscallArgument{Value: uintptr(fd)},
 		arch.SyscallArgument{Value: uintptr(fr.Start)})
 	return err
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
-	ar, ok := addr.ToRange(length)
-	if !ok {
-		panic(fmt.Sprintf("addr %#x + length %#x overflows", addr, length))
-	}
-	s.mu.Lock()
-	for c := range s.faultedContexts {
-		c.mu.Lock()
-		if c.lastFaultSP == s && ar.Contains(c.lastFaultAddr) {
-			// Forget the last fault so that if c faults again, the fault isn't
-			// incorrectly reported as a write fault. If this is being called
-			// due to munmap() of the corresponding vma, handling of the second
-			// fault will fail anyway.
-			c.lastFaultSP = nil
-			delete(s.faultedContexts, c)
-		}
-		c.mu.Unlock()
-	}
-	s.mu.Unlock()
 	_, err := s.syscall(
 		unix.SYS_MUNMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
@@ -1057,7 +1048,7 @@ func (s *subprocess) createSysmsgThread() error {
 	}
 
 	// Skip SIGSTOP.
-	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(p.tid), 0, 0, 0, 0); errno != 0 {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(p.tid), 0); errno != 0 {
 		panic(fmt.Sprintf("ptrace cont failed: %v", errno))
 	}
 	sig := p.wait(stopped)
@@ -1085,7 +1076,7 @@ func (s *subprocess) createSysmsgThread() error {
 	threadID := uint32(p.sysmsgStackID)
 
 	// Map the stack into the sentry.
-	sentryStackAddr, _, errno := unix.RawSyscall6(
+	sentryStackAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		sysmsg.PerThreadSharedStackSize,
@@ -1165,11 +1156,11 @@ func (s *subprocess) createSysmsgThread() error {
 	}
 	archSpecificSysmsgThreadInit(sysThread)
 	// Skip SIGSTOP.
-	if _, _, e := unix.RawSyscall(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
+	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
 		panic(fmt.Sprintf("tkill failed: %v", e))
 	}
 	// Resume the BPF process.
-	if _, _, errno := unix.RawSyscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(p.tid), 0, 0, 0, 0); errno != 0 {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(p.tid), 0); errno != 0 {
 		panic(fmt.Sprintf("can't detach new clone: %v", errno))
 	}
 

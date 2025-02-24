@@ -360,16 +360,22 @@ type MMapOpts struct {
 	// Linux.
 	Stack bool
 
+	// PlatformEffect controls the synchronous effect of this call on the
+	// underlying platform.AddressSpace.
 	PlatformEffect MMapPlatformEffect
 
 	// MLockMode specifies the memory locking behavior of the mapping.
 	MLockMode MLockMode
 
-	// Hint is the name used for the mapping in /proc/[pid]/maps. If Hint is
+	// Name is the name used for the mapping in /proc/[pid]/maps. If Name is
 	// empty, MappingIdentity.MappedName() will be used instead.
 	//
 	// TODO(jamieliu): Replace entirely with MappingIdentity?
-	Hint string
+	Name string
+
+	// NameMut controls the effect of prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)
+	// on this mapping.
+	NameMut NameMut
 
 	// Force means to skip validation checks of Addr and Length. It can be
 	// used to create special mappings below mm.layout.MinAddr and
@@ -378,11 +384,35 @@ type MMapOpts struct {
 	// If Force is true, Unmap and Fixed must be true.
 	Force bool
 
+	// If RequirePlatformEffect is false, PlatformEffect is best-effort;
+	// failure to create mappings in the platform.AddressSpace are silently
+	// ignored. If RequirePlatformEffect is true, failure to create mappings in
+	// the platform.AddressSpace cause MMap() to fail. (If PlatformEffect is
+	// PlatformEffectDefault, RequirePlatformEffect is ignored.)
+	RequirePlatformEffect bool
+
 	// SentryOwnedContent indicates the sentry exclusively controls the
 	// underlying memory backing the mapping thus the memory content is
 	// guaranteed not to be modified outside the sentry's purview.
 	SentryOwnedContent bool
 }
+
+// NameMut is the type of MMapOpts.NameMut.
+type NameMut uint8
+
+// Possible values for MMapOpts.NameMut:
+const (
+	// NameMutDisallowed indicates that PR_SET_VMA_ANON_NAME should fail.
+	NameMutDisallowed NameMut = iota
+
+	// NameMutAnon indicates that PR_SET_VMA_ANON_NAME should succeed, and
+	// treat the mapping as private anonymous memory.
+	NameMutAnon
+
+	// NameMutAnonShmem indicates that PR_SET_VMA_ANON_NAME should succeed, and
+	// treat the mapping as shared anonymous memory.
+	NameMutAnonShmem
+)
 
 // MMapPlatformEffect is the type of MMapOpts.PlatformEffect.
 type MMapPlatformEffect uint8
@@ -440,6 +470,16 @@ type File interface {
 	// reference is held on the mapped pages.
 	MapInternal(fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, error)
 
+	// DataFD blocks until offsets fr in the file contain valid data, then
+	// returns the file descriptor represented by the File.
+	//
+	// Note that fr.Start and fr.End need not be page-aligned.
+	//
+	// Preconditions:
+	//	* fr.Length() > 0.
+	//	* At least one reference must be held on all pages in fr.
+	DataFD(fr FileRange) (int, error)
+
 	// BufferReadAt reads len(dst) bytes from the file into dst, starting at
 	// file offset off. It returns the number of bytes read. Like
 	// io.ReaderAt.ReadAt(), it never returns a short read with a nil error.
@@ -466,10 +506,10 @@ type File interface {
 	//	* At least one reference must be held on all written pages.
 	BufferWriteAt(off uint64, src []byte) (uint64, error)
 
-	// FD returns the file descriptor represented by the File.
-	//
-	// The only permitted operation on the returned file descriptor is to map
-	// pages from it consistent with the requirements of AddressSpace.MapFile.
+	// FD returns the file descriptor represented by the File. The returned
+	// file descriptor should not be used to implement
+	// platform.AddressSpace.MapFile, since the contents of the File may not be
+	// valid; use DataFD instead.
 	FD() int
 }
 

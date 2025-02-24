@@ -43,6 +43,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_EXIT:       seccomp.MatchAll{},
 	unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
 	unix.SYS_FCHMOD:     seccomp.MatchAll{},
+	unix.SYS_FCHMODAT:   seccomp.MatchAll{},
 	unix.SYS_FCHOWNAT:   seccomp.MatchAll{},
 	unix.SYS_FCNTL: seccomp.Or{
 		seccomp.PerArg{
@@ -105,6 +106,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_GETRANDOM:    seccomp.MatchAll{},
 	unix.SYS_GETTID:       seccomp.MatchAll{},
 	unix.SYS_GETTIMEOFDAY: seccomp.MatchAll{},
+	unix.SYS_LGETXATTR:    seccomp.MatchAll{},
 	unix.SYS_LSEEK:        seccomp.MatchAll{},
 	unix.SYS_MADVISE:      seccomp.MatchAll{},
 	unix.SYS_MEMFD_CREATE: seccomp.MatchAll{}, // Used by flipcall.PacketWindowAllocator.Init().
@@ -206,7 +208,9 @@ var udsCommonSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule
 })
 
 var udsOpenSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-	unix.SYS_CONNECT: seccomp.MatchAll{},
+	unix.SYS_CONNECT:  seccomp.MatchAll{},
+	unix.SYS_SETREUID: seccomp.MatchAll{},
+	unix.SYS_SETREGID: seccomp.MatchAll{},
 })
 
 var udsCreateSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
@@ -220,7 +224,6 @@ var lisafsFilters = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0),
 	},
-	unix.SYS_FCHMODAT:   seccomp.MatchAll{},
 	unix.SYS_FGETXATTR:  seccomp.MatchAll{},
 	unix.SYS_FSTATFS:    seccomp.MatchAll{},
 	unix.SYS_GETDENTS64: seccomp.MatchAll{},

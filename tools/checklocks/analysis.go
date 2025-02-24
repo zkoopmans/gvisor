@@ -56,7 +56,7 @@ func (pc *passContext) typeAlignment(pkg *types.Package, obj types.Object) atomi
 		}
 	case *types.Array:
 		// Export direct alignment requirements.
-		if named, ok := x.Elem().(*types.Named); ok && !hasTypeParams(named) {
+		if named, ok := types.Unalias(x.Elem()).(*types.Named); ok && !hasTypeParams(named) {
 			requiredOffset = pc.typeAlignment(pkg, named.Obj())
 		}
 	default:
@@ -298,7 +298,7 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 		for s, info := range ls.lockedMutexes {
 			// Is this an object for which we have facts? If there
 			// is no ability to name this object, then we don't
-			// bother with any inferrence. We also ignore any self
+			// bother with any inference. We also ignore any self
 			// references (e.g. accessing a mutex while you are
 			// holding that exact mutex).
 			if info.object == nil || accessObj == info.object {

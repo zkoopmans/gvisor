@@ -15,8 +15,6 @@
 package linux
 
 import (
-	"math"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -127,7 +125,7 @@ func openat(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, flags uint32, m
 // Access implements Linux syscall access(2).
 func Access(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
-	mode := args[1].ModeT()
+	mode := args[1].Uint()
 
 	return 0, nil, accessAt(t, linux.AT_FDCWD, addr, mode, 0 /* flags */)
 }
@@ -136,7 +134,7 @@ func Access(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 func Faccessat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	dirfd := args[0].Int()
 	addr := args[1].Pointer()
-	mode := args[2].ModeT()
+	mode := args[2].Uint()
 
 	return 0, nil, accessAt(t, dirfd, addr, mode, 0 /* flags */)
 }
@@ -145,13 +143,13 @@ func Faccessat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 func Faccessat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	dirfd := args[0].Int()
 	addr := args[1].Pointer()
-	mode := args[2].ModeT()
+	mode := args[2].Uint()
 	flags := args[3].Int()
 
 	return 0, nil, accessAt(t, dirfd, addr, mode, flags)
 }
 
-func accessAt(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, mode uint, flags int32) error {
+func accessAt(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, mode uint32, flags int32) error {
 	const rOK = 4
 	const wOK = 2
 	const xOK = 1
@@ -455,12 +453,18 @@ func CloseRange(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uint
 	last := args[1].Uint()
 	flags := args[2].Uint()
 
-	if (first > last) || (last > math.MaxInt32) {
+	if first > last {
 		return 0, nil, linuxerr.EINVAL
 	}
 
 	if (flags & ^(linux.CLOSE_RANGE_CLOEXEC | linux.CLOSE_RANGE_UNSHARE)) != 0 {
 		return 0, nil, linuxerr.EINVAL
+	}
+
+	// close_range allows fd arguments to be up to MaxUint32, but only fds
+	// up to kernel.MaxFdLimit are valid, so cap it here.
+	if last > uint32(kernel.MaxFdLimit) {
+		last = uint32(kernel.MaxFdLimit)
 	}
 
 	cloexec := flags & linux.CLOSE_RANGE_CLOEXEC
@@ -474,7 +478,7 @@ func CloseRange(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uint
 		if cloexec == 0 && int32(last) >= t.FDTable().GetLastFd() {
 			t.UnshareFdTable(int32(first))
 		} else {
-			t.UnshareFdTable(math.MaxInt32)
+			t.UnshareFdTable(kernel.MaxFdLimit)
 		}
 	}
 

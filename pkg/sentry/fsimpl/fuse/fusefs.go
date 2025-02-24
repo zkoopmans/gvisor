@@ -26,7 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -95,7 +95,7 @@ type filesystem struct {
 	opts *filesystemOptions
 
 	// clock is a real-time clock used to set timestamps in file operations.
-	clock time.Clock
+	clock ktime.Clock
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -271,7 +271,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 		devMinor: devMinor,
 		opts:     opts,
 		conn:     fuseFD.conn,
-		clock:    time.RealtimeClockFromContext(ctx),
+		clock:    ktime.RealtimeClockFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
 	return fs, nil
@@ -301,8 +301,11 @@ func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode
 	return &d
 }
 
-func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) kernfs.Inode {
+func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (kernfs.Inode, error) {
 	attr := out.Attr
+	if !isValidType(attr.Mode) {
+		return nil, linuxerr.EIO
+	}
 	i := &inode{fs: fs, nodeID: out.NodeID, generation: out.Generation}
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
@@ -314,5 +317,15 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) kern
 
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
-	return i
+	return i, nil
+}
+
+// isValidType is analogous to fs/fuse/dir.c:fuse_valid_type().
+func isValidType(mode uint32) bool {
+	switch mode & linux.S_IFMT {
+	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFCHR, linux.S_IFBLK, linux.S_IFIFO, linux.S_IFSOCK:
+		return true
+	default:
+		return false
+	}
 }

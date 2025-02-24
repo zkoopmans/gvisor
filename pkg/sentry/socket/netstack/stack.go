@@ -40,7 +40,21 @@ import (
 //
 // +stateify savable
 type Stack struct {
-	Stack *stack.Stack `state:"manual"`
+	Stack *stack.Stack `state:".(*stack.Stack)"`
+}
+
+// EnableSaveRestore enables netstack s/r.
+func (s *Stack) EnableSaveRestore() error {
+	s.Stack.EnableSaveRestore()
+	return nil
+}
+
+// IsSaveRestoreEnabled implements inet.Stack.IsSaveRestoreEnabled.
+func (s *Stack) IsSaveRestoreEnabled() bool {
+	if s.Stack == nil {
+		return false
+	}
+	return s.Stack.IsSaveRestoreEnabled()
 }
 
 // Destroy implements inet.Stack.Destroy.
@@ -170,7 +184,7 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 }
 
 func (s *Stack) setLink(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
-	// IFLA_NET_NS_FD has to be handled first, because other parameters may be reseted.
+	// IFLA_NET_NS_FD has to be handled first, because other parameters may be reset.
 	if v, ok := linkAttrs[linux.IFLA_NET_NS_FD]; ok {
 		fd, ok := v.Uint32()
 		if !ok {
@@ -284,7 +298,7 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 			}
 		}
 	}
-	ep, peerEP := veth.NewPair(defaultMTU)
+	ep, peerEP := veth.NewPair(defaultMTU, veth.DefaultBacklogSize)
 	id := s.Stack.NextNICID()
 	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
@@ -578,6 +592,7 @@ func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
 
 // Statistics implements inet.Stack.Statistics.
 func (s *Stack) Statistics(stat any, arg string) error {
+	netStats := s.Stats()
 	switch stats := stat.(type) {
 	case *inet.StatDev:
 		for _, ni := range s.Stack.NICInfo() {
@@ -608,7 +623,7 @@ func (s *Stack) Statistics(stat any, arg string) error {
 			break
 		}
 	case *inet.StatSNMPIP:
-		ip := Metrics.IP
+		ip := netStats.IP
 		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPIP{
 			0,                          // Ip/Forwarding.
@@ -632,8 +647,8 @@ func (s *Stack) Statistics(stat any, arg string) error {
 			0,                               // Support Ip/FragCreates.
 		}
 	case *inet.StatSNMPICMP:
-		in := Metrics.ICMP.V4.PacketsReceived.ICMPv4PacketStats
-		out := Metrics.ICMP.V4.PacketsSent.ICMPv4PacketStats
+		in := netStats.ICMP.V4.PacketsReceived.ICMPv4PacketStats
+		out := netStats.ICMP.V4.PacketsSent.ICMPv4PacketStats
 		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPICMP{
 			0, // Icmp/InMsgs.
@@ -665,7 +680,7 @@ func (s *Stack) Statistics(stat any, arg string) error {
 			out.InfoReply.Value(),                           // OutAddrMaskReps.
 		}
 	case *inet.StatSNMPTCP:
-		tcp := Metrics.TCP
+		tcp := netStats.TCP
 		// RFC 2012 (updates 1213):  SNMPv2-MIB-TCP.
 		*stats = inet.StatSNMPTCP{
 			1,                                     // RtoAlgorithm.
@@ -685,7 +700,7 @@ func (s *Stack) Statistics(stat any, arg string) error {
 			tcp.ChecksumErrors.Value(),            // InCsumErrors.
 		}
 	case *inet.StatSNMPUDP:
-		udp := Metrics.UDP
+		udp := netStats.UDP
 		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPUDP{
 			udp.PacketsReceived.Value(),     // InDatagrams.
@@ -701,6 +716,11 @@ func (s *Stack) Statistics(stat any, arg string) error {
 		return syserr.ErrEndpointOperation.ToError()
 	}
 	return nil
+}
+
+// Stats implements inet.Stack.Stats.
+func (s *Stack) Stats() tcpip.Stats {
+	return s.Stack.Stats()
 }
 
 // RouteTable implements inet.Stack.RouteTable.
@@ -742,87 +762,86 @@ func (s *Stack) RouteTable() []inet.Route {
 	return routeTable
 }
 
-// NewRoute implements inet.Stack.NewRoute.
-func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
-	var routeMsg linux.RouteMessage
-	attrs, ok := msg.GetData(&routeMsg)
+// localRoute constructs a local route from the netlink message.
+func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
+	var rtMsg linux.RouteMessage
+	attrs, ok := msg.GetData(&rtMsg)
 	if !ok {
-		return syserr.ErrInvalidArgument
+		return tcpip.Route{}, syserr.ErrInvalidArgument
 	}
 
 	route := inet.Route{
-		Family:   routeMsg.Family,
-		DstLen:   routeMsg.DstLen,
-		SrcLen:   routeMsg.SrcLen,
-		TOS:      routeMsg.TOS,
-		Table:    routeMsg.Table,
-		Protocol: routeMsg.Protocol,
-		Scope:    routeMsg.Scope,
-		Type:     routeMsg.Type,
-		Flags:    routeMsg.Flags,
+		Family:   rtMsg.Family,
+		DstLen:   rtMsg.DstLen,
+		SrcLen:   rtMsg.SrcLen,
+		TOS:      rtMsg.TOS,
+		Table:    rtMsg.Table,
+		Protocol: rtMsg.Protocol,
+		Scope:    rtMsg.Scope,
+		Type:     rtMsg.Type,
+		Flags:    rtMsg.Flags,
 	}
 
 	for !attrs.Empty() {
 		ahdr, value, rest, ok := attrs.ParseFirst()
 		if !ok {
-			return syserr.ErrInvalidArgument
+			return tcpip.Route{}, syserr.ErrInvalidArgument
 		}
 		attrs = rest
 
 		switch ahdr.Type {
 		case linux.RTA_DST:
 			if len(value) < 1 {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			route.DstAddr = value
 		case linux.RTA_SRC:
 			if len(value) < 1 {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			route.SrcAddr = value
 		case linux.RTA_OIF:
 			oif := nlmsg.BytesView(value)
 			outputInterface, ok := oif.Int32()
 			if !ok {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			if _, exist := s.Interfaces()[outputInterface]; !exist {
-				return syserr.ErrNoDevice
+				return tcpip.Route{}, syserr.ErrNoDevice
 			}
 			route.OutputInterface = outputInterface
 		case linux.RTA_GATEWAY:
 			if len(value) < 1 {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			route.GatewayAddr = value
 		case linux.RTA_PRIORITY:
 		default:
-			ctx.Warningf("Unknown attribute: %v", ahdr.Type)
-			return syserr.ErrNotSupported
+			log.Warningf("Unknown attribute: %v", ahdr.Type)
+			return tcpip.Route{}, syserr.ErrNotSupported
 		}
 	}
-
 	var dest tcpip.Subnet
 	// When no destination address is provided, the new route might be the default route.
 	if route.DstAddr == nil {
 		if route.GatewayAddr == nil {
-			return syserr.ErrInvalidArgument
+			return tcpip.Route{}, syserr.ErrInvalidArgument
 		}
 		switch len(route.GatewayAddr) {
 		case header.IPv4AddressSize:
 			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv4Zero), tcpip.MaskFromBytes(tcpip.IPv4Zero))
 			if err != nil {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			dest = subnet
 		case header.IPv6AddressSize:
 			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv6Zero), tcpip.MaskFromBytes(tcpip.IPv6Zero))
 			if err != nil {
-				return syserr.ErrInvalidArgument
+				return tcpip.Route{}, syserr.ErrInvalidArgument
 			}
 			dest = subnet
 		default:
-			return syserr.ErrInvalidArgument
+			return tcpip.Route{}, syserr.ErrInvalidArgument
 		}
 	} else {
 		dest = tcpip.AddressWithPrefix{
@@ -835,8 +854,41 @@ func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error 
 		Gateway:     tcpip.AddrFromSlice(route.GatewayAddr),
 		NIC:         tcpip.NICID(route.OutputInterface),
 	}
+
 	if len(route.SrcAddr) != 0 {
 		localRoute.SourceHint = tcpip.AddrFromSlice(route.SrcAddr)
+	}
+
+	return localRoute, nil
+}
+
+// RemoveRoute implements inte.Stack.RemoveRoute.
+func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	localRoute, err := s.localRoute(msg)
+	if err != nil {
+		return err
+	}
+	if removed := s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		// Both gateway and NIC are compared with existing routes
+		// only when they are present in the netlink message.
+		if localRoute.Gateway.Len() > 0 && !localRoute.Gateway.Equal(rt.Gateway) {
+			return false
+		}
+		if localRoute.NIC > 0 && localRoute.NIC != rt.NIC {
+			return false
+		}
+		return rt.Destination.Equal(localRoute.Destination)
+	}); removed == 0 {
+		return syserr.ErrNoProcess
+	}
+	return nil
+}
+
+// NewRoute implements inet.Stack.NewRoute.
+func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	localRoute, err := s.localRoute(msg)
+	if err != nil {
+		return err
 	}
 	found := false
 	for _, rt := range s.Stack.GetRouteTable() {
@@ -871,6 +923,14 @@ func (s *Stack) Pause() {
 // Restore implements inet.Stack.Restore.
 func (s *Stack) Restore() {
 	s.Stack.Restore()
+}
+
+// ReplaceConfig implements inet.Stack.ReplaceConfig.
+func (s *Stack) ReplaceConfig(st inet.Stack) {
+	if _, ok := st.(*Stack); !ok {
+		panic("netstack.Stack cannot be nil when netstack s/r is enabled")
+	}
+	s.Stack.ReplaceConfig(st.(*Stack).Stack)
 }
 
 // Resume implements inet.Stack.Resume.

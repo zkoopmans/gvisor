@@ -151,30 +151,31 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 			parent:   cfg.Parent,
 			children: make(map[*Task]struct{}),
 		},
-		runState:       (*runApp)(nil),
-		interruptChan:  make(chan struct{}, 1),
-		signalMask:     atomicbitops.FromUint64(uint64(cfg.SignalMask)),
-		signalStack:    linux.SignalStack{Flags: linux.SS_DISABLE},
-		image:          *image,
-		fsContext:      cfg.FSContext,
-		fdTable:        cfg.FDTable,
-		k:              cfg.Kernel,
-		ptraceTracees:  make(map[*Task]struct{}),
-		allowedCPUMask: cfg.AllowedCPUMask.Copy(),
-		ioUsage:        &usage.IO{},
-		niceness:       cfg.Niceness,
-		utsns:          cfg.UTSNamespace,
-		ipcns:          cfg.IPCNamespace,
-		mountNamespace: cfg.MountNamespace,
-		rseqCPU:        -1,
-		rseqAddr:       cfg.RSeqAddr,
-		rseqSignature:  cfg.RSeqSignature,
-		futexWaiter:    futex.NewWaiter(),
-		containerID:    cfg.ContainerID,
-		cgroups:        make(map[Cgroup]struct{}),
-		userCounters:   cfg.UserCounters,
-		sessionKeyring: cfg.SessionKeyring,
-		Origin:         cfg.Origin,
+		runState:        (*runApp)(nil),
+		interruptChan:   make(chan struct{}, 1),
+		signalMask:      atomicbitops.FromUint64(uint64(cfg.SignalMask)),
+		signalStack:     linux.SignalStack{Flags: linux.SS_DISABLE},
+		image:           *image,
+		fsContext:       cfg.FSContext,
+		fdTable:         cfg.FDTable,
+		k:               cfg.Kernel,
+		ptraceTracees:   make(map[*Task]struct{}),
+		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
+		ioUsage:         &usage.IO{},
+		niceness:        cfg.Niceness,
+		utsns:           cfg.UTSNamespace,
+		ipcns:           cfg.IPCNamespace,
+		mountNamespace:  cfg.MountNamespace,
+		rseqCPU:         -1,
+		rseqAddr:        cfg.RSeqAddr,
+		rseqSignature:   cfg.RSeqSignature,
+		futexWaiter:     futex.NewWaiter(),
+		containerID:     cfg.ContainerID,
+		cgroups:         make(map[Cgroup]struct{}),
+		userCounters:    cfg.UserCounters,
+		sessionKeyring:  cfg.SessionKeyring,
+		Origin:          cfg.Origin,
+		onDestroyAction: make(map[TaskDestroyAction]struct{}),
 	}
 	t.netns = cfg.NetworkNamespace
 	t.creds.Store(cfg.Credentials)
@@ -213,6 +214,17 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		}
 	}
 
+	// If the task was the first to be added to the thread group, check if
+	// it needs to be notified of CPU limits being exceeded.
+	// We use a defer here because we need to do this without holding the
+	// TaskSet or signalHandlers lock.
+	var isFirstTask bool
+	defer func() {
+		if isFirstTask {
+			tg.notifyRlimitCPUUpdated(t)
+		}
+	}()
+
 	// Make the new task (and possibly thread group) visible to the rest of
 	// the system atomically.
 	ts.mu.Lock()
@@ -226,11 +238,19 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		// we're in uncharted territory and can return whatever we want.
 		return nil, linuxerr.EINTR
 	}
+	if ts.liveTasks == 0 && ts.noNewTasksIfZeroLive {
+		// Since liveTasks == 0, our caller cannot be a task goroutine invoking
+		// a syscall, so it's safe to return a non-errno error that is more
+		// explanatory.
+		return nil, fmt.Errorf("task creation disabled after Kernel.WaitExited() may have returned")
+	}
 	if err := ts.assignTIDsLocked(t); err != nil {
 		return nil, err
 	}
 	// Below this point, newTask is expected not to fail (there is no rollback
 	// of assignTIDsLocked or any of the following).
+
+	ts.liveTasks++
 
 	// Logging on t's behalf will panic if t.logPrefix hasn't been
 	// initialized. This is the earliest point at which we can do so
@@ -251,7 +271,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	t.EnterInitialCgroups(srcT, cfg.InitialCgroups)
 	committed = true
 
-	if tg.leader == nil {
+	if isFirstTask = tg.leader == nil; isFirstTask {
 		// New thread group.
 		tg.leader = t
 		if parentPG := tg.parentPG(); parentPG == nil {
@@ -383,7 +403,6 @@ func (t *Task) Start(tid ThreadID) {
 	}
 	t.goroutineStopped.Add(1)
 	t.tg.liveGoroutines.Add(1)
-	t.tg.pidns.owner.liveGoroutines.Add(1)
 	t.tg.pidns.owner.runningGoroutines.Add(1)
 
 	// Task is now running in system mode.

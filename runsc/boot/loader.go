@@ -16,9 +16,9 @@
 package boot
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	mrand "math/rand"
 	"os"
 	"runtime"
 	"strconv"
@@ -41,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
@@ -51,9 +52,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -73,13 +77,13 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/runsc/boot/filter"
-	_ "gvisor.dev/gvisor/runsc/boot/platforms" // register all platforms.
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/specutils/seccomp"
+	"gvisor.dev/gvisor/runsc/version"
 
 	// Top-level inet providers.
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
@@ -211,35 +215,46 @@ type Loader struct {
 	// mu guards the fields below.
 	mu sync.Mutex
 
-	// state is guarded by mu.
+	// +checklocks:mu
 	state loaderState
 
 	// sharedMounts holds VFS mounts that may be shared between containers within
 	// the same pod. It is mapped by mount source.
 	//
-	// sharedMounts is guarded by mu.
+	// +checklocks:mu
 	sharedMounts map[string]*vfs.Mount
 
 	// processes maps containers init process and invocation of exec. Root
 	// processes are keyed with container ID and pid=0, while exec invocations
 	// have the corresponding pid set.
 	//
-	// processes is guarded by mu.
+	// +checklocks:mu
 	processes map[execID]*execProcess
 
 	// containerIDs store container names and IDs to assist with restore and container
 	// naming when user didn't provide one.
 	//
 	// Mapping: name -> cid.
-	// processes is guarded by mu.
+	// +checklocks:mu
 	containerIDs map[string]string
+
+	// containerSpecs stores container specs for each container in sandbox.
+	//
+	// Mapping: name -> spec.
+	// +checklocks:mu
+	containerSpecs map[string]*specs.Spec
 
 	// portForwardProxies is a list of active port forwarding connections.
 	//
-	// portForwardProxies is guarded by mu.
+	// +checklocks:mu
 	portForwardProxies []*pf.Proxy
 
+	// +checklocks:mu
 	saveFDs []*fd.FD
+
+	// saveRestoreNet indicates if the saved network stack should be used
+	// during restore.
+	saveRestoreNet bool
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
@@ -278,11 +293,6 @@ type fdMapping struct {
 type FDMapping struct {
 	Guest int
 	Host  int
-}
-
-func init() {
-	// Initialize the random number generator.
-	mrand.Seed(gtime.Now().UnixNano())
 }
 
 // Args are the arguments for New().
@@ -352,8 +362,20 @@ type Args struct {
 	SaveFDs []*fd.FD
 }
 
-// make sure stdioFDs are always the same on initial start and on restore
-const startingStdioFD = 256
+const (
+	// startingStdioFD is the starting stdioFD number used during sandbox
+	// start and restore. This makes sure the stdioFDs are always the same
+	// on initial start and on restore.
+	startingStdioFD = 256
+
+	// containerSpecsKey is the key used to add and pop the container specs to the
+	// kernel during save/restore.
+	containerSpecsKey = "container_specs"
+
+	// versionKey is the key used to add and pop runsc version to the kernel
+	// during save/restore.
+	versionKey = "runsc_version"
+)
 
 func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.UserNamespace) *auth.Credentials {
 	// Create capabilities.
@@ -412,17 +434,18 @@ func New(args Args) (*Loader, error) {
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		sandboxID:     args.ID,
-		processes:     map[execID]*execProcess{eid: {}},
-		sharedMounts:  make(map[string]*vfs.Mount),
-		stopProfiling: stopProfiling,
-		productName:   args.ProductName,
-		hostShmemHuge: args.HostShmemHuge,
-		containerIDs:  map[string]string{},
-		saveFDs:       args.SaveFDs,
+		sandboxID:      args.ID,
+		processes:      map[execID]*execProcess{eid: {}},
+		sharedMounts:   make(map[string]*vfs.Mount),
+		stopProfiling:  stopProfiling,
+		productName:    args.ProductName,
+		hostShmemHuge:  args.HostShmemHuge,
+		containerIDs:   make(map[string]string),
+		containerSpecs: make(map[string]*specs.Spec),
+		saveFDs:        args.SaveFDs,
 	}
 
-	containerName := l.registerContainerLocked(args.Spec, args.ID)
+	containerName := l.registerContainer(args.Spec, args.ID)
 	l.root = containerInfo{
 		cid:                 args.ID,
 		containerName:       containerName,
@@ -518,6 +541,14 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}
 
+	// S/R is not supported for hostinet.
+	if l.root.conf.Network != config.NetworkHost && args.Conf.TestOnlySaveRestoreNetstack {
+		l.saveRestoreNet = true
+		if err := netns.Stack().EnableSaveRestore(); err != nil {
+			return nil, fmt.Errorf("enable s/r: %w", err)
+		}
+	}
+
 	if args.NumCPU == 0 {
 		args.NumCPU = runtime.NumCPU()
 	}
@@ -553,6 +584,9 @@ func New(args Args) (*Loader, error) {
 	}
 	// Initiate the Kernel object, which is required by the Context passed
 	// to createVFS in order to mount (among other things) procfs.
+	unixSocketOpts := transport.UnixSocketOpts{
+		DisconnectOnSave: args.Conf.NetDisconnectOk,
+	}
 	if err = l.k.Init(kernel.InitKernelArgs{
 		FeatureSet:           cpuid.HostFeatureSet().Fixed(),
 		Timekeeper:           tk,
@@ -565,6 +599,7 @@ func New(args Args) (*Loader, error) {
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		PIDNamespace:         kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           maxFDLimit,
+		UnixSocketOpts:       unixSocketOpts,
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -628,9 +663,7 @@ func New(args Args) (*Loader, error) {
 		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs)
 	}
 
-	if err := l.kernelInitExtra(); err != nil {
-		return nil, err
-	}
+	l.kernelInitExtra()
 
 	// Create the control server using the provided FD.
 	//
@@ -668,13 +701,18 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 		wd = "/"
 	}
 
+	umask := uint(0022)
+	if spec.Process.User.Umask != nil {
+		umask = uint(*spec.Process.User.Umask) & 0777
+	}
+
 	// Create the process arguments.
 	procArgs := kernel.CreateProcessArgs{
 		Argv:                 spec.Process.Args,
 		Envv:                 env,
 		WorkingDirectory:     wd,
 		Credentials:          creds,
-		Umask:                0022,
+		Umask:                umask,
 		Limits:               ls,
 		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
 		UTSNamespace:         k.RootUTSNamespace(),
@@ -698,9 +736,11 @@ func (l *Loader) Destroy() {
 	l.watchdog.Stop()
 
 	ctx := l.k.SupervisorContext()
+	l.mu.Lock()
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
 	}
+	l.mu.Unlock()
 
 	// Stop the control server. This will indirectly stop any
 	// long-running control operations that are in flight, e.g.
@@ -802,15 +842,32 @@ func (l *Loader) installSeccompFilters() error {
 		log.Warningf("*** SECCOMP WARNING: syscall filter is DISABLED. Running in less secure mode.")
 	} else {
 		hostnet := l.root.conf.Network == config.NetworkHost
+		var nvproxyCaps nvconf.DriverCaps
+		nvproxyEnabled := specutils.NVProxyEnabled(l.root.spec, l.root.conf)
+		if nvproxyEnabled {
+			var err error
+			// We use the set of allowed capabilities here, not the subset of them
+			// that the root container requests. This is because we need to support
+			// subsequent containers being able to execute with a wider set than the
+			// set that the root container requests. Seccomp filters are only
+			// applied once at sandbox startup, so they need to be as wide as the
+			// set of capabilities that may ever be requested.
+			if nvproxyCaps, err = specutils.NVProxyDriverCapsAllowed(l.root.conf); err != nil {
+				return fmt.Errorf("NVIDIA capabilities: %w", err)
+			}
+		}
 		opts := filter.Options{
 			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
 			HostFilesystem:        l.root.conf.DirectFS,
 			ProfileEnable:         l.root.conf.ProfileEnable,
-			NVProxy:               specutils.NVProxyEnabled(l.root.spec, l.root.conf),
+			NVProxy:               nvproxyEnabled,
+			NVProxyCaps:           nvproxyCaps,
 			TPUProxy:              specutils.TPUProxyIsEnabled(l.root.spec, l.root.conf),
 			ControllerFD:          uint32(l.ctrl.srv.FD()),
+			CgoEnabled:            config.CgoEnabled,
+			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
 		}
 		if err := filter.Install(opts); err != nil {
 			return fmt.Errorf("installing seccomp filters: %w", err)
@@ -989,6 +1046,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	}
 
 	containerName := l.registerContainerLocked(spec, cid)
+	l.k.RegisterContainerName(cid, containerName)
 	info := &containerInfo{
 		cid:                 cid,
 		containerName:       containerName,
@@ -1057,7 +1115,6 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		})
 	}
 
-	l.k.RegisterContainerName(cid, info.containerName)
 	l.k.StartProcess(ep.tg)
 	// No more failures from this point on.
 	cu.Release()
@@ -1075,6 +1132,10 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	// CreateProcess takes a reference on fdTable if successful. We won't need
 	// ours either way.
 	info.procArgs.FDTable = fdTable
+
+	if ttyFile != nil {
+		info.procArgs.TTY = ttyFile.TTY()
+	}
 
 	if info.execFD != nil {
 		if info.procArgs.Filename != "" {
@@ -1134,12 +1195,6 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	// CreateProcess takes a reference on FDTable if successful.
 	info.procArgs.FDTable.DecRef(ctx)
-
-	// Set the foreground process group on the TTY to the global init process
-	// group, since that is what we are about to start running.
-	if ttyFile != nil {
-		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
-	}
 
 	// Install seccomp filters with the new task if there are any.
 	if info.conf.OCISeccomp {
@@ -1446,6 +1501,8 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 		}
 		return inet.NewRootNamespace(s, creator, userns), nil
+	case config.NetworkPlugin:
+		return inet.NewRootNamespace(plugin.GetPluginStack(), nil, userns), nil
 
 	default:
 		panic(fmt.Sprintf("invalid network configuration: %v", conf.Network))
@@ -1624,8 +1681,15 @@ func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, s
 	if tty == nil {
 		return fmt.Errorf("no TTY attached")
 	}
-	pg := tty.ForegroundProcessGroup()
 	si := &linux.SignalInfo{Signo: signo}
+	ttyTg := tty.ThreadGroup()
+	if ttyTg == nil {
+		// No thread group has been set. Signal the original thread
+		// group.
+		log.Warningf("No thread group for container %q and PID %d. Sending signal directly to PID %d.", cid, tgid, tgid)
+		return l.k.SendExternalSignalThreadGroup(tg, si)
+	}
+	pg, _ := ttyTg.ForegroundProcessGroup(tty.TTY())
 	if pg == nil {
 		// No foreground process group has been set. Signal the
 		// original thread group.
@@ -1666,7 +1730,8 @@ func (l *Loader) threadGroupFromID(key execID) (*kernel.ThreadGroup, error) {
 // tryThreadGroupFromIDLocked returns the thread group for the given execution
 // ID. It may return nil in case the container has not started yet. Returns
 // error if execution ID is invalid or if the container cannot be found (maybe
-// it has been deleted). Caller must hold 'mu'.
+// it has been deleted).
+// +checklocks:l.mu
 func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, error) {
 	ep, err := l.findProcessLocked(key)
 	if err != nil {
@@ -1678,7 +1743,8 @@ func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, er
 // ttyFromIDLocked returns the TTY files for the given execution ID. It may
 // return nil in case the container has not started yet. Returns error if
 // execution ID is invalid or if the container cannot be found (maybe it has
-// been deleted). Caller must hold 'mu'.
+// been deleted).
+// +checklocks:l.mu
 func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileDescription, error) {
 	ep, err := l.findProcessLocked(key)
 	if err != nil {
@@ -1861,6 +1927,7 @@ func (l *Loader) networkStats() ([]*NetworkInterface, error) {
 	return stats, nil
 }
 
+// +checklocks:l.mu
 func (l *Loader) findProcessLocked(key execID) (*execProcess, error) {
 	ep := l.processes[key]
 	if ep == nil {
@@ -1876,6 +1943,7 @@ func (l *Loader) registerContainer(spec *specs.Spec, cid string) string {
 	return l.registerContainerLocked(spec, cid)
 }
 
+// +checklocks:l.mu
 func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
 	containerName := specutils.ContainerName(spec)
 	if len(containerName) == 0 {
@@ -1885,7 +1953,14 @@ func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
 	}
 
 	l.containerIDs[containerName] = cid
+	l.containerSpecs[containerName] = spec
 	return containerName
+}
+
+func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.containerSpecs[containerName]
 }
 
 func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
@@ -1907,4 +1982,46 @@ func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 	}
 	// Init process has stopped, but no one has called wait on it yet.
 	return RuntimeStateStopped
+}
+
+// addContainerSpecsToCheckpoint adds the container specs to the kernel.
+func (l *Loader) addContainerSpecsToCheckpoint() {
+	l.mu.Lock()
+	s := l.containerSpecs
+	l.mu.Unlock()
+
+	specsMap := make(map[string][]byte)
+	for k, v := range s {
+		data, err := json.Marshal(v)
+		if err != nil {
+			log.Warningf("json marshal error for specs %v", err)
+			return
+		}
+		specsMap[k] = data
+	}
+	l.k.AddStateToCheckpoint(containerSpecsKey, specsMap)
+}
+
+// popContainerSpecsFromCheckpoint pops all the container specs from the kernel.
+func popContainerSpecsFromCheckpoint(k *kernel.Kernel) (map[string]*specs.Spec, error) {
+	specsMap := (k.PopCheckpointState(containerSpecsKey)).(map[string][]byte)
+	oldSpecs := make(map[string]*specs.Spec)
+	for k, v := range specsMap {
+		var s specs.Spec
+		if err := json.Unmarshal(v, &s); err != nil {
+			return nil, fmt.Errorf("json unmarshal error for specs %v", err)
+		}
+		oldSpecs[k] = &s
+	}
+	return oldSpecs, nil
+}
+
+// addVersionToCheckpoint adds the runsc version to the kernel.
+func (l *Loader) addVersionToCheckpoint() {
+	l.k.AddStateToCheckpoint(versionKey, version.Version())
+}
+
+// popVersionFromCheckpoint pops the runsc version from the kernel.
+func popVersionFromCheckpoint(k *kernel.Kernel) string {
+	return (k.PopCheckpointState(versionKey)).(string)
 }

@@ -25,11 +25,12 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Register registers all devices implemented by this package in vfsObj.
-func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, uvmDevMajor uint32) error {
+func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, driverCaps nvconf.DriverCaps, uvmDevMajor uint32) error {
 	// The kernel driver's interface is unstable, so only allow versions of the
 	// driver that are known to be supported.
 	log.Infof("NVIDIA driver version: %s", versionStr)
@@ -41,9 +42,13 @@ func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, uvmDevMajor uint
 	if !ok {
 		return fmt.Errorf("unsupported Nvidia driver version: %s", versionStr)
 	}
+	if driverCaps == 0 {
+		log.Warningf("nvproxy: NVIDIA driver capability set is empty; all GPU operations will fail")
+	}
 	nvp := &nvproxy{
 		abi:         abiCons.cons(),
 		version:     version,
+		capsEnabled: driverCaps,
 		frontendFDs: make(map[*frontendFD]struct{}),
 		clients:     make(map[nvgpu.Handle]*rootClient),
 		objsFreeSet: make(map[*object]struct{}),
@@ -70,8 +75,9 @@ func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, uvmDevMajor uint
 
 // +stateify savable
 type nvproxy struct {
-	abi     *driverABI `state:"nosave"`
-	version DriverVersion
+	abi         *driverABI `state:"nosave"`
+	version     DriverVersion
+	capsEnabled nvconf.DriverCaps
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
@@ -99,6 +105,17 @@ func addrFromP64(p nvgpu.P64) hostarch.Addr {
 type hasFrontendFDPtr[T any] interface {
 	marshalPtr[T]
 	nvgpu.HasFrontendFD
+}
+
+type hasStatusPtr[T any] interface {
+	marshalPtr[T]
+	nvgpu.HasStatus
+}
+
+type hasFrontendFDAndStatusPtr[T any] interface {
+	marshalPtr[T]
+	nvgpu.HasFrontendFD
+	nvgpu.HasStatus
 }
 
 type hasCtrlInfoListPtr[T any] interface {

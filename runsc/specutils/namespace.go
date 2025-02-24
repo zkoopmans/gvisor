@@ -183,11 +183,7 @@ func startInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) ([]func() error, error
 		deferFuncs = append(deferFuncs, restoreNS)
 	}
 
-	err := cmd.Start()
-	if err != nil && cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWUSER != 0 {
-		err = fmt.Errorf("%v: check whether /proc/sys/user/max_user_namespaces is set too low (gvisor.dev/issue/5964)", err)
-	}
-	return deferFuncs, err
+	return deferFuncs, cmd.Start()
 }
 
 // SetUIDGIDMappings sets the given uid/gid mappings from the spec on the cmd.
@@ -218,7 +214,7 @@ func SetUIDGIDMappings(cmd *exec.Cmd, s *specs.Spec) {
 
 // HasCapabilities returns true if the user has all capabilities in 'cs'.
 func HasCapabilities(cs ...capability.Cap) bool {
-	caps, err := capability.NewPid2(os.Getpid())
+	caps, err := capability.NewPid2(0)
 	if err != nil {
 		return false
 	}

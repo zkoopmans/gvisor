@@ -400,8 +400,8 @@ func (k *Kernel) StateFields() []string {
 		"globalInit",
 		"syslog",
 		"runningTasks",
-		"cpuClock",
 		"cpuClockTickerRunning",
+		"cpuClock",
 		"uniqueID",
 		"nextInotifyCookie",
 		"netlinkPorts",
@@ -425,7 +425,9 @@ func (k *Kernel) StateFields() []string {
 		"MaxFDLimit",
 		"containerNames",
 		"additionalCheckpointState",
-		"checkpointCounter",
+		"CheckpointWait",
+		"checkpointGen",
+		"UnixSocketOpts",
 	}
 }
 
@@ -453,8 +455,8 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(13, &k.globalInit)
 	stateSinkObject.Save(14, &k.syslog)
 	stateSinkObject.Save(15, &k.runningTasks)
-	stateSinkObject.Save(16, &k.cpuClock)
-	stateSinkObject.Save(17, &k.cpuClockTickerRunning)
+	stateSinkObject.Save(16, &k.cpuClockTickerRunning)
+	stateSinkObject.Save(17, &k.cpuClock)
 	stateSinkObject.Save(18, &k.uniqueID)
 	stateSinkObject.Save(19, &k.nextInotifyCookie)
 	stateSinkObject.Save(20, &k.netlinkPorts)
@@ -477,7 +479,9 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(38, &k.MaxFDLimit)
 	stateSinkObject.Save(39, &k.containerNames)
 	stateSinkObject.Save(40, &k.additionalCheckpointState)
-	stateSinkObject.Save(41, &k.checkpointCounter)
+	stateSinkObject.Save(41, &k.CheckpointWait)
+	stateSinkObject.Save(42, &k.checkpointGen)
+	stateSinkObject.Save(43, &k.UnixSocketOpts)
 }
 
 func (k *Kernel) afterLoad(context.Context) {}
@@ -500,8 +504,8 @@ func (k *Kernel) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(13, &k.globalInit)
 	stateSourceObject.Load(14, &k.syslog)
 	stateSourceObject.Load(15, &k.runningTasks)
-	stateSourceObject.Load(16, &k.cpuClock)
-	stateSourceObject.Load(17, &k.cpuClockTickerRunning)
+	stateSourceObject.Load(16, &k.cpuClockTickerRunning)
+	stateSourceObject.Load(17, &k.cpuClock)
 	stateSourceObject.Load(18, &k.uniqueID)
 	stateSourceObject.Load(19, &k.nextInotifyCookie)
 	stateSourceObject.Load(20, &k.netlinkPorts)
@@ -524,7 +528,9 @@ func (k *Kernel) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(38, &k.MaxFDLimit)
 	stateSourceObject.Load(39, &k.containerNames)
 	stateSourceObject.Load(40, &k.additionalCheckpointState)
-	stateSourceObject.Load(41, &k.checkpointCounter)
+	stateSourceObject.Load(41, &k.CheckpointWait)
+	stateSourceObject.Load(42, &k.checkpointGen)
+	stateSourceObject.Load(43, &k.UnixSocketOpts)
 	stateSourceObject.LoadValue(21, new([]tcpip.Endpoint), func(y any) { k.loadDanglingEndpoints(ctx, y.([]tcpip.Endpoint)) })
 }
 
@@ -582,6 +588,59 @@ func (s *SocketRecord) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(0, &s.k)
 	stateSourceObject.Load(1, &s.Sock)
 	stateSourceObject.Load(2, &s.ID)
+}
+
+func (c *CheckpointGeneration) StateTypeName() string {
+	return "pkg/sentry/kernel.CheckpointGeneration"
+}
+
+func (c *CheckpointGeneration) StateFields() []string {
+	return []string{
+		"Count",
+		"Restore",
+	}
+}
+
+func (c *CheckpointGeneration) beforeSave() {}
+
+// +checklocksignore
+func (c *CheckpointGeneration) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.Count)
+	stateSinkObject.Save(1, &c.Restore)
+}
+
+func (c *CheckpointGeneration) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *CheckpointGeneration) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.Count)
+	stateSourceObject.Load(1, &c.Restore)
+}
+
+func (w *CheckpointWaitable) StateTypeName() string {
+	return "pkg/sentry/kernel.CheckpointWaitable"
+}
+
+func (w *CheckpointWaitable) StateFields() []string {
+	return []string{
+		"k",
+	}
+}
+
+func (w *CheckpointWaitable) beforeSave() {}
+
+// +checklocksignore
+func (w *CheckpointWaitable) StateSave(stateSinkObject state.Sink) {
+	w.beforeSave()
+	stateSinkObject.Save(0, &w.k)
+}
+
+func (w *CheckpointWaitable) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (w *CheckpointWaitable) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &w.k)
 }
 
 func (p *pendingSignals) StateTypeName() string {
@@ -1271,7 +1330,10 @@ func (t *Task) StateFields() []string {
 		"taskWorkCount",
 		"taskWork",
 		"haveSyscallReturn",
-		"gosched",
+		"gostate",
+		"gostateTime",
+		"appCPUClock",
+		"appSysCPUClock",
 		"yieldCount",
 		"pendingSignals",
 		"signalMask",
@@ -1334,6 +1396,7 @@ func (t *Task) StateFields() []string {
 		"userCounters",
 		"sessionKeyring",
 		"Origin",
+		"onDestroyAction",
 	}
 }
 
@@ -1342,78 +1405,84 @@ func (t *Task) beforeSave() {}
 // +checklocksignore
 func (t *Task) StateSave(stateSinkObject state.Sink) {
 	t.beforeSave()
+	var vforkParentValue *Task
+	vforkParentValue = t.saveVforkParent()
+	stateSinkObject.SaveValue(29, vforkParentValue)
 	var ptraceTracerValue *Task
 	ptraceTracerValue = t.savePtraceTracer()
-	stateSinkObject.SaveValue(32, ptraceTracerValue)
+	stateSinkObject.SaveValue(35, ptraceTracerValue)
 	var seccompValue *taskSeccomp
 	seccompValue = t.saveSeccomp()
-	stateSinkObject.SaveValue(48, seccompValue)
+	stateSinkObject.SaveValue(51, seccompValue)
 	stateSinkObject.Save(0, &t.taskNode)
 	stateSinkObject.Save(1, &t.runState)
 	stateSinkObject.Save(2, &t.taskWorkCount)
 	stateSinkObject.Save(3, &t.taskWork)
 	stateSinkObject.Save(4, &t.haveSyscallReturn)
-	stateSinkObject.Save(5, &t.gosched)
-	stateSinkObject.Save(6, &t.yieldCount)
-	stateSinkObject.Save(7, &t.pendingSignals)
-	stateSinkObject.Save(8, &t.signalMask)
-	stateSinkObject.Save(9, &t.realSignalMask)
-	stateSinkObject.Save(10, &t.haveSavedSignalMask)
-	stateSinkObject.Save(11, &t.savedSignalMask)
-	stateSinkObject.Save(12, &t.signalStack)
-	stateSinkObject.Save(13, &t.signalQueue)
-	stateSinkObject.Save(14, &t.groupStopPending)
-	stateSinkObject.Save(15, &t.groupStopAcknowledged)
-	stateSinkObject.Save(16, &t.trapStopPending)
-	stateSinkObject.Save(17, &t.trapNotifyPending)
-	stateSinkObject.Save(18, &t.stop)
-	stateSinkObject.Save(19, &t.exitStatus)
-	stateSinkObject.Save(20, &t.syscallRestartBlock)
-	stateSinkObject.Save(21, &t.k)
-	stateSinkObject.Save(22, &t.containerID)
-	stateSinkObject.Save(23, &t.image)
-	stateSinkObject.Save(24, &t.fsContext)
-	stateSinkObject.Save(25, &t.fdTable)
-	stateSinkObject.Save(26, &t.vforkParent)
-	stateSinkObject.Save(27, &t.exitState)
-	stateSinkObject.Save(28, &t.exitTracerNotified)
-	stateSinkObject.Save(29, &t.exitTracerAcked)
-	stateSinkObject.Save(30, &t.exitParentNotified)
-	stateSinkObject.Save(31, &t.exitParentAcked)
-	stateSinkObject.Save(33, &t.ptraceTracees)
-	stateSinkObject.Save(34, &t.ptraceSeized)
-	stateSinkObject.Save(35, &t.ptraceOpts)
-	stateSinkObject.Save(36, &t.ptraceSyscallMode)
-	stateSinkObject.Save(37, &t.ptraceSinglestep)
-	stateSinkObject.Save(38, &t.ptraceCode)
-	stateSinkObject.Save(39, &t.ptraceSiginfo)
-	stateSinkObject.Save(40, &t.ptraceEventMsg)
-	stateSinkObject.Save(41, &t.ptraceYAMAExceptionAdded)
-	stateSinkObject.Save(42, &t.ioUsage)
-	stateSinkObject.Save(43, &t.creds)
-	stateSinkObject.Save(44, &t.utsns)
-	stateSinkObject.Save(45, &t.ipcns)
-	stateSinkObject.Save(46, &t.mountNamespace)
-	stateSinkObject.Save(47, &t.parentDeathSignal)
-	stateSinkObject.Save(49, &t.cleartid)
-	stateSinkObject.Save(50, &t.allowedCPUMask)
-	stateSinkObject.Save(51, &t.cpu)
-	stateSinkObject.Save(52, &t.niceness)
-	stateSinkObject.Save(53, &t.numaPolicy)
-	stateSinkObject.Save(54, &t.numaNodeMask)
-	stateSinkObject.Save(55, &t.netns)
-	stateSinkObject.Save(56, &t.rseqCPU)
-	stateSinkObject.Save(57, &t.oldRSeqCPUAddr)
-	stateSinkObject.Save(58, &t.rseqAddr)
-	stateSinkObject.Save(59, &t.rseqSignature)
-	stateSinkObject.Save(60, &t.robustList)
-	stateSinkObject.Save(61, &t.startTime)
-	stateSinkObject.Save(62, &t.kcov)
-	stateSinkObject.Save(63, &t.cgroups)
-	stateSinkObject.Save(64, &t.memCgID)
-	stateSinkObject.Save(65, &t.userCounters)
-	stateSinkObject.Save(66, &t.sessionKeyring)
-	stateSinkObject.Save(67, &t.Origin)
+	stateSinkObject.Save(5, &t.gostate)
+	stateSinkObject.Save(6, &t.gostateTime)
+	stateSinkObject.Save(7, &t.appCPUClock)
+	stateSinkObject.Save(8, &t.appSysCPUClock)
+	stateSinkObject.Save(9, &t.yieldCount)
+	stateSinkObject.Save(10, &t.pendingSignals)
+	stateSinkObject.Save(11, &t.signalMask)
+	stateSinkObject.Save(12, &t.realSignalMask)
+	stateSinkObject.Save(13, &t.haveSavedSignalMask)
+	stateSinkObject.Save(14, &t.savedSignalMask)
+	stateSinkObject.Save(15, &t.signalStack)
+	stateSinkObject.Save(16, &t.signalQueue)
+	stateSinkObject.Save(17, &t.groupStopPending)
+	stateSinkObject.Save(18, &t.groupStopAcknowledged)
+	stateSinkObject.Save(19, &t.trapStopPending)
+	stateSinkObject.Save(20, &t.trapNotifyPending)
+	stateSinkObject.Save(21, &t.stop)
+	stateSinkObject.Save(22, &t.exitStatus)
+	stateSinkObject.Save(23, &t.syscallRestartBlock)
+	stateSinkObject.Save(24, &t.k)
+	stateSinkObject.Save(25, &t.containerID)
+	stateSinkObject.Save(26, &t.image)
+	stateSinkObject.Save(27, &t.fsContext)
+	stateSinkObject.Save(28, &t.fdTable)
+	stateSinkObject.Save(30, &t.exitState)
+	stateSinkObject.Save(31, &t.exitTracerNotified)
+	stateSinkObject.Save(32, &t.exitTracerAcked)
+	stateSinkObject.Save(33, &t.exitParentNotified)
+	stateSinkObject.Save(34, &t.exitParentAcked)
+	stateSinkObject.Save(36, &t.ptraceTracees)
+	stateSinkObject.Save(37, &t.ptraceSeized)
+	stateSinkObject.Save(38, &t.ptraceOpts)
+	stateSinkObject.Save(39, &t.ptraceSyscallMode)
+	stateSinkObject.Save(40, &t.ptraceSinglestep)
+	stateSinkObject.Save(41, &t.ptraceCode)
+	stateSinkObject.Save(42, &t.ptraceSiginfo)
+	stateSinkObject.Save(43, &t.ptraceEventMsg)
+	stateSinkObject.Save(44, &t.ptraceYAMAExceptionAdded)
+	stateSinkObject.Save(45, &t.ioUsage)
+	stateSinkObject.Save(46, &t.creds)
+	stateSinkObject.Save(47, &t.utsns)
+	stateSinkObject.Save(48, &t.ipcns)
+	stateSinkObject.Save(49, &t.mountNamespace)
+	stateSinkObject.Save(50, &t.parentDeathSignal)
+	stateSinkObject.Save(52, &t.cleartid)
+	stateSinkObject.Save(53, &t.allowedCPUMask)
+	stateSinkObject.Save(54, &t.cpu)
+	stateSinkObject.Save(55, &t.niceness)
+	stateSinkObject.Save(56, &t.numaPolicy)
+	stateSinkObject.Save(57, &t.numaNodeMask)
+	stateSinkObject.Save(58, &t.netns)
+	stateSinkObject.Save(59, &t.rseqCPU)
+	stateSinkObject.Save(60, &t.oldRSeqCPUAddr)
+	stateSinkObject.Save(61, &t.rseqAddr)
+	stateSinkObject.Save(62, &t.rseqSignature)
+	stateSinkObject.Save(63, &t.robustList)
+	stateSinkObject.Save(64, &t.startTime)
+	stateSinkObject.Save(65, &t.kcov)
+	stateSinkObject.Save(66, &t.cgroups)
+	stateSinkObject.Save(67, &t.memCgID)
+	stateSinkObject.Save(68, &t.userCounters)
+	stateSinkObject.Save(69, &t.sessionKeyring)
+	stateSinkObject.Save(70, &t.Origin)
+	stateSinkObject.Save(71, &t.onDestroyAction)
 }
 
 // +checklocksignore
@@ -1423,70 +1492,199 @@ func (t *Task) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &t.taskWorkCount)
 	stateSourceObject.Load(3, &t.taskWork)
 	stateSourceObject.Load(4, &t.haveSyscallReturn)
-	stateSourceObject.Load(5, &t.gosched)
-	stateSourceObject.Load(6, &t.yieldCount)
-	stateSourceObject.Load(7, &t.pendingSignals)
-	stateSourceObject.Load(8, &t.signalMask)
-	stateSourceObject.Load(9, &t.realSignalMask)
-	stateSourceObject.Load(10, &t.haveSavedSignalMask)
-	stateSourceObject.Load(11, &t.savedSignalMask)
-	stateSourceObject.Load(12, &t.signalStack)
-	stateSourceObject.Load(13, &t.signalQueue)
-	stateSourceObject.Load(14, &t.groupStopPending)
-	stateSourceObject.Load(15, &t.groupStopAcknowledged)
-	stateSourceObject.Load(16, &t.trapStopPending)
-	stateSourceObject.Load(17, &t.trapNotifyPending)
-	stateSourceObject.Load(18, &t.stop)
-	stateSourceObject.Load(19, &t.exitStatus)
-	stateSourceObject.Load(20, &t.syscallRestartBlock)
-	stateSourceObject.Load(21, &t.k)
-	stateSourceObject.Load(22, &t.containerID)
-	stateSourceObject.Load(23, &t.image)
-	stateSourceObject.Load(24, &t.fsContext)
-	stateSourceObject.Load(25, &t.fdTable)
-	stateSourceObject.Load(26, &t.vforkParent)
-	stateSourceObject.Load(27, &t.exitState)
-	stateSourceObject.Load(28, &t.exitTracerNotified)
-	stateSourceObject.Load(29, &t.exitTracerAcked)
-	stateSourceObject.Load(30, &t.exitParentNotified)
-	stateSourceObject.Load(31, &t.exitParentAcked)
-	stateSourceObject.Load(33, &t.ptraceTracees)
-	stateSourceObject.Load(34, &t.ptraceSeized)
-	stateSourceObject.Load(35, &t.ptraceOpts)
-	stateSourceObject.Load(36, &t.ptraceSyscallMode)
-	stateSourceObject.Load(37, &t.ptraceSinglestep)
-	stateSourceObject.Load(38, &t.ptraceCode)
-	stateSourceObject.Load(39, &t.ptraceSiginfo)
-	stateSourceObject.Load(40, &t.ptraceEventMsg)
-	stateSourceObject.Load(41, &t.ptraceYAMAExceptionAdded)
-	stateSourceObject.Load(42, &t.ioUsage)
-	stateSourceObject.Load(43, &t.creds)
-	stateSourceObject.Load(44, &t.utsns)
-	stateSourceObject.Load(45, &t.ipcns)
-	stateSourceObject.Load(46, &t.mountNamespace)
-	stateSourceObject.Load(47, &t.parentDeathSignal)
-	stateSourceObject.Load(49, &t.cleartid)
-	stateSourceObject.Load(50, &t.allowedCPUMask)
-	stateSourceObject.Load(51, &t.cpu)
-	stateSourceObject.Load(52, &t.niceness)
-	stateSourceObject.Load(53, &t.numaPolicy)
-	stateSourceObject.Load(54, &t.numaNodeMask)
-	stateSourceObject.Load(55, &t.netns)
-	stateSourceObject.Load(56, &t.rseqCPU)
-	stateSourceObject.Load(57, &t.oldRSeqCPUAddr)
-	stateSourceObject.Load(58, &t.rseqAddr)
-	stateSourceObject.Load(59, &t.rseqSignature)
-	stateSourceObject.Load(60, &t.robustList)
-	stateSourceObject.Load(61, &t.startTime)
-	stateSourceObject.Load(62, &t.kcov)
-	stateSourceObject.Load(63, &t.cgroups)
-	stateSourceObject.Load(64, &t.memCgID)
-	stateSourceObject.Load(65, &t.userCounters)
-	stateSourceObject.Load(66, &t.sessionKeyring)
-	stateSourceObject.Load(67, &t.Origin)
-	stateSourceObject.LoadValue(32, new(*Task), func(y any) { t.loadPtraceTracer(ctx, y.(*Task)) })
-	stateSourceObject.LoadValue(48, new(*taskSeccomp), func(y any) { t.loadSeccomp(ctx, y.(*taskSeccomp)) })
+	stateSourceObject.Load(5, &t.gostate)
+	stateSourceObject.Load(6, &t.gostateTime)
+	stateSourceObject.Load(7, &t.appCPUClock)
+	stateSourceObject.Load(8, &t.appSysCPUClock)
+	stateSourceObject.Load(9, &t.yieldCount)
+	stateSourceObject.Load(10, &t.pendingSignals)
+	stateSourceObject.Load(11, &t.signalMask)
+	stateSourceObject.Load(12, &t.realSignalMask)
+	stateSourceObject.Load(13, &t.haveSavedSignalMask)
+	stateSourceObject.Load(14, &t.savedSignalMask)
+	stateSourceObject.Load(15, &t.signalStack)
+	stateSourceObject.Load(16, &t.signalQueue)
+	stateSourceObject.Load(17, &t.groupStopPending)
+	stateSourceObject.Load(18, &t.groupStopAcknowledged)
+	stateSourceObject.Load(19, &t.trapStopPending)
+	stateSourceObject.Load(20, &t.trapNotifyPending)
+	stateSourceObject.Load(21, &t.stop)
+	stateSourceObject.Load(22, &t.exitStatus)
+	stateSourceObject.Load(23, &t.syscallRestartBlock)
+	stateSourceObject.Load(24, &t.k)
+	stateSourceObject.Load(25, &t.containerID)
+	stateSourceObject.Load(26, &t.image)
+	stateSourceObject.Load(27, &t.fsContext)
+	stateSourceObject.Load(28, &t.fdTable)
+	stateSourceObject.Load(30, &t.exitState)
+	stateSourceObject.Load(31, &t.exitTracerNotified)
+	stateSourceObject.Load(32, &t.exitTracerAcked)
+	stateSourceObject.Load(33, &t.exitParentNotified)
+	stateSourceObject.Load(34, &t.exitParentAcked)
+	stateSourceObject.Load(36, &t.ptraceTracees)
+	stateSourceObject.Load(37, &t.ptraceSeized)
+	stateSourceObject.Load(38, &t.ptraceOpts)
+	stateSourceObject.Load(39, &t.ptraceSyscallMode)
+	stateSourceObject.Load(40, &t.ptraceSinglestep)
+	stateSourceObject.Load(41, &t.ptraceCode)
+	stateSourceObject.Load(42, &t.ptraceSiginfo)
+	stateSourceObject.Load(43, &t.ptraceEventMsg)
+	stateSourceObject.Load(44, &t.ptraceYAMAExceptionAdded)
+	stateSourceObject.Load(45, &t.ioUsage)
+	stateSourceObject.Load(46, &t.creds)
+	stateSourceObject.Load(47, &t.utsns)
+	stateSourceObject.Load(48, &t.ipcns)
+	stateSourceObject.Load(49, &t.mountNamespace)
+	stateSourceObject.Load(50, &t.parentDeathSignal)
+	stateSourceObject.Load(52, &t.cleartid)
+	stateSourceObject.Load(53, &t.allowedCPUMask)
+	stateSourceObject.Load(54, &t.cpu)
+	stateSourceObject.Load(55, &t.niceness)
+	stateSourceObject.Load(56, &t.numaPolicy)
+	stateSourceObject.Load(57, &t.numaNodeMask)
+	stateSourceObject.Load(58, &t.netns)
+	stateSourceObject.Load(59, &t.rseqCPU)
+	stateSourceObject.Load(60, &t.oldRSeqCPUAddr)
+	stateSourceObject.Load(61, &t.rseqAddr)
+	stateSourceObject.Load(62, &t.rseqSignature)
+	stateSourceObject.Load(63, &t.robustList)
+	stateSourceObject.Load(64, &t.startTime)
+	stateSourceObject.Load(65, &t.kcov)
+	stateSourceObject.Load(66, &t.cgroups)
+	stateSourceObject.Load(67, &t.memCgID)
+	stateSourceObject.Load(68, &t.userCounters)
+	stateSourceObject.Load(69, &t.sessionKeyring)
+	stateSourceObject.Load(70, &t.Origin)
+	stateSourceObject.Load(71, &t.onDestroyAction)
+	stateSourceObject.LoadValue(29, new(*Task), func(y any) { t.loadVforkParent(ctx, y.(*Task)) })
+	stateSourceObject.LoadValue(35, new(*Task), func(y any) { t.loadPtraceTracer(ctx, y.(*Task)) })
+	stateSourceObject.LoadValue(51, new(*taskSeccomp), func(y any) { t.loadSeccomp(ctx, y.(*taskSeccomp)) })
 	stateSourceObject.AfterLoad(func() { t.afterLoad(ctx) })
+}
+
+func (l *itimerRealListener) StateTypeName() string {
+	return "pkg/sentry/kernel.itimerRealListener"
+}
+
+func (l *itimerRealListener) StateFields() []string {
+	return []string{
+		"tg",
+	}
+}
+
+func (l *itimerRealListener) beforeSave() {}
+
+// +checklocksignore
+func (l *itimerRealListener) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.tg)
+}
+
+func (l *itimerRealListener) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *itimerRealListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.tg)
+}
+
+func (l *itimerVirtListener) StateTypeName() string {
+	return "pkg/sentry/kernel.itimerVirtListener"
+}
+
+func (l *itimerVirtListener) StateFields() []string {
+	return []string{
+		"tg",
+	}
+}
+
+func (l *itimerVirtListener) beforeSave() {}
+
+// +checklocksignore
+func (l *itimerVirtListener) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.tg)
+}
+
+func (l *itimerVirtListener) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *itimerVirtListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.tg)
+}
+
+func (l *itimerProfListener) StateTypeName() string {
+	return "pkg/sentry/kernel.itimerProfListener"
+}
+
+func (l *itimerProfListener) StateFields() []string {
+	return []string{
+		"tg",
+	}
+}
+
+func (l *itimerProfListener) beforeSave() {}
+
+// +checklocksignore
+func (l *itimerProfListener) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.tg)
+}
+
+func (l *itimerProfListener) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *itimerProfListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.tg)
+}
+
+func (l *rlimitCPUSoftListener) StateTypeName() string {
+	return "pkg/sentry/kernel.rlimitCPUSoftListener"
+}
+
+func (l *rlimitCPUSoftListener) StateFields() []string {
+	return []string{
+		"tg",
+	}
+}
+
+func (l *rlimitCPUSoftListener) beforeSave() {}
+
+// +checklocksignore
+func (l *rlimitCPUSoftListener) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.tg)
+}
+
+func (l *rlimitCPUSoftListener) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *rlimitCPUSoftListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.tg)
+}
+
+func (l *rlimitCPUHardListener) StateTypeName() string {
+	return "pkg/sentry/kernel.rlimitCPUHardListener"
+}
+
+func (l *rlimitCPUHardListener) StateFields() []string {
+	return []string{
+		"tg",
+	}
+}
+
+func (l *rlimitCPUHardListener) beforeSave() {}
+
+// +checklocksignore
+func (l *rlimitCPUHardListener) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.tg)
+}
+
+func (l *rlimitCPUHardListener) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *rlimitCPUHardListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.tg)
 }
 
 func (r *runSyscallAfterPtraceEventClone) StateTypeName() string {
@@ -1791,96 +1989,6 @@ func (app *runApp) afterLoad(context.Context) {}
 func (app *runApp) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 }
 
-func (ts *TaskGoroutineSchedInfo) StateTypeName() string {
-	return "pkg/sentry/kernel.TaskGoroutineSchedInfo"
-}
-
-func (ts *TaskGoroutineSchedInfo) StateFields() []string {
-	return []string{
-		"Timestamp",
-		"State",
-		"UserTicks",
-		"SysTicks",
-	}
-}
-
-func (ts *TaskGoroutineSchedInfo) beforeSave() {}
-
-// +checklocksignore
-func (ts *TaskGoroutineSchedInfo) StateSave(stateSinkObject state.Sink) {
-	ts.beforeSave()
-	stateSinkObject.Save(0, &ts.Timestamp)
-	stateSinkObject.Save(1, &ts.State)
-	stateSinkObject.Save(2, &ts.UserTicks)
-	stateSinkObject.Save(3, &ts.SysTicks)
-}
-
-func (ts *TaskGoroutineSchedInfo) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (ts *TaskGoroutineSchedInfo) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &ts.Timestamp)
-	stateSourceObject.Load(1, &ts.State)
-	stateSourceObject.Load(2, &ts.UserTicks)
-	stateSourceObject.Load(3, &ts.SysTicks)
-}
-
-func (tc *taskClock) StateTypeName() string {
-	return "pkg/sentry/kernel.taskClock"
-}
-
-func (tc *taskClock) StateFields() []string {
-	return []string{
-		"t",
-		"includeSys",
-	}
-}
-
-func (tc *taskClock) beforeSave() {}
-
-// +checklocksignore
-func (tc *taskClock) StateSave(stateSinkObject state.Sink) {
-	tc.beforeSave()
-	stateSinkObject.Save(0, &tc.t)
-	stateSinkObject.Save(1, &tc.includeSys)
-}
-
-func (tc *taskClock) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (tc *taskClock) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &tc.t)
-	stateSourceObject.Load(1, &tc.includeSys)
-}
-
-func (tgc *tgClock) StateTypeName() string {
-	return "pkg/sentry/kernel.tgClock"
-}
-
-func (tgc *tgClock) StateFields() []string {
-	return []string{
-		"tg",
-		"includeSys",
-	}
-}
-
-func (tgc *tgClock) beforeSave() {}
-
-// +checklocksignore
-func (tgc *tgClock) StateSave(stateSinkObject state.Sink) {
-	tgc.beforeSave()
-	stateSinkObject.Save(0, &tgc.tg)
-	stateSinkObject.Save(1, &tgc.includeSys)
-}
-
-func (tgc *tgClock) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (tgc *tgClock) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &tgc.tg)
-	stateSourceObject.Load(1, &tgc.includeSys)
-}
-
 func (g *groupStop) StateTypeName() string {
 	return "pkg/sentry/kernel.groupStop"
 }
@@ -2049,13 +2157,22 @@ func (tg *ThreadGroup) StateFields() []string {
 		"exitStatus",
 		"terminationSignal",
 		"itimerRealTimer",
-		"itimerVirtSetting",
-		"itimerProfSetting",
-		"rlimitCPUSoftSetting",
-		"cpuTimersEnabled",
+		"itimerRealListener",
+		"itimerVirtTimer",
+		"itimerVirtListener",
+		"itimerProfTimer",
+		"itimerProfListener",
+		"rlimitCPUSoftTimer",
+		"rlimitCPUSoftListener",
+		"rlimitCPUHardTimer",
+		"rlimitCPUHardListener",
 		"timers",
 		"nextTimerID",
-		"exitedCPUStats",
+		"appCPUClockLast",
+		"appCPUClock",
+		"appSysCPUClockLast",
+		"appSysCPUClock",
+		"yieldCount",
 		"childCPUStats",
 		"ioUsage",
 		"maxRSS",
@@ -2076,9 +2193,15 @@ func (tg *ThreadGroup) beforeSave() {}
 // +checklocksignore
 func (tg *ThreadGroup) StateSave(stateSinkObject state.Sink) {
 	tg.beforeSave()
+	var appCPUClockLastValue *Task
+	appCPUClockLastValue = tg.saveAppCPUClockLast()
+	stateSinkObject.SaveValue(26, appCPUClockLastValue)
+	var appSysCPUClockLastValue *Task
+	appSysCPUClockLastValue = tg.saveAppSysCPUClockLast()
+	stateSinkObject.SaveValue(28, appSysCPUClockLastValue)
 	var oldRSeqCriticalValue *OldRSeqCriticalRegion
 	oldRSeqCriticalValue = tg.saveOldRSeqCritical()
-	stateSinkObject.SaveValue(29, oldRSeqCriticalValue)
+	stateSinkObject.SaveValue(38, oldRSeqCriticalValue)
 	stateSinkObject.Save(0, &tg.threadGroupNode)
 	stateSinkObject.Save(1, &tg.signalHandlers)
 	stateSinkObject.Save(2, &tg.pendingSignals)
@@ -2094,24 +2217,31 @@ func (tg *ThreadGroup) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(12, &tg.exitStatus)
 	stateSinkObject.Save(13, &tg.terminationSignal)
 	stateSinkObject.Save(14, &tg.itimerRealTimer)
-	stateSinkObject.Save(15, &tg.itimerVirtSetting)
-	stateSinkObject.Save(16, &tg.itimerProfSetting)
-	stateSinkObject.Save(17, &tg.rlimitCPUSoftSetting)
-	stateSinkObject.Save(18, &tg.cpuTimersEnabled)
-	stateSinkObject.Save(19, &tg.timers)
-	stateSinkObject.Save(20, &tg.nextTimerID)
-	stateSinkObject.Save(21, &tg.exitedCPUStats)
-	stateSinkObject.Save(22, &tg.childCPUStats)
-	stateSinkObject.Save(23, &tg.ioUsage)
-	stateSinkObject.Save(24, &tg.maxRSS)
-	stateSinkObject.Save(25, &tg.childMaxRSS)
-	stateSinkObject.Save(26, &tg.limits)
-	stateSinkObject.Save(27, &tg.processGroup)
-	stateSinkObject.Save(28, &tg.execed)
-	stateSinkObject.Save(30, &tg.tty)
-	stateSinkObject.Save(31, &tg.oomScoreAdj)
-	stateSinkObject.Save(32, &tg.isChildSubreaper)
-	stateSinkObject.Save(33, &tg.hasChildSubreaper)
+	stateSinkObject.Save(15, &tg.itimerRealListener)
+	stateSinkObject.Save(16, &tg.itimerVirtTimer)
+	stateSinkObject.Save(17, &tg.itimerVirtListener)
+	stateSinkObject.Save(18, &tg.itimerProfTimer)
+	stateSinkObject.Save(19, &tg.itimerProfListener)
+	stateSinkObject.Save(20, &tg.rlimitCPUSoftTimer)
+	stateSinkObject.Save(21, &tg.rlimitCPUSoftListener)
+	stateSinkObject.Save(22, &tg.rlimitCPUHardTimer)
+	stateSinkObject.Save(23, &tg.rlimitCPUHardListener)
+	stateSinkObject.Save(24, &tg.timers)
+	stateSinkObject.Save(25, &tg.nextTimerID)
+	stateSinkObject.Save(27, &tg.appCPUClock)
+	stateSinkObject.Save(29, &tg.appSysCPUClock)
+	stateSinkObject.Save(30, &tg.yieldCount)
+	stateSinkObject.Save(31, &tg.childCPUStats)
+	stateSinkObject.Save(32, &tg.ioUsage)
+	stateSinkObject.Save(33, &tg.maxRSS)
+	stateSinkObject.Save(34, &tg.childMaxRSS)
+	stateSinkObject.Save(35, &tg.limits)
+	stateSinkObject.Save(36, &tg.processGroup)
+	stateSinkObject.Save(37, &tg.execed)
+	stateSinkObject.Save(39, &tg.tty)
+	stateSinkObject.Save(40, &tg.oomScoreAdj)
+	stateSinkObject.Save(41, &tg.isChildSubreaper)
+	stateSinkObject.Save(42, &tg.hasChildSubreaper)
 }
 
 func (tg *ThreadGroup) afterLoad(context.Context) {}
@@ -2133,50 +2263,34 @@ func (tg *ThreadGroup) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(12, &tg.exitStatus)
 	stateSourceObject.Load(13, &tg.terminationSignal)
 	stateSourceObject.Load(14, &tg.itimerRealTimer)
-	stateSourceObject.Load(15, &tg.itimerVirtSetting)
-	stateSourceObject.Load(16, &tg.itimerProfSetting)
-	stateSourceObject.Load(17, &tg.rlimitCPUSoftSetting)
-	stateSourceObject.Load(18, &tg.cpuTimersEnabled)
-	stateSourceObject.Load(19, &tg.timers)
-	stateSourceObject.Load(20, &tg.nextTimerID)
-	stateSourceObject.Load(21, &tg.exitedCPUStats)
-	stateSourceObject.Load(22, &tg.childCPUStats)
-	stateSourceObject.Load(23, &tg.ioUsage)
-	stateSourceObject.Load(24, &tg.maxRSS)
-	stateSourceObject.Load(25, &tg.childMaxRSS)
-	stateSourceObject.Load(26, &tg.limits)
-	stateSourceObject.Load(27, &tg.processGroup)
-	stateSourceObject.Load(28, &tg.execed)
-	stateSourceObject.Load(30, &tg.tty)
-	stateSourceObject.Load(31, &tg.oomScoreAdj)
-	stateSourceObject.Load(32, &tg.isChildSubreaper)
-	stateSourceObject.Load(33, &tg.hasChildSubreaper)
-	stateSourceObject.LoadValue(29, new(*OldRSeqCriticalRegion), func(y any) { tg.loadOldRSeqCritical(ctx, y.(*OldRSeqCriticalRegion)) })
-}
-
-func (l *itimerRealListener) StateTypeName() string {
-	return "pkg/sentry/kernel.itimerRealListener"
-}
-
-func (l *itimerRealListener) StateFields() []string {
-	return []string{
-		"tg",
-	}
-}
-
-func (l *itimerRealListener) beforeSave() {}
-
-// +checklocksignore
-func (l *itimerRealListener) StateSave(stateSinkObject state.Sink) {
-	l.beforeSave()
-	stateSinkObject.Save(0, &l.tg)
-}
-
-func (l *itimerRealListener) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (l *itimerRealListener) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &l.tg)
+	stateSourceObject.Load(15, &tg.itimerRealListener)
+	stateSourceObject.Load(16, &tg.itimerVirtTimer)
+	stateSourceObject.Load(17, &tg.itimerVirtListener)
+	stateSourceObject.Load(18, &tg.itimerProfTimer)
+	stateSourceObject.Load(19, &tg.itimerProfListener)
+	stateSourceObject.Load(20, &tg.rlimitCPUSoftTimer)
+	stateSourceObject.Load(21, &tg.rlimitCPUSoftListener)
+	stateSourceObject.Load(22, &tg.rlimitCPUHardTimer)
+	stateSourceObject.Load(23, &tg.rlimitCPUHardListener)
+	stateSourceObject.Load(24, &tg.timers)
+	stateSourceObject.Load(25, &tg.nextTimerID)
+	stateSourceObject.Load(27, &tg.appCPUClock)
+	stateSourceObject.Load(29, &tg.appSysCPUClock)
+	stateSourceObject.Load(30, &tg.yieldCount)
+	stateSourceObject.Load(31, &tg.childCPUStats)
+	stateSourceObject.Load(32, &tg.ioUsage)
+	stateSourceObject.Load(33, &tg.maxRSS)
+	stateSourceObject.Load(34, &tg.childMaxRSS)
+	stateSourceObject.Load(35, &tg.limits)
+	stateSourceObject.Load(36, &tg.processGroup)
+	stateSourceObject.Load(37, &tg.execed)
+	stateSourceObject.Load(39, &tg.tty)
+	stateSourceObject.Load(40, &tg.oomScoreAdj)
+	stateSourceObject.Load(41, &tg.isChildSubreaper)
+	stateSourceObject.Load(42, &tg.hasChildSubreaper)
+	stateSourceObject.LoadValue(26, new(*Task), func(y any) { tg.loadAppCPUClockLast(ctx, y.(*Task)) })
+	stateSourceObject.LoadValue(28, new(*Task), func(y any) { tg.loadAppSysCPUClockLast(ctx, y.(*Task)) })
+	stateSourceObject.LoadValue(38, new(*OldRSeqCriticalRegion), func(y any) { tg.loadOldRSeqCritical(ctx, y.(*OldRSeqCriticalRegion)) })
 }
 
 func (ts *TaskSet) StateTypeName() string {
@@ -2187,6 +2301,8 @@ func (ts *TaskSet) StateFields() []string {
 	return []string{
 		"Root",
 		"sessions",
+		"liveTasks",
+		"noNewTasksIfZeroLive",
 	}
 }
 
@@ -2197,14 +2313,17 @@ func (ts *TaskSet) StateSave(stateSinkObject state.Sink) {
 	ts.beforeSave()
 	stateSinkObject.Save(0, &ts.Root)
 	stateSinkObject.Save(1, &ts.sessions)
+	stateSinkObject.Save(2, &ts.liveTasks)
+	stateSinkObject.Save(3, &ts.noNewTasksIfZeroLive)
 }
-
-func (ts *TaskSet) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (ts *TaskSet) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &ts.Root)
 	stateSourceObject.Load(1, &ts.sessions)
+	stateSourceObject.Load(2, &ts.liveTasks)
+	stateSourceObject.Load(3, &ts.noNewTasksIfZeroLive)
+	stateSourceObject.AfterLoad(func() { ts.afterLoad(ctx) })
 }
 
 func (ns *PIDNamespace) StateTypeName() string {
@@ -2350,7 +2469,7 @@ func (t *taskNode) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (t *taskNode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.LoadWait(0, &t.tg)
+	stateSourceObject.Load(0, &t.tg)
 	stateSourceObject.Load(1, &t.taskEntry)
 	stateSourceObject.Load(2, &t.parent)
 	stateSourceObject.Load(3, &t.children)
@@ -2425,7 +2544,8 @@ func (tty *TTY) StateTypeName() string {
 
 func (tty *TTY) StateFields() []string {
 	return []string{
-		"Index",
+		"TTYOperations",
+		"index",
 		"tg",
 	}
 }
@@ -2435,16 +2555,18 @@ func (tty *TTY) beforeSave() {}
 // +checklocksignore
 func (tty *TTY) StateSave(stateSinkObject state.Sink) {
 	tty.beforeSave()
-	stateSinkObject.Save(0, &tty.Index)
-	stateSinkObject.Save(1, &tty.tg)
+	stateSinkObject.Save(0, &tty.TTYOperations)
+	stateSinkObject.Save(1, &tty.index)
+	stateSinkObject.Save(2, &tty.tg)
 }
 
 func (tty *TTY) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (tty *TTY) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &tty.Index)
-	stateSourceObject.Load(1, &tty.tg)
+	stateSourceObject.Load(0, &tty.TTYOperations)
+	stateSourceObject.Load(1, &tty.index)
+	stateSourceObject.Load(2, &tty.tg)
 }
 
 func (u *UTSNamespace) StateTypeName() string {
@@ -2527,6 +2649,8 @@ func init() {
 	state.Register((*Kernel)(nil))
 	state.Register((*privateMemoryFileMetadata)(nil))
 	state.Register((*SocketRecord)(nil))
+	state.Register((*CheckpointGeneration)(nil))
+	state.Register((*CheckpointWaitable)(nil))
 	state.Register((*pendingSignals)(nil))
 	state.Register((*pendingSignalQueue)(nil))
 	state.Register((*pendingSignal)(nil))
@@ -2550,6 +2674,11 @@ func init() {
 	state.Register((*syscallTableInfo)(nil))
 	state.Register((*syslog)(nil))
 	state.Register((*Task)(nil))
+	state.Register((*itimerRealListener)(nil))
+	state.Register((*itimerVirtListener)(nil))
+	state.Register((*itimerProfListener)(nil))
+	state.Register((*rlimitCPUSoftListener)(nil))
+	state.Register((*rlimitCPUHardListener)(nil))
 	state.Register((*runSyscallAfterPtraceEventClone)(nil))
 	state.Register((*runSyscallAfterVforkStop)(nil))
 	state.Register((*vforkStop)(nil))
@@ -2562,9 +2691,6 @@ func init() {
 	state.Register((*taskList)(nil))
 	state.Register((*taskEntry)(nil))
 	state.Register((*runApp)(nil))
-	state.Register((*TaskGoroutineSchedInfo)(nil))
-	state.Register((*taskClock)(nil))
-	state.Register((*tgClock)(nil))
 	state.Register((*groupStop)(nil))
 	state.Register((*runInterrupt)(nil))
 	state.Register((*runInterruptAfterSignalDeliveryStop)(nil))
@@ -2573,7 +2699,6 @@ func init() {
 	state.Register((*runSyscallReinvoke)(nil))
 	state.Register((*runSyscallExit)(nil))
 	state.Register((*ThreadGroup)(nil))
-	state.Register((*itimerRealListener)(nil))
 	state.Register((*TaskSet)(nil))
 	state.Register((*PIDNamespace)(nil))
 	state.Register((*threadGroupNode)(nil))

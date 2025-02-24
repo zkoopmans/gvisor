@@ -39,6 +39,7 @@ type replicaInode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
@@ -53,26 +54,7 @@ var _ kernfs.Inode = (*replicaInode)(nil)
 
 // Open implements kernfs.Inode.Open.
 func (ri *replicaInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	t := kernel.TaskFromContext(ctx)
-	if t == nil {
-		panic("open must be called from a task goroutine")
-	}
-	fd := &replicaFileDescription{
-		inode: ri,
-	}
-	fd.LockFD.Init(&ri.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
-		return nil, err
-	}
-	if opts.Flags&linux.O_NOCTTY == 0 {
-		// Opening a replica sets the process' controlling TTY when
-		// possible. An error indicates it cannot be set, and is
-		// ignored silently.
-		_ = t.ThreadGroup().SetControllingTTY(fd.inode.t.replicaKTTY, false /* steal */, fd.vfsfd.IsReadable())
-	}
-	ri.t.ld.replicaOpen()
-	return &fd.vfsfd, nil
-
+	return ri.t.Open(ctx, rp.Mount(), d.VFSDentry(), opts)
 }
 
 // Valid implements kernfs.Inode.Valid.
@@ -168,11 +150,12 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 	case linux.TCSETS:
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TCSETSW:
-		// TODO(b/29356795): This should drain the output queue first.
+		// Note that this should drain the output queue first, but we
+		// don't implement that yet.
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TCSETSF:
-		// TODO(b/29356795): This should drain the output queue and
-		// clear the input queue first.
+		// This should drain the output queue and clear the input queue
+		// first, but we don't implement that yet.
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TIOCGPTN:
 		nP := primitive.Uint32(rfd.inode.t.n)
@@ -186,7 +169,7 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 		// Make the given terminal the controlling terminal of the
 		// calling process.
 		steal := args[2].Int() == 1
-		return 0, t.ThreadGroup().SetControllingTTY(rfd.inode.t.replicaKTTY, steal, rfd.vfsfd.IsReadable())
+		return 0, t.ThreadGroup().SetControllingTTY(ctx, rfd.inode.t.replicaKTTY, steal, rfd.vfsfd.IsReadable())
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
 		return 0, t.ThreadGroup().ReleaseControllingTTY(rfd.inode.t.replicaKTTY)

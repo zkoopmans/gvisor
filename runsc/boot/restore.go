@@ -43,6 +43,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
 const (
@@ -75,6 +77,10 @@ type restorer struct {
 	stateFile     io.ReadCloser
 	pagesMetadata *fd.FD
 	pagesFile     *fd.FD
+
+	// If background is true, pagesFile may continue to be read after
+	// restorer.restore() returns.
+	background bool
 
 	// deviceFile is the required to start the platform.
 	deviceFile *fd.FD
@@ -128,7 +134,7 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	return nil
 }
 
-func createNetworStackForRestore(l *Loader) (*stack.Stack, inet.Stack) {
+func createNetworkStackForRestore(l *Loader) (*stack.Stack, inet.Stack) {
 	// Save the current network stack to slap on top of the one that was restored.
 	curNetwork := l.k.RootNetworkNamespace().Stack()
 	if eps, ok := curNetwork.(*netstack.Stack); ok {
@@ -142,7 +148,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	// Create a new root network namespace with the network stack of the
 	// old kernel to preserve the existing network configuration.
-	oldStack, oldInetStack := createNetworStackForRestore(l)
+	oldStack, oldInetStack := createNetworkStackForRestore(l)
 
 	// Reset the network stack in the network namespace to nil before
 	// replacing the kernel. This will not free the network stack when this
@@ -189,6 +195,12 @@ func (r *restorer) restore(l *Loader) error {
 		ctx = context.WithValue(ctx, stack.CtxRestoreStack, oldStack)
 	}
 
+	l.mu.Lock()
+	cu := cleanup.Make(func() {
+		l.mu.Unlock()
+	})
+	defer cu.Clean()
+
 	fdmap := make(map[vfs.RestoreID]int)
 	mfmap := make(map[string]*pgalloc.MemoryFile)
 	for _, cont := range r.containers {
@@ -215,9 +227,30 @@ func (r *restorer) restore(l *Loader) error {
 	ctx = context.WithValue(ctx, devutil.CtxDevGoferClientProvider, l.k)
 
 	// Load the state.
-	loadOpts := state.LoadOpts{Source: r.stateFile, PagesMetadata: r.pagesMetadata, PagesFile: r.pagesFile}
-	if err := loadOpts.Load(ctx, l.k, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
-		return err
+	loadOpts := state.LoadOpts{
+		Source:        r.stateFile,
+		PagesMetadata: r.pagesMetadata,
+		PagesFile:     r.pagesFile,
+		Background:    r.background,
+	}
+	err = loadOpts.Load(ctx, l.k, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet)
+	r.pagesFile = nil // transferred to loadOpts.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+
+	checkpointVersion := popVersionFromCheckpoint(l.k)
+	currentVersion := version.Version()
+	if checkpointVersion != currentVersion {
+		return fmt.Errorf("runsc version does not match across checkpoint restore, checkpoint: %v current: %v", checkpointVersion, currentVersion)
+	}
+
+	oldSpecs, err := popContainerSpecsFromCheckpoint(l.k)
+	if err != nil {
+		return fmt.Errorf("failed to pop container specs from checkpoint: %w", err)
+	}
+	if err := specutils.RestoreValidateSpec(oldSpecs, l.containerSpecs, l.root.conf); err != nil {
+		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
 
 	// Since we have a new kernel we also must make a new watchdog.
@@ -232,12 +265,6 @@ func (r *restorer) restore(l *Loader) error {
 	l.root.procArgs = kernel.CreateProcessArgs{}
 	l.restore = true
 	l.sandboxID = l.root.cid
-
-	l.mu.Lock()
-	cu := cleanup.Make(func() {
-		l.mu.Unlock()
-	})
-	defer cu.Clean()
 
 	// Update all tasks in the system with their respective new container IDs.
 	for _, task := range l.k.TaskSet().Root.Tasks() {
@@ -276,9 +303,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	l.k.RestoreContainerMapping(l.containerIDs)
 
-	if err := l.kernelInitExtra(); err != nil {
-		return err
-	}
+	l.kernelInitExtra()
 
 	// Refresh the control server with the newly created kernel.
 	l.ctrl.refreshHandlers()
@@ -288,7 +313,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	// r.restoreDone() signals and waits for the sandbox to start.
 	if err := r.restoreDone(); err != nil {
-		return err
+		return fmt.Errorf("restorer.restoreDone callback failed: %w", err)
 	}
 
 	r.stateFile.Close()
@@ -299,15 +324,20 @@ func (r *restorer) restore(l *Loader) error {
 		r.pagesMetadata.Close()
 	}
 
-	if err := postRestoreImpl(l.k); err != nil {
-		return err
-	}
+	go func() {
+		if err := postRestoreImpl(l); err != nil {
+			log.Warningf("Killing the sandbox after post restore work failed: %v", err)
+			l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			return
+		}
 
-	// Restore was successful, so increment the checkpoint count manually. The
-	// count was saved while the previous kernel was being saved and checkpoint
-	// success was unknown at that time. Now we know the checkpoint succeeded.
-	l.k.IncCheckpointCount()
-	log.Infof("Restore successful")
+		// Restore was successful, so increment the checkpoint count manually. The
+		// count was saved while the previous kernel was being saved and checkpoint
+		// success was unknown at that time. Now we know the checkpoint succeeded.
+		l.k.OnRestoreDone()
+
+		log.Infof("Restore successful")
+	}()
 	return nil
 }
 
@@ -316,7 +346,6 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		// This closure is required to capture the final value of err.
 		l.k.OnCheckpointAttempt(err)
 	}()
-	l.k.ResetCheckpointStatus()
 
 	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
 	if l.root.conf.Network == config.NetworkHost {
@@ -328,7 +357,13 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 	}
 	o.Metadata["container_count"] = strconv.Itoa(l.containerCount())
 
-	if err := preSaveImpl(l.k, o); err != nil {
+	// Save runsc version.
+	l.addVersionToCheckpoint()
+
+	// Save container specs.
+	l.addContainerSpecsToCheckpoint()
+
+	if err := preSaveImpl(l, o); err != nil {
 		return err
 	}
 
@@ -341,7 +376,7 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 	}
 
 	if o.Resume {
-		if err := postResumeImpl(l.k); err != nil {
+		if err := postResumeImpl(l); err != nil {
 			return err
 		}
 	}

@@ -198,7 +198,7 @@ func (pg *ProcessGroup) handleOrphan() {
 
 	// See if there are any stopped jobs.
 	hasStopped := false
-	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup) {
+	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, _ *Task) {
 		if tg.processGroup != pg {
 			return
 		}
@@ -213,13 +213,13 @@ func (pg *ProcessGroup) handleOrphan() {
 	}
 
 	// Deliver appropriate signals to all thread groups.
-	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup) {
+	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, tgLeader *Task) {
 		if tg.processGroup != pg {
 			return
 		}
 		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
-		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
-		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
+		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
+		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
 		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 
@@ -431,13 +431,9 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 
 // JoinProcessGroup joins an existing process group.
 //
-// This function will return EACCES if an exec has been performed since fork
-// by the given ThreadGroup, and EPERM if the Sessions are not the same or the
+// This function will return EPERM if the Sessions are not the same or the
 // group does not exist.
-//
-// If checkExec is set, then the join is not permitted after the process has
-// executed exec at least once.
-func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID, checkExec bool) error {
+func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID) error {
 	pidns.owner.mu.Lock()
 	defer pidns.owner.mu.Unlock()
 
@@ -450,11 +446,6 @@ func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID
 	pg := pidns.processGroups[pgid]
 	if pg == nil {
 		return linuxerr.EPERM
-	}
-
-	// Disallow the join if an execve has performed, per POSIX.
-	if checkExec && tg.execed {
-		return linuxerr.EACCES
 	}
 
 	// See if it's in the same session as ours.

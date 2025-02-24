@@ -22,15 +22,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/containerd/containerd/log"
 	runc "github.com/containerd/go-runc"
+	"github.com/containerd/log"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
@@ -178,6 +177,7 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 	return err
 }
 
+// Pause will pause a running container.
 func (r *Runsc) Pause(context context.Context, id string) error {
 	if out, _, err := cmdOutput(r.command(context, "pause", id), true); err != nil {
 		return fmt.Errorf("unable to pause: %w: %s", err, out)
@@ -185,6 +185,7 @@ func (r *Runsc) Pause(context context.Context, id string) error {
 	return nil
 }
 
+// Resume will resume a paused container.
 func (r *Runsc) Resume(context context.Context, id string) error {
 	if out, _, err := cmdOutput(r.command(context, "resume", id), true); err != nil {
 		return fmt.Errorf("unable to resume: %w: %s", err, out)
@@ -231,9 +232,10 @@ func (r *Runsc) start(context context.Context, cio runc.IO, cmd *exec.Cmd) error
 
 // RestoreOpts is a set of options to runsc.Restore().
 type RestoreOpts struct {
-	ImagePath string
-	Detach    bool
-	Direct    bool
+	ImagePath  string
+	Detach     bool
+	Direct     bool
+	Background bool
 }
 
 func (o *RestoreOpts) args() []string {
@@ -246,6 +248,9 @@ func (o *RestoreOpts) args() []string {
 	}
 	if o.Direct {
 		out = append(out, "--direct")
+	}
+	if o.Background {
+		out = append(out, "--background")
 	}
 	return out
 }
@@ -313,7 +318,7 @@ func (o *ExecOpts) args() (out []string, err error) {
 // Exec executes an additional process inside the container based on a full OCI
 // Process specification.
 func (r *Runsc) Exec(context context.Context, id string, spec specs.Process, opts *ExecOpts) error {
-	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), "runsc-process")
+	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "runsc-process")
 	if err != nil {
 		return err
 	}

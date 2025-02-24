@@ -27,10 +27,7 @@ func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
 	// UVM_VALIDATE_VA_RANGE, and probably other ioctls, expect that
 	// application mmaps of /dev/nvidia-uvm are immediately visible to the
 	// driver.
-	if opts.PlatformEffect < memmap.PlatformEffectPopulate {
-		opts.PlatformEffect = memmap.PlatformEffectPopulate
-	}
-	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
@@ -54,9 +51,7 @@ func (fd *uvmFD) Translate(ctx context.Context, required, optional memmap.Mappab
 			Source: optional,
 			File:   &fd.memmapFile,
 			Offset: optional.Start,
-			// kernel-open/nvidia-uvm/uvm.c:uvm_mmap() requires mappings to be
-			// PROT_READ|PROT_WRITE.
-			Perms: hostarch.ReadWrite,
+			Perms:  hostarch.AnyAccess,
 		},
 	}, nil
 }
@@ -83,6 +78,11 @@ func (mf *uvmFDMemmapFile) DecRef(fr memmap.FileRange) {
 func (mf *uvmFDMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	// TODO(jamieliu): make an attempt with MAP_FIXED_NOREPLACE?
 	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
+}
+
+// DataFD implements memmap.File.DataFD.
+func (mf *uvmFDMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
+	return mf.FD(), nil
 }
 
 // FD implements memmap.File.FD.

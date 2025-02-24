@@ -23,7 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -735,6 +735,7 @@ type StaticDirectory struct {
 	InodeWatches
 	OrderedChildren
 	StaticDirectoryRefs
+	InodeFSOwned
 
 	locks  vfs.FileLocks
 	fdOpts GenericDirectoryFDOptions
@@ -845,3 +846,15 @@ type InodeNotAnonymous struct{}
 func (*InodeNotAnonymous) Anonymous() bool {
 	return false
 }
+
+// InodeFSOwned represents inodes whose lifecycle is entirely managed by the
+// filesystem.
+//
+// +stateify savable
+type InodeFSOwned struct{}
+
+// RegisterDentry implements Inode.RegisterDentry.
+func (*InodeFSOwned) RegisterDentry(d *Dentry) {}
+
+// UnregisterDentry implements Remove.UnregisterDentry.
+func (*InodeFSOwned) UnregisterDentry(d *Dentry) {}

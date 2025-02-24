@@ -17,7 +17,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,12 +28,14 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -48,21 +49,29 @@ import (
 
 // Note that directfsSandboxCaps is the same as caps defined in gofer.go
 // except CAP_SYS_CHROOT because we don't need to chroot in directfs mode.
-var directfsSandboxCaps = []string{
-	"CAP_CHOWN",
-	"CAP_DAC_OVERRIDE",
-	"CAP_DAC_READ_SEARCH",
-	"CAP_FOWNER",
-	"CAP_FSETID",
-}
+var (
+	directfsSandboxCaps = []string{
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE",
+		"CAP_DAC_READ_SEARCH",
+		"CAP_FOWNER",
+		"CAP_FSETID",
+	}
 
-// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
-// sandbox to operate on files in directfs mode.
-var directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
-	Bounding:  directfsSandboxCaps,
-	Effective: directfsSandboxCaps,
-	Permitted: directfsSandboxCaps,
-}
+	// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
+	// sandbox to operate on files in directfs mode.
+	directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
+		Bounding:  directfsSandboxCaps,
+		Effective: directfsSandboxCaps,
+		Permitted: directfsSandboxCaps,
+	}
+
+	hostnetSandboxLinuxCaps = map[capability.Cap]string{
+		capability.CAP_NET_ADMIN:        "CAP_NET_ADMIN",
+		capability.CAP_NET_BIND_SERVICE: "CAP_NET_BIND_SERVICE",
+		capability.CAP_NET_RAW:          "CAP_NET_RAW",
+	}
+)
 
 // Boot implements subcommands.Command for the "boot" command which starts a
 // new sandbox. It should not be called directly.
@@ -141,9 +150,6 @@ type Boot struct {
 
 	saveFDs intFlags
 
-	// pidns is set if the sandbox is in its own pid namespace.
-	pidns bool
-
 	// attached is set to true to kill the sandbox process when the parent process
 	// terminates. This flag is set when the command execve's itself because
 	// parent death signal doesn't propagate through execve when uid/gid changes.
@@ -158,6 +164,10 @@ type Boot struct {
 
 	// FDs for profile data.
 	profileFDs profile.FDArgs
+
+	// finalMetricsFD is a file descriptor to write metric data to upon sandbox
+	// termination.
+	finalMetricsFD int
 
 	// profilingMetricsFD is a file descriptor to write Sentry metrics data to.
 	profilingMetricsFD int
@@ -191,7 +201,7 @@ func (*Boot) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Boot) Usage() string {
-	return `boot [flags] <container id>`
+	return "boot [flags] <container id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -199,7 +209,6 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.bundleDir, "bundle", "", "required path to the root of the bundle directory")
 	f.BoolVar(&b.applyCaps, "apply-caps", false, "if true, apply capabilities defined in the spec to the process")
 	f.BoolVar(&b.setUpRoot, "setup-root", false, "if true, set up an empty root for the process")
-	f.BoolVar(&b.pidns, "pidns", false, "if true, the sandbox is in its own PID namespace")
 	f.IntVar(&b.cpuNum, "cpu-num", 0, "number of CPUs to create inside the sandbox")
 	f.IntVar(&b.procMountSyncFD, "proc-mount-sync-fd", -1, "file descriptor that has to be written to when /proc isn't needed anymore and can be unmounted")
 	f.IntVar(&b.syncUsernsFD, "sync-userns-fd", -1, "file descriptor used to synchronize rootless user namespace initialization.")
@@ -230,6 +239,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
+	f.IntVar(&b.finalMetricsFD, "final-metrics-log-fd", -1, "file descriptor to write metrics to upon sandbox termination.")
 	f.IntVar(&b.profilingMetricsFD, "profiling-metrics-fd", -1, "file descriptor to write sentry profiling metrics.")
 	f.BoolVar(&b.profilingMetricsLossy, "profiling-metrics-fd-lossy", false, "if true, treat the sentry profiling metrics FD as lossy and write a checksum to it.")
 }
@@ -257,7 +267,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	// Do these before chroot takes effect, otherwise we can't read /sys.
 	if len(b.productName) == 0 {
-		if product, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
+		if product, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
 			log.Warningf("Not setting product_name: %v", err)
 		} else {
 			b.productName = strings.TrimSpace(string(product))
@@ -300,7 +310,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	if b.setUpRoot {
-		if err := setUpChroot(b.pidns, spec, conf); err != nil {
+		if err := setUpChroot(spec, conf); err != nil {
 			util.Fatalf("error setting up chroot: %v", err)
 		}
 		argOverride["setup-root"] = "false"
@@ -346,10 +356,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	if b.applyCaps {
-		caps := spec.Process.Capabilities
-		if caps == nil {
-			caps = &specs.LinuxCapabilities{}
-		}
+		caps := &specs.LinuxCapabilities{}
 
 		gPlatform, err := platform.Lookup(conf.Platform)
 		if err != nil {
@@ -365,6 +372,31 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 		if conf.DirectFS {
 			caps = specutils.MergeCapabilities(caps, directfsSandboxLinuxCaps)
+		}
+		if conf.Network == config.NetworkHost {
+			curCaps, err := capability.NewPid2(0)
+			if err != nil {
+				util.Fatalf("capability.NewPid2(0) failed: %v", err)
+			}
+			if err := curCaps.Load(); err != nil {
+				util.Fatalf("unable to load capabilities: %v", err)
+			}
+			addCaps := []string{}
+			for c, strCap := range hostnetSandboxLinuxCaps {
+				if c == capability.CAP_NET_RAW && !conf.EnableRaw {
+					continue
+				}
+				if curCaps.Get(capability.PERMITTED, c) {
+					addCaps = append(addCaps, strCap)
+				}
+			}
+			if len(addCaps) != 0 {
+				caps = specutils.MergeCapabilities(caps, &specs.LinuxCapabilities{
+					Bounding:  addCaps,
+					Effective: addCaps,
+					Permitted: addCaps,
+				})
+			}
 		}
 		argOverride["apply-caps"] = "false"
 
@@ -439,7 +471,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 		// Verify that all sentry threads are properly core tagged, and log
 		// current core tag.
-		coreTags, err := coretag.GetAllCoreTags(os.Getpid())
+		coreTags, err := coretag.GetAllCoreTags(0)
 		if err != nil {
 			util.Fatalf("Failed read current core tags: %v", err)
 		}
@@ -497,6 +529,10 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	// but before the start-sync file is notified, as the parent process needs to query for
 	// registered metrics prior to sending the start signal.
 	metric.Initialize()
+	var finalMetricsFile *os.File
+	if b.finalMetricsFD != -1 {
+		finalMetricsFile = os.NewFile(uintptr(b.finalMetricsFD), "final metrics file")
+	}
 	if b.profilingMetricsFD != -1 {
 		if err := metric.StartProfilingMetrics(metric.ProfilingMetricsOptions[*os.File]{
 			Sink:    os.NewFile(uintptr(b.profilingMetricsFD), "metrics file"),
@@ -534,6 +570,14 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	log.Infof("application exiting with %+v", ws)
 	waitStatus := args[1].(*unix.WaitStatus)
 	*waitStatus = unix.WaitStatus(ws)
+
+	if finalMetricsFile != nil {
+		if err := exportFinalMetrics(finalMetricsFile); err != nil {
+			l.Destroy()
+			util.Fatalf("unable to export final metrics: %v", err)
+		}
+	}
+
 	l.Destroy()
 	return subcommands.ExitSuccess
 }
@@ -541,7 +585,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 // prepareArgs returns the args that can be used to re-execute the current
 // program. It manipulates the flags of the subcommands.Command identified by
 // subCmdName and fSet is the flag.FlagSet of this subcommand. It applies the
-// flags specified by override map. In case of conflict, flag is overriden.
+// flags specified by override map. In case of conflict, flag is overridden.
 //
 // Postcondition: prepareArgs() takes ownership of override map.
 func prepareArgs(subCmdName string, fSet *flag.FlagSet, override map[string]string) []string {
@@ -661,4 +705,25 @@ func validateOpenFDs(passFDs []boot.FDMapping) {
 	}); err != nil {
 		util.Fatalf("WalkDir(%s) failed: %v", selfFDDir, err)
 	}
+}
+
+// exportFinalMetrics exports all metrics to the given file.
+// The file is closed as part of this function.
+func exportFinalMetrics(f *os.File) error {
+	snapshot, err := metric.GetSnapshot(metric.SnapshotOptions{})
+	if err != nil {
+		return fmt.Errorf("getting metrics snapshot: %w", err)
+	}
+	_, err = prometheus.Write(f, prometheus.ExportOptions{}, map[*prometheus.Snapshot]prometheus.SnapshotExportOptions{
+		snapshot: {
+			ExporterPrefix: "runsc_",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("writing metrics snapshot: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return fmt.Errorf("closing metrics snapshot file: %w", err)
+	}
+	return nil
 }

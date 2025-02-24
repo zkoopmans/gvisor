@@ -17,7 +17,6 @@ package hostinet
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strconv"
@@ -93,7 +92,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 	// SACK is important for performance and even compatibility, assume it's
 	// enabled if we can't find the actual value.
 	s.tcpSACKEnabled = true
-	if sack, err := ioutil.ReadFile("/proc/sys/net/ipv4/tcp_sack"); err == nil {
+	if sack, err := os.ReadFile("/proc/sys/net/ipv4/tcp_sack"); err == nil {
 		s.tcpSACKEnabled = strings.TrimSpace(string(sack)) != "0"
 	} else {
 		log.Warningf("Failed to read if TCP SACK if enabled, setting to true")
@@ -120,7 +119,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 }
 
 func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
-	contents, err := ioutil.ReadFile(filename)
+	contents, err := os.ReadFile(filename)
 	if err != nil {
 		return inet.TCPBufferSize{}, fmt.Errorf("failed to read %s: %v", filename, err)
 	}
@@ -388,11 +387,19 @@ func (*Stack) NewRoute(context.Context, *nlmsg.Message) *syserr.Error {
 	return syserr.ErrNotSupported
 }
 
+// RemoveRoute implements inet.Stack.RemoveRoute.
+func (*Stack) RemoveRoute(context.Context, *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
 // Pause implements inet.Stack.Pause.
 func (*Stack) Pause() {}
 
 // Restore implements inet.Stack.Restore.
 func (*Stack) Restore() {}
+
+// ReplaceConfig implements inet.Stack.ReplaceConfig.
+func (s *Stack) ReplaceConfig(_ inet.Stack) {}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}
@@ -420,4 +427,19 @@ func (*Stack) PortRange() (uint16, uint16) {
 // SetPortRange implements inet.Stack.SetPortRange.
 func (*Stack) SetPortRange(uint16, uint16) error {
 	return linuxerr.EACCES
+}
+
+// EnableSaveRestore implements inet.Stack.EnableSaveRestore.
+func (*Stack) EnableSaveRestore() error {
+	return fmt.Errorf("s/r is not supported for hostinet")
+}
+
+// IsSaveRestoreEnabled implements inet.Stack.IsSaveRestoreEnabled.
+func (s *Stack) IsSaveRestoreEnabled() bool {
+	return false
+}
+
+// Stats implements inet.Stack.Stats.
+func (s *Stack) Stats() tcpip.Stats {
+	return tcpip.Stats{}
 }

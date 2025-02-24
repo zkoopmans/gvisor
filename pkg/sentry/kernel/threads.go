@@ -76,12 +76,17 @@ type TaskSet struct {
 	// always reset to zero after restore.
 	stopCount int32 `state:"nosave"`
 
-	// liveGoroutines is the number of non-exited task goroutines in the
-	// TaskSet.
-	//
-	// liveGoroutines is not saved; it is reset as task goroutines are
-	// restarted by Task.Start.
-	liveGoroutines sync.WaitGroup `state:"nosave"`
+	// liveTasks is the number of tasks in the TaskSet whose goroutines have
+	// not exited. liveTasks is protected by mu.
+	liveTasks uint32
+
+	// If noNewTasksIfZeroLive is true and liveTasks is zero, calls to
+	// Kernel.NewTask() will fail. noNewTasksIfZeroLive is protected by mu.
+	noNewTasksIfZeroLive bool
+
+	// zeroLiveTasksCond is broadcast when liveTasks transitions from non-zero
+	// to zero.
+	zeroLiveTasksCond sync.Cond `state:"nosave"`
 
 	// runningGoroutines is the number of running task goroutines in the
 	// TaskSet.
@@ -102,12 +107,13 @@ type TaskSet struct {
 // newTaskSet returns a new, empty TaskSet.
 func newTaskSet(pidns *PIDNamespace) *TaskSet {
 	ts := &TaskSet{Root: pidns}
+	ts.zeroLiveTasksCond.L = &ts.mu
 	pidns.owner = ts
 	return ts
 }
 
 // ForEachThreadGroup applies f to each thread group in ts.
-func (ts *TaskSet) ForEachThreadGroup(f func(tg *ThreadGroup)) {
+func (ts *TaskSet) ForEachThreadGroup(f func(tg *ThreadGroup, tgLeader *Task)) {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	ts.forEachThreadGroupLocked(f)
@@ -116,9 +122,9 @@ func (ts *TaskSet) ForEachThreadGroup(f func(tg *ThreadGroup)) {
 // forEachThreadGroupLocked applies f to each thread group in ts.
 //
 // Preconditions: ts.mu must be locked (for reading or writing).
-func (ts *TaskSet) forEachThreadGroupLocked(f func(tg *ThreadGroup)) {
+func (ts *TaskSet) forEachThreadGroupLocked(f func(tg *ThreadGroup, tgLeader *Task)) {
 	for tg := range ts.Root.tgids {
-		f(tg)
+		f(tg, tg.leader)
 	}
 }
 
@@ -293,13 +299,17 @@ func (ns *PIDNamespace) IDOfThreadGroup(tg *ThreadGroup) ThreadID {
 
 // Tasks returns a snapshot of the tasks in ns.
 func (ns *PIDNamespace) Tasks() []*Task {
+	return ns.TasksAppend(nil)
+}
+
+// TasksAppend appends a snapshot of the tasks in ns to ts.
+func (ns *PIDNamespace) TasksAppend(ts []*Task) []*Task {
 	ns.owner.mu.RLock()
 	defer ns.owner.mu.RUnlock()
-	tasks := make([]*Task, 0, len(ns.tasks))
 	for t := range ns.tids {
-		tasks = append(tasks, t)
+		ts = append(ts, t)
 	}
-	return tasks
+	return ts
 }
 
 // NumTasks returns the number of tasks in ns.
@@ -481,7 +491,7 @@ func (tg *ThreadGroup) ID() ThreadID {
 type taskNode struct {
 	// tg is the thread group that this task belongs to. The tg pointer is
 	// immutable.
-	tg *ThreadGroup `state:"wait"`
+	tg *ThreadGroup
 
 	// taskEntry links into tg.tasks. Note that this means that
 	// Task.Next/Prev/SetNext/SetPrev refer to sibling tasks in the same thread

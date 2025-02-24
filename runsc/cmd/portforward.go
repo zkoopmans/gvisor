@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"os"
@@ -80,7 +79,7 @@ OPTIONS:
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (p *PortForward) SetFlags(f *flag.FlagSet) {
-	f.StringVar(&p.stream, "stream", "", "Stream mode - a Unix doman socket")
+	f.StringVar(&p.stream, "stream", "", "Stream mode - a Unix domain socket")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -128,7 +127,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 	// Start port forwarding with the local port.
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(ctx)
-	wg.Add(3)
+	wg.Add(1)
 	go func(localPort, portNum int) {
 		defer cancel()
 		defer wg.Done()
@@ -141,7 +140,6 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 
 	// Exit port forwarding if the container exits.
 	go func() {
-		defer wg.Done()
 		// Cancel port forwarding after Wait returns regardless of return
 		// value as err may indicate sandbox has terminated already.
 		_, _ = c.Wait()
@@ -151,7 +149,6 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 
 	// Wait for ^C from the user.
 	go func() {
-		defer wg.Done()
 		sig := waitSignal()
 		fmt.Printf("Got %v, Exiting...\n", sig)
 		cancel()
@@ -324,7 +321,7 @@ func portCopy(ctx context.Context, c *container.Container, localConn net.Conn, p
 
 // tmpUDS generates a temporary UDS addr.
 func tmpUDSAddr() (string, error) {
-	tmpFile, err := ioutil.TempFile("", "runsc-port-forward")
+	tmpFile, err := os.CreateTemp("", "runsc-port-forward")
 	if err != nil {
 		return "", err
 	}

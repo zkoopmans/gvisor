@@ -30,9 +30,9 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
@@ -101,6 +101,7 @@ type inode struct {
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
@@ -281,6 +282,11 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	fileType := linux.FileMode(stat.Mode).FileType()
+	if fileType == 0 && isHostEventFdDevice(stat.Dev) {
+		// This is an event fd. No inode needed.
+		vfsObj := mnt.Filesystem().VirtualFilesystem()
+		return eventfd.NewFromHost(ctx, vfsObj, hostFD, flags)
+	}
 	i, err := newInode(ctx, fs, hostFD, opts.Savable, opts.RestoreKey, fileType, opts.IsTTY, opts.Readonly)
 	if err != nil {
 		return nil, err
@@ -669,14 +675,7 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 
 	case unix.S_IFREG, unix.S_IFIFO, unix.S_IFCHR:
 		if i.isTTY {
-			fd := &TTYFileDescription{
-				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultReplicaTermios,
-			}
-			if task := kernel.TaskFromContext(ctx); task != nil {
-				fd.fgProcessGroup = task.ThreadGroup().ProcessGroup()
-				fd.session = fd.fgProcessGroup.Session()
-			}
+			fd := NewTTYFileDescription(i)
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
 			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
@@ -1033,4 +1032,29 @@ func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintp
 	}
 
 	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, sysno, args)
+}
+
+// hostEventFdDevice is the host device that host event fds are associated
+// with. It is calculated once lazily.
+var hostEventFdDevice uint64
+var hostEventFdDeviceOnce sync.Once
+
+// isHostEventFdDevice initializes hostEventFdDevice and compares it to the
+// given host device id.
+func isHostEventFdDevice(dev uint64) bool {
+	hostEventFdDeviceOnce.Do(func() {
+		efd, _, err := unix.RawSyscall(unix.SYS_EVENTFD2, 0, 0, 0)
+		if err != 0 {
+			log.Warningf("failed to create dummy eventfd: %v. Importing eventfds will fail", error(err))
+			return
+		}
+		defer unix.Close(int(efd))
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(efd), &stat); err != nil {
+			log.Warningf("failed to stat dummy eventfd: %v. Importing eventfds will fail", error(err))
+			return
+		}
+		hostEventFdDevice = stat.Dev
+	})
+	return dev == hostEventFdDevice
 }

@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,7 +34,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -194,7 +192,7 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
 	}
-	specBytes, err := ioutil.ReadAll(specFile)
+	specBytes, err := io.ReadAll(specFile)
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
 	}
@@ -274,7 +272,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 
 // ReadMounts reads mount list from a file.
 func ReadMounts(f *os.File) ([]specs.Mount, error) {
-	bytes, err := ioutil.ReadAll(f)
+	bytes, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("error reading mounts: %v", err)
 	}
@@ -359,7 +357,7 @@ func AllCapabilitiesUint64() uint64 {
 	return rv
 }
 
-// MergeCapabilities merges the capabilites from first and second.
+// MergeCapabilities merges the capabilities from first and second.
 func MergeCapabilities(first, second *specs.LinuxCapabilities) *specs.LinuxCapabilities {
 	return &specs.LinuxCapabilities{
 		Bounding:    mergeUnique(first.Bounding, second.Bounding),
@@ -456,7 +454,7 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 		if !ok {
 			return 0, fmt.Errorf("unknown capability %q", n)
 		}
-		// Should we skip this capabilty?
+		// Should we skip this capability?
 		if _, ok := skipSet[c]; ok {
 			continue
 		}
@@ -577,7 +575,7 @@ func TPUProxyIsEnabled(spec *specs.Spec, conf *config.Config) bool {
 // VFIOFunctionalityRequested returns true if the container should have access
 // to VFIO functionality.
 func VFIOFunctionalityRequested(dev *specs.LinuxDevice) bool {
-	return strings.HasPrefix(dev.Path, filepath.Dir(tpuproxy.VFIOPath))
+	return strings.HasPrefix(dev.Path, "/dev/vfio")
 }
 
 // AcceleratorFunctionalityRequested returns true if the container should have
@@ -680,7 +678,11 @@ func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 		return &ErrSymlinkMount{fmt.Errorf("failed to safely mount: expected to open %s, but found %s", dst, target)}
 	}
 
-	return unix.Mount(src, safePath, fstype, flags, data)
+	mountErr := unix.Mount(src, safePath, fstype, flags, data)
+	if mountErr != nil {
+		return fmt.Errorf("mount(%q, %q, %q, %#x, %q) failed: %w", src, safePath, fstype, flags, data, mountErr)
+	}
+	return nil
 }
 
 // RetryEintr retries the function until an error different than EINTR is
@@ -696,7 +698,7 @@ func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
 
 // GetOOMScoreAdj reads the given process' oom_score_adj
 func GetOOMScoreAdj(pid int) (int, error) {
-	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
 	if err != nil {
 		return 0, err
 	}

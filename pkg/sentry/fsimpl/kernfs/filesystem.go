@@ -155,6 +155,14 @@ func (fs *Filesystem) invalidateRemovedChildLocked(ctx context.Context, vfsObj *
 		d := toInvalidate[len(toInvalidate)-1]
 		toInvalidate = toInvalidate[:len(toInvalidate)-1]
 
+		if d.cached {
+			// The dentry is removed from the cache when its
+			// reference counter drops to 0. It can't be removed
+			// from the cache here, because fs.mu isn't locked for
+			// write.
+			d.IncRef()
+			fs.deferDecRef(d)
+		}
 		if d.inode.Keep() {
 			fs.deferDecRef(d)
 		}
@@ -915,6 +923,10 @@ func (fs *Filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 
 // StatAt implements vfs.FilesystemImpl.StatAt.
 func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
+	if rp.Done() && opts.Sync == linux.AT_STATX_DONT_SYNC {
+		return rp.Start().Impl().(*Dentry).inode.Stat(ctx, fs.VFSFilesystem(), opts)
+	}
+
 	fs.mu.RLock()
 	defer fs.processDeferredDecRefs(ctx)
 	defer fs.mu.RUnlock()
@@ -1089,9 +1101,12 @@ func (fs *Filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.
 func (fs *Filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDentry, b *fspath.Builder) error {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
-	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*Dentry), b)
+	return genericPrependPath(fs, vfsroot, vd.Mount(), vd.Dentry().Impl().(*Dentry), b)
+}
+
+// IsDescendant implements vfs.FilesystemImpl.IsDescendant.
+func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
+	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*Dentry))
 }
 
 func (fs *Filesystem) deferDecRefVD(ctx context.Context, vd vfs.VirtualDentry) {
@@ -1105,9 +1120,4 @@ func (fs *Filesystem) deferDecRefVD(ctx context.Context, vd vfs.VirtualDentry) {
 	} else {
 		vd.DecRef(ctx)
 	}
-}
-
-// IsDescendant implements vfs.FilesystemImpl.IsDescendant.
-func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
-	return genericIsDescendant(vfsroot.Dentry(), vd.Dentry().Impl().(*Dentry))
 }

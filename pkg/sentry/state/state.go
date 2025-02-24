@@ -16,6 +16,7 @@
 package state
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 
@@ -98,8 +99,17 @@ func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wat
 	if err != nil {
 		err = ErrStateFile{err}
 	} else {
+		var pagesMetadata io.Writer
+		if opts.PagesMetadata != nil {
+			// //pkg/state/wire writes one byte at a time; buffer these writes
+			// to avoid making one syscall per write. For the "main" state
+			// file, this buffering is handled by statefile.NewWriter() =>
+			// compressio.Writer or compressio.NewSimpleWriter().
+			pagesMetadata = bufio.NewWriter(opts.PagesMetadata)
+		}
+
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.MemoryFileSaveOpts)
+		err = k.SaveTo(ctx, wc, pagesMetadata, opts.PagesFile, opts.MemoryFileSaveOpts)
 
 		// ENOSPC is a state file error. This error can only come from
 		// writing the state file, and not from fs.FileOperations.Fsync
@@ -110,6 +120,11 @@ func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wat
 
 		if closeErr := wc.Close(); err == nil && closeErr != nil {
 			err = ErrStateFile{closeErr}
+		}
+		if pagesMetadata != nil {
+			if flushErr := pagesMetadata.(*bufio.Writer).Flush(); err == nil && flushErr != nil {
+				err = ErrStateFile{flushErr}
+			}
 		}
 	}
 	opts.Callback(err)
@@ -129,20 +144,43 @@ type LoadOpts struct {
 	// PagesFile is non-nil. Otherwise this content is stored in Source.
 	PagesFile *fd.FD
 
+	// If Background is true, the sentry may read from PagesFile after Load has
+	// returned.
+	Background bool
+
 	// Key is used for state integrity check.
 	Key []byte
 }
 
 // Load loads the given kernel, setting the provided platform and stack.
-func (opts LoadOpts) Load(ctx context.Context, k *kernel.Kernel, timeReady chan struct{}, n inet.Stack, clocks time.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
+//
+// Load takes ownership of (and unsets) opts.PagesFile.
+func (opts LoadOpts) Load(ctx context.Context, k *kernel.Kernel, timeReady chan struct{}, n inet.Stack, clocks time.Clocks, vfsOpts *vfs.CompleteRestoreOptions, saveRestoreNet bool) error {
+	defer func() {
+		if opts.PagesFile != nil {
+			opts.PagesFile.Close()
+			opts.PagesFile = nil
+		}
+	}()
+
 	// Open the file.
 	r, m, err := statefile.NewReader(opts.Source, opts.Key)
 	if err != nil {
 		return ErrStateFile{err}
 	}
+	var pagesMetadata io.Reader
+	if opts.PagesMetadata != nil {
+		// //pkg/state/wire reads one byte at a time; buffer these reads to
+		// avoid making one syscall per read. For the "main" state file, this
+		// buffering is handled by statefile.NewReader() => compressio.Reader
+		// or compressio.NewSimpleReader().
+		pagesMetadata = bufio.NewReader(opts.PagesMetadata)
+	}
 
 	previousMetadata = m
 
 	// Restore the Kernel object graph.
-	return k.LoadFrom(ctx, r, opts.PagesMetadata, opts.PagesFile, timeReady, n, clocks, vfsOpts)
+	err = k.LoadFrom(ctx, r, pagesMetadata, opts.PagesFile, opts.Background, timeReady, n, clocks, vfsOpts, saveRestoreNet)
+	opts.PagesFile = nil // transferred to k.LoadFrom()
+	return err
 }

@@ -21,10 +21,11 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 
 	// Import platforms that we need to precompile filters for.
-	_ "gvisor.dev/gvisor/runsc/boot/platforms"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms"
 )
 
 // Variable names used in precompiled filters.
@@ -57,7 +58,7 @@ func allPrecompiledPlatforms() ([]platform.SeccompInfo, error) {
 // precompile seccomp filters.
 func optionsToPrecompile() ([]Options, error) {
 	type expandFn func(opt Options) ([]Options, error)
-	opts := []Options{Options{}}
+	opts := []Options{{}}
 	for _, fn := range []expandFn{
 		// Expand all platforms.
 		func(opt Options) ([]Options, error) {
@@ -86,13 +87,22 @@ func optionsToPrecompile() ([]Options, error) {
 			return []Options{opt}, nil
 		},
 
-		// Expand NVProxy vs not.
+		// Expand NVProxy and its possible configurations.
 		func(opt Options) ([]Options, error) {
-			nvProxyYes := opt
-			nvProxyYes.NVProxy = true
+			// Add the "NVProxy disabled" configuration.
 			nvProxyNo := opt
 			nvProxyNo.NVProxy = false
-			return []Options{nvProxyYes, nvProxyNo}, nil
+			opts := []Options{nvProxyNo}
+
+			// Add a "yes NVProxy with this capability set" for each popular set
+			// of capabilities.
+			for _, caps := range nvconf.PopularCapabilitySets() {
+				optCopy := opt
+				optCopy.NVProxy = true
+				optCopy.NVProxyCaps = caps
+				opts = append(opts, optCopy)
+			}
+			return opts, nil
 		},
 
 		// Expand TPUProxy vs not.

@@ -16,17 +16,17 @@ package nvproxy
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *frontendFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+	// Nvidia kernel driver: kernel-open/nvidia/nv-mmap.c:nvidia_mmap_helper()
+	// requires vm_pgoff == 0, so trying to lazily fault any subset of the
+	// mapping that doesn't include the beginning will fail.
+	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
@@ -50,7 +50,7 @@ func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.M
 			Source: optional,
 			File:   &fd.memmapFile,
 			Offset: optional.Start,
-			Perms:  at,
+			Perms:  hostarch.AnyAccess,
 		},
 	}, nil
 }
@@ -75,11 +75,9 @@ func (mf *frontendFDMemmapFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 func (mf *frontendFDMemmapFile) DecRef(fr memmap.FileRange) {
 }
 
-// MapInternal implements memmap.File.MapInternal.
-func (mf *frontendFDMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
-	// FIXME(jamieliu): determine if this is safe
-	log.Traceback("nvproxy: rejecting frontendFDMemmapFile.MapInternal")
-	return safemem.BlockSeq{}, linuxerr.EINVAL
+// DataFD implements memmap.File.DataFD.
+func (mf *frontendFDMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
+	return mf.FD(), nil
 }
 
 // FD implements memmap.File.FD.

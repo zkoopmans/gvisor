@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
@@ -228,6 +229,7 @@ type rootInode struct {
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 	rootInodeRefs
 
 	locks vfs.FileLocks
@@ -242,8 +244,6 @@ type rootInode struct {
 	replicas map[uint32]*replicaInode
 
 	// nextIdx is the next pty index to use. Must be accessed atomically.
-	//
-	// TODO(b/29356795): reuse indices when ptys are closed.
 	nextIdx uint32
 }
 
@@ -265,7 +265,13 @@ func (i *rootInode) allocateTerminal(ctx context.Context, creds *auth.Credential
 	}
 
 	// Create the new terminal and replica.
-	t := newTerminal(idx)
+	t := &Terminal{
+		n:    idx,
+		root: i,
+	}
+	t.masterKTTY = kernel.NewTTY(idx, t)
+	t.replicaKTTY = kernel.NewTTY(idx, t)
+	t.ld = newLineDiscipline(linux.DefaultReplicaTermios, t)
 	replica := &replicaInode{
 		root: i,
 		t:    t,

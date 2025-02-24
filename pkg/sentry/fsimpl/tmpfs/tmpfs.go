@@ -20,11 +20,12 @@
 //	filesystem.mu
 //		inode.mu
 //		  regularFileFD.offMu
-//		    *** "memmap.Mappable locks" below this point
+//		    *** "memmap.Mappable/MappingIdentity locks" below this point
 //		    regularFile.mapsMu
 //		      *** "memmap.Mappable locks taken by Translate" below this point
 //		      regularFile.dataMu
 //		        fs.pagesUsedMu
+//		    filesystem.ancestryMu
 //		  directory.iterMu
 package tmpfs
 
@@ -41,11 +42,12 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -67,7 +69,7 @@ type filesystem struct {
 	mf *pgalloc.MemoryFile `state:".(string)"`
 
 	// clock is a realtime clock used to set timestamps in file operations.
-	clock time.Clock
+	clock ktime.Clock
 
 	// devMinor is the filesystem's minor device number. devMinor is immutable.
 	devMinor uint32
@@ -82,6 +84,10 @@ type filesystem struct {
 
 	// mu serializes changes to the Dentry tree.
 	mu filesystemRWMutex `state:"nosave"`
+
+	// ancestryMu additionally protects dentry.parent and dentry.name as
+	// required by genericfstree.
+	ancestryMu sync.RWMutex `state:"nosave"`
 
 	nextInoMinusOne atomicbitops.Uint64 // accessed using atomic memory operations
 
@@ -99,6 +105,9 @@ type filesystem struct {
 	// allowXattrPrefix is a set of xattr namespace prefixes that this
 	// tmpfs mount will allow. It is immutable.
 	allowXattrPrefix map[string]struct{}
+
+	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
+	ovlWhiteout *deviceFile
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -182,10 +191,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// also supports "security" and (if configured) POSIX ACL namespaces
 	// "system.posix_acl_access" and "system.posix_acl_default".
 	allowXattrPrefix := map[string]struct{}{
-		linux.XATTR_TRUSTED_PREFIX: struct{}{},
-		linux.XATTR_USER_PREFIX:    struct{}{},
+		linux.XATTR_TRUSTED_PREFIX: {},
+		linux.XATTR_USER_PREFIX:    {},
 		// The "security" namespace is allowed, but it always returns an error.
-		linux.XATTR_SECURITY_PREFIX: struct{}{},
+		linux.XATTR_SECURITY_PREFIX: {},
 	}
 
 	tmpfsOpts, tmpfsOptsOk := opts.InternalData.(FilesystemOpts)
@@ -279,7 +288,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if err != nil {
 		return nil, nil, err
 	}
-	clock := time.RealtimeClockFromContext(ctx)
+	clock := ktime.RealtimeClockFromContext(ctx)
 	memUsage := usage.Tmpfs
 	if tmpfsOpts.Usage != nil {
 		memUsage = *tmpfsOpts.Usage
@@ -321,6 +330,9 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.mu.Lock()
 	if fs.root.inode.isDir() {
 		fs.root.releaseChildrenLocked(ctx)
+	}
+	if fs.ovlWhiteout != nil {
+		fs.ovlWhiteout.inode.decLinksLocked(ctx)
 	}
 	fs.mu.Unlock()
 	if fs.mf.RestoreID() != "" {
@@ -436,14 +448,14 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 	// that d was deleted.
 	deleted := d.vfsd.IsDead()
 
-	d.inode.fs.mu.RLock()
+	d.inode.fs.ancestryMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
 	parent := d.parent.Load()
 	if parent != nil {
 		parent.inode.watches.Notify(ctx, d.name, events, cookie, et, deleted)
 	}
 	d.inode.watches.Notify(ctx, "", events, cookie, et, deleted)
-	d.inode.fs.mu.RUnlock()
+	d.inode.fs.ancestryMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.
@@ -527,7 +539,6 @@ func (i *inode) init(impl any, fs *filesystem, kuid auth.KUID, kgid auth.KGID, m
 //
 // Preconditions:
 //   - filesystem.mu must be locked for writing.
-//   - i.mu must be lcoked.
 //   - i.nlink != 0.
 //   - i.nlink < maxLinks.
 func (i *inode) incLinksLocked() {
@@ -545,7 +556,6 @@ func (i *inode) incLinksLocked() {
 //
 // Preconditions:
 //   - filesystem.mu must be locked for writing.
-//   - i.mu must be lcoked.
 //   - i.nlink != 0.
 func (i *inode) decLinksLocked(ctx context.Context) {
 	if i.nlink.RacyLoad() == 0 {

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
@@ -178,7 +177,7 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 			Args:         f.Args(),
 			Env:          os.Environ(),
 			Capabilities: specutils.AllCapabilities(),
-			Terminal:     console.IsPty(os.Stdin.Fd()),
+			Terminal:     console.StdioIsPty(),
 		},
 		Hostname: hostname,
 	}
@@ -207,7 +206,7 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 			conf.Network = config.NetworkHost
 
 		case nil:
-			// Setup successfull.
+			// Setup successful.
 			defer clean()
 
 		default:
@@ -381,7 +380,7 @@ func deviceMTU(dev string) (int, error) {
 }
 
 func makeFile(dest, content string, spec *specs.Spec) (string, error) {
-	tmpFile, err := ioutil.TempFile("", filepath.Base(dest))
+	tmpFile, err := os.CreateTemp("", filepath.Base(dest))
 	if err != nil {
 		return "", err
 	}
@@ -433,7 +432,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 	if err != nil {
 		return util.Errorf("Error to marshal spec: %v", err)
 	}
-	tmpDir, err := ioutil.TempDir("", "runsc-do")
+	tmpDir, err := os.MkdirTemp("", "runsc-do")
 	if err != nil {
 		return util.Errorf("Error to create tmp dir: %v", err)
 	}
@@ -443,7 +442,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 	conf.RootDir = tmpDir
 
 	cfgPath := filepath.Join(tmpDir, "config.json")
-	if err := ioutil.WriteFile(cfgPath, out, 0755); err != nil {
+	if err := os.WriteFile(cfgPath, out, 0755); err != nil {
 		return util.Errorf("Error write spec: %v", err)
 	}
 

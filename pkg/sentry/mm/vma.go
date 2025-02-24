@@ -126,7 +126,8 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		mlockMode:      opts.MLockMode,
 		numaPolicy:     linux.MPOL_DEFAULT,
 		id:             opts.MappingIdentity,
-		hint:           opts.Hint,
+		name:           opts.Name,
+		nameMut:        opts.NameMut,
 	}
 
 	vseg := mm.vmas.Insert(vgap, ar, v)
@@ -401,12 +402,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
-	vseg, vgap := mm.vmas.Find(ar.Start)
-	if vgap.Ok() {
-		vseg = vgap.NextSegment()
-	}
-	for vseg.Ok() && vseg.Start() < ar.End {
-		vseg = mm.vmas.Isolate(vseg, ar)
+	vgap := mm.vmas.RemoveRangeWith(ar, func(vseg vmaIterator) {
 		vmaAR := vseg.Range()
 		vma := vseg.ValuePtr()
 		if vma.mappable != nil {
@@ -422,9 +418,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 		if vma.mlockMode != memmap.MLockNone {
 			mm.lockedAS -= uint64(vmaAR.Length())
 		}
-		vgap = mm.vmas.Remove(vseg)
-		vseg = vgap.NextSegment()
-	}
+	})
 	return vgap, droppedIDs
 }
 
@@ -462,7 +456,7 @@ func (vmaSetFunctions) MaxKey() hostarch.Addr {
 func (vmaSetFunctions) ClearValue(vma *vma) {
 	vma.mappable = nil
 	vma.id = nil
-	vma.hint = ""
+	vma.name = ""
 	atomic.StoreUintptr(&vma.lastFault, 0)
 }
 
@@ -479,7 +473,8 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 		vma1.numaNodemask != vma2.numaNodemask ||
 		vma1.dontfork != vma2.dontfork ||
 		vma1.id != vma2.id ||
-		vma1.hint != vma2.hint {
+		vma1.name != vma2.name ||
+		vma1.nameMut != vma2.nameMut {
 		return vma{}, false
 	}
 
@@ -489,6 +484,13 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 		// need to worry about whether we're in a mm.mappingMu critical section.
 		vma2.id.DecRef(context.Background())
 	}
+
+	// If the existing vma (vma2) has non-zero lastFault address,
+	// we should preserve it to the resulting merged-VMA
+	if vma1.lastFault == 0 {
+		vma1.lastFault = vma2.lastFault
+	}
+
 	return vma1, true
 }
 

@@ -32,7 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/control"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
@@ -149,7 +149,7 @@ func (s *Socket) blockingAccept(t *kernel.Task, peerAddr *transport.Address) (tr
 	// Try to accept the connection; if it fails, then wait until we get a
 	// notification.
 	for {
-		if ep, err := s.ep.Accept(t, peerAddr); err != syserr.ErrWouldBlock {
+		if ep, err := s.ep.Accept(t, peerAddr, t.Kernel().UnixSocketOpts); err != syserr.ErrWouldBlock {
 			return ep, err
 		}
 
@@ -166,7 +166,7 @@ func (s *Socket) Accept(t *kernel.Task, peerRequested bool, flags int, blocking 
 	if peerRequested {
 		peerAddr = &transport.Address{}
 	}
-	ep, err := s.ep.Accept(t, peerAddr)
+	ep, err := s.ep.Accept(t, peerAddr, t.Kernel().UnixSocketOpts)
 	if err != nil {
 		if err != syserr.ErrWouldBlock || !blocking {
 			return 0, nil, 0, err
@@ -445,7 +445,7 @@ func (s *Socket) Endpoint() transport.Endpoint {
 
 // extractPath extracts and validates the address.
 func extractPath(sockaddr []byte) (string, *syserr.Error) {
-	addr, family, err := addressAndFamily(sockaddr)
+	addr, family, err := AddressAndFamily(sockaddr)
 	if err != nil {
 		if err == syserr.ErrAddressFamilyNotSupported {
 			err = syserr.ErrInvalidArgument
@@ -466,7 +466,9 @@ func extractPath(sockaddr []byte) (string, *syserr.Error) {
 	return p, nil
 }
 
-func addressAndFamily(addr []byte) (transport.Address, uint16, *syserr.Error) {
+// AddressAndFamily converts the addr byte slice to a transport.Address and
+// family. It supports only AF_UNIX addresses.
+func AddressAndFamily(addr []byte) (transport.Address, uint16, *syserr.Error) {
 	// Make sure we have at least 2 bytes for the address family.
 	if len(addr) < 2 {
 		return transport.Address{}, 0, syserr.ErrInvalidArgument
@@ -580,7 +582,7 @@ func (s *Socket) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr
 	defer ep.Release(t)
 
 	// Connect the server endpoint.
-	err = s.ep.Connect(t, ep)
+	err = s.ep.Connect(t, ep, t.Kernel().UnixSocketOpts)
 
 	if err == syserr.ErrWrongProtocolForSocket {
 		// Linux for abstract sockets returns ErrConnectionRefused

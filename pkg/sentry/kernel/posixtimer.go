@@ -19,7 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 )
 
 // IntervalTimer represents a POSIX interval timer as described by
@@ -27,7 +27,7 @@ import (
 //
 // +stateify savable
 type IntervalTimer struct {
-	timer *ktime.Timer
+	timer ktime.Timer
 
 	// If target is not nil, it receives signo from timer expirations. If group
 	// is true, these signals are thread-group-directed. These fields are
@@ -76,10 +76,8 @@ func (it *IntervalTimer) timerSettingChanged() {
 	if it.target == nil {
 		return
 	}
-	it.target.tg.pidns.owner.mu.RLock()
-	defer it.target.tg.pidns.owner.mu.RUnlock()
-	it.target.tg.signalHandlers.mu.Lock()
-	defer it.target.tg.signalHandlers.mu.Unlock()
+	sh := it.target.tg.signalLock()
+	defer sh.mu.Unlock()
 	it.sigorphan = true
 	it.overrunCur = 0
 	it.overrunLast = 0
@@ -116,19 +114,17 @@ func (it *IntervalTimer) signalRejectedLocked() {
 }
 
 // NotifyTimer implements ktime.TimerListener.NotifyTimer.
-func (it *IntervalTimer) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
+func (it *IntervalTimer) NotifyTimer(exp uint64) {
 	if it.target == nil {
-		return ktime.Setting{}, false
+		return
 	}
 
-	it.target.tg.pidns.owner.mu.RLock()
-	defer it.target.tg.pidns.owner.mu.RUnlock()
-	it.target.tg.signalHandlers.mu.Lock()
-	defer it.target.tg.signalHandlers.mu.Unlock()
+	sh := it.target.tg.signalLock()
+	defer sh.mu.Unlock()
 
 	if it.sigpending {
 		it.overrunCur += exp
-		return ktime.Setting{}, false
+		return
 	}
 
 	// sigpending must be set before sendSignalTimerLocked() so that it can be
@@ -147,8 +143,6 @@ func (it *IntervalTimer) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.S
 	if err := it.target.sendSignalTimerLocked(si, it.group, it); err != nil {
 		it.signalRejectedLocked()
 	}
-
-	return ktime.Setting{}, false
 }
 
 // IntervalTimerCreate implements timer_create(2).
@@ -221,7 +215,7 @@ func (t *Task) IntervalTimerCreate(c ktime.Clock, sigev *linux.Sigevent) (linux.
 			return 0, linuxerr.EINVAL
 		}
 	}
-	it.timer = ktime.NewTimer(c, it)
+	it.timer = c.NewTimer(it)
 
 	t.tg.timers[id] = it
 	return id, nil
@@ -253,7 +247,7 @@ func (t *Task) IntervalTimerSettime(id linux.TimerID, its linux.Itimerspec, abs 
 	if err != nil {
 		return linux.Itimerspec{}, err
 	}
-	tm, oldS := it.timer.SwapAnd(newS, it.timerSettingChanged)
+	tm, oldS := it.timer.Set(newS, it.timerSettingChanged)
 	its = ktime.ItimerspecFromSetting(tm, oldS)
 	return its, nil
 }

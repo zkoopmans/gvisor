@@ -273,7 +273,7 @@ type Context interface {
 	// Release() releases any resources associated with this context.
 	Release()
 
-	// PrepareSleep() is called when the tread switches to the
+	// PrepareSleep() is called when the thread switches to the
 	// interruptible sleep state.
 	PrepareSleep()
 }
@@ -455,9 +455,6 @@ func (f SegmentationFault) Error() string {
 
 // Requirements is used to specify platform specific requirements.
 type Requirements struct {
-	// RequiresCurrentPIDNS indicates that the sandbox has to be started in the
-	// current pid namespace.
-	RequiresCurrentPIDNS bool
 	// RequiresCapSysPtrace indicates that the sandbox has to be started with
 	// the CAP_SYS_PTRACE capability.
 	RequiresCapSysPtrace bool
