@@ -17,6 +17,8 @@ package imagegen_test
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +28,12 @@ import (
 // TestStableDiffusionXL generates an image with Stable Diffusion XL.
 func TestStableDiffusionXL(t *testing.T) {
 	ctx := context.Background()
+	if strings.HasPrefix(runtime.GOARCH, "arm") {
+		// TODO(zkoopmans): Fix me if/when facebook supports this:
+		// https://github.com/facebookresearch/xformers/issues/1071
+		t.Skipf("StableDiffusion not yet supported on arm.")
+	}
+
 	sdxl := stablediffusion.NewDockerXL(t)
 	generateCtx, generateCancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer generateCancel()

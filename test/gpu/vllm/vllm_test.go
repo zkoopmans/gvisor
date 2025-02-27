@@ -33,6 +33,7 @@ import (
 
 // BenchmarkVLLM runs a vLLM workload.
 func BenchmarkVLLM(b *testing.B) {
+	b.Logf("Starting test")
 	doVLLMTest(b)
 }
 
@@ -42,6 +43,7 @@ func doVLLMTest(b *testing.B) {
 		b.Fatalf("failed to get machine: %v", err)
 	}
 	defer serverMachine.CleanUp()
+	b.Log("started machine")
 
 	ctx := context.Background()
 	serverCtr := serverMachine.GetContainer(ctx, b)
@@ -49,6 +51,8 @@ func doVLLMTest(b *testing.B) {
 	if err := harness.DropCaches(serverMachine); err != nil {
 		b.Skipf("failed to drop caches: %v. You probably need root.", err)
 	}
+
+	b.Log("drop caches")
 
 	// Run vllm.
 	runOpts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{})
@@ -61,12 +65,18 @@ func doVLLMTest(b *testing.B) {
 	if err := serverCtr.Spawn(ctx, runOpts); err != nil {
 		b.Errorf("failed to run container: %v", err)
 	}
+
+	b.Logf("server spawn: %s", serverCtr.Name)
+
 	if out, err := serverCtr.WaitForOutput(ctx, "Uvicorn running on http://0.0.0.0:8000", 10*time.Minute); err != nil {
 		b.Fatalf("failed to start vllm model: %v %s", err, out)
 	}
 
+	b.Logf("wait for output")
+
 	b.Run("opt-125", func(b *testing.B) {
 		ctx := context.Background()
+		b.Log("opt-125")
 
 		b.ResetTimer()
 		b.StopTimer()
