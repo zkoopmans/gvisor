@@ -17,12 +17,17 @@ package smoke_test
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 )
 
-func TestGPUHello(t *testing.T) {
+func TestGPUVectorAdd(t *testing.T) {
+	if strings.HasPrefix(runtime.GOARCH, "arm") {
+		t.Skip("Test does not work on ARM due to cross compiling errors")
+	}
 	ctx := context.Background()
 	c := dockerutil.MakeContainer(ctx, t)
 	defer c.CleanUp(ctx)

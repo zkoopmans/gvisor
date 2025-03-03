@@ -17,6 +17,8 @@ package pytorch_test
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
@@ -25,6 +27,9 @@ import (
 // runPytorch runs the given script and command in a PyTorch container.
 func runPytorch(ctx context.Context, t *testing.T, scriptPath string, args ...string) {
 	t.Helper()
+	if strings.HasPrefix(runtime.GOARCH, "arm") {
+		t.Skip("pytorch not supported on ARM for now")
+	}
 	c := dockerutil.MakeContainer(ctx, t)
 	opts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{})
 	if err != nil {

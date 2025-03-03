@@ -16,6 +16,7 @@
 package sr_test
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,9 @@ import (
 func TestGPUCheckpointRestore(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint is not supported.")
+	}
+	if strings.HasPrefix(runtime.GOARCH, "arm") {
+		t.Skip("Test not yet supported on ARM due to cross compile errors")
 	}
 	dockerutil.EnsureDockerExperimentalEnabled()
 

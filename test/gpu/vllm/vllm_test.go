@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,9 @@ import (
 
 // BenchmarkVLLM runs a vLLM workload.
 func BenchmarkVLLM(b *testing.B) {
+	if strings.HasPrefix(runtime.GOARCH, "arm") {
+		b.Skip("VLLM not supported on ARM for now")
+	}
 	doVLLMTest(b)
 }
 
