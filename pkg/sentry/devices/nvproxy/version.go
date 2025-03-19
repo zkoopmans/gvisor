@@ -781,12 +781,50 @@ func Init() {
 			abi.allocationClass[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 
+			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_USERMODE_A] = allocHandler(rmAllocSimple[nvgpu.NV_HOPPER_USERMODE_A_PARAMS], compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_A] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics)
+			abi.allocationClass[nvgpu.BLACKWELL_COMPUTE_A] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_B] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics)
+			abi.allocationClass[nvgpu.BLACKWELL_COMPUTE_B] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], compUtil)
+			abi.allocationClass[nvgpu.NV20_SUBDEVICE_DIAG] = allocHandler(rmAllocNoParams, nvconf.CapVideo)
+			abi.allocationClass[nvgpu.NV04_DISPLAY_COMMON] = allocHandler(rmAllocNoParams, nvconf.CapVideo)
+			abi.allocationClass[nvgpu.BLACKWELL_DMA_COPY_A] = allocHandler(rmAllocSimple[nvgpu.NVB0B5_ALLOCATION_PARAMETERS], compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_DMA_COPY_B] = allocHandler(rmAllocSimple[nvgpu.NVB0B5_ALLOCATION_PARAMETERS], compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_GPU_LEGACY_NON_PRIVILEGED] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_CE_GET_CAPS_V2] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV00DE_CTRL_CMD_REQUEST_DATA_POLL] = ctrlHandler(rmControlSimple, compUtil)
+
 			prevStructs := abi.getStructs
 			abi.getStructs = func() *driverABIStructs {
 				structs := prevStructs()
 				structs.allocationStructs[nvgpu.TURING_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+
+				structs.controlStructs[nvgpu.NV2080_CTRL_CMD_CE_GET_CAPS_V2] = driverStructWithName(nvgpu.NV2080_CTRL_CE_GET_CAPS_V2_PARAMS{}, "NV2080_CTRL_CE_GET_CAPS_V2_PARAMS")
+
+				structs.allocationStructs[nvgpu.BLACKWELL_USERMODE_A] = driverStructs(nvgpu.NV_HOPPER_USERMODE_A_PARAMS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_A] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_COMPUTE_A] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_B] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_COMPUTE_B] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
+				structs.controlStructs[nvgpu.NV2080_CTRL_GPU_LEGACY_NON_PRIVILEGED] = driverStructWithName(nvgpu.RmapiParamNvU32List{}, "NV2080_CTRL_GPU_LEGACY_NON_PRIVILEGED_PARAMS")
+
+				structs.allocationStructs[nvgpu.BLACKWELL_DMA_COPY_A] = driverStructWithName(nvgpu.NVB0B5_ALLOCATION_PARAMETERS{}, "NVB0B5_ALLOCATION_PARAMETERS")
+				structs.allocationStructs[nvgpu.BLACKWELL_DMA_COPY_B] = driverStructWithName(nvgpu.NVB0B5_ALLOCATION_PARAMETERS{}, "NVB0B5_ALLOCATION_PARAMETERS")
+
+				structs.allocationStructs[nvgpu.NV20_SUBDEVICE_DIAG] = nil
+				structs.allocationStructs[nvgpu.NV04_DISPLAY_COMMON] = nil
+				structs.controlStructs[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = driverStructWithName(nvgpu.NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS{}, "NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS")
+				structs.controlStructs[nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM] = driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}, "NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS")
+				structs.controlStructs[nvgpu.NV00DE_CTRL_CMD_REQUEST_DATA_POLL] = driverStructWithName(nvgpu.NV00DE_CTRL_CMD_REQUEST_DATA_POLL_PARAMS{}, "NV00DE_CTRL_CMD_REQUEST_DATA_POLL_PARAMS")
 				return structs
 			}
 			return abi

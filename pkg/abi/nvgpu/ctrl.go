@@ -42,6 +42,26 @@ type NVXXXX_CTRL_XXX_INFO struct {
 	Data  uint32
 }
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h
+const (
+	NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT          = 0x20801358
+	NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT_DISABLED = 0x00000000
+	NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT_ENABLED  = 0x00000001
+
+	NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS_MESSAGE_ID = 0x58
+)
+
+// +marshal
+type NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS struct {
+	IsSupported uint32
+}
+
+// +marshal
+type NV2080_CTRL_CE_GET_CAPS_V2_PARAMS struct {
+	CeEngineType uint32
+	CapsTbl      [2]byte
+}
+
 // CtrlXxxInfoSize is sizeof(NVXXXX_CTRL_XXX_INFO).
 var CtrlXxxInfoSize = uint32((*NVXXXX_CTRL_XXX_INFO)(nil).SizeBytes())
 
@@ -455,6 +475,7 @@ type NV2080_CTRL_FIFO_DISABLE_CHANNELS_PARAMS struct {
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h:
 const (
 	NV2080_CTRL_CMD_GPU_GET_INFO_V2                      = 0x20800102
+	NV2080_CTRL_GPU_LEGACY_NON_PRIVILEGED                = 0x20810110
 	NV2080_CTRL_CMD_GPU_GET_NAME_STRING                  = 0x20800110
 	NV2080_CTRL_CMD_GPU_GET_SHORT_NAME_STRING            = 0x20800111
 	NV2080_CTRL_CMD_GPU_GET_SIMULATION_INFO              = 0x20800119
@@ -523,6 +544,17 @@ func (p *NV2080_CTRL_GR_GET_INFO_PARAMS) SetCtrlInfoList(ptr P64) {
 // CtrlInfoList implements HasCtrlInfoList.CtrlInfoList.
 func (p *NV2080_CTRL_GR_GET_INFO_PARAMS) CtrlInfoList() P64 {
 	return p.InfoList
+}
+
+const (
+	// From src/common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgpu.h
+	NV208F_CTRL_CMD_GPU_VERIFY_INFOROM = 0x208f1105
+)
+
+// +marshal
+type NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS struct {
+	Result   uint32
+	Checksum uint32
 }
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080mc.h:
