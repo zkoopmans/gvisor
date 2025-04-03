@@ -777,6 +777,9 @@ func Init() {
 
 		v570_86_15 := addDriverABI(570, 86, 15, "87709c19c7401243136bc0ec9e7f147c6803070a11449ae8f0819dee7963f76b", func() *driverABI {
 			abi := v565_57_01()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = ctrlHandler(rmControlSimple, compUtil)
+			abi.controlCmd[nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM] = ctrlHandler(rmControlSimple, compUtil)
+
 			abi.allocationClass[nvgpu.TURING_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
@@ -784,6 +787,10 @@ func Init() {
 			prevStructs := abi.getStructs
 			abi.getStructs = func() *driverABIStructs {
 				structs := prevStructs()
+
+				structs.controlStructs[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = simpleDriverStruct("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT")
+				structs.controlStructs[nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM] = driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}, "NV00FD_CTRL_ATTACH_GPU_PARAMS")
+
 				structs.allocationStructs[nvgpu.TURING_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
