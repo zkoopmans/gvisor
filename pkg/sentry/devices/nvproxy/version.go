@@ -363,7 +363,7 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:          allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.NV04_DISPLAY_COMMON:                allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 					nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM: allocHandler(rmAllocSimple[nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS], compUtil),
-					NV20_SUBDEVICE_DIAG:                      allocHandler(rmAllocNoParms, compUtil),
+					nvgpu.NV20_SUBDEVICE_DIAG:                allocHandler(rmAllocNoParams, compUtil),
 				},
 
 				getStructs: func() *driverABIStructs {
