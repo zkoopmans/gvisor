@@ -317,6 +317,17 @@ type NV0080_CTRL_GR_ROUTE_INFO struct {
 	Route uint64
 }
 
+const (
+	// From src/common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgpu.h
+	NV208F_CTRL_CMD_GPU_VERIFY_INFOROM = 0x208f1105
+)
+
+// +marshal
+type NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS struct {
+	Result   uint32
+	Checksum uint32
+}
+
 // NvxxxCtrlXxxGetInfoParams is used to represent the following:
 // - NV0080_CTRL_GR_GET_INFO_PARAMS
 // - NV2080_CTRL_FB_GET_INFO_PARAMS
