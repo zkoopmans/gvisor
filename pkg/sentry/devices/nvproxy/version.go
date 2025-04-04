@@ -363,6 +363,7 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:          allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.NV04_DISPLAY_COMMON:                allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 					nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM: allocHandler(rmAllocSimple[nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS], compUtil),
+					NV20_SUBDEVICE_DIAG:                      allocHandler(rmAllocNoParms, compUtil),
 				},
 
 				getStructs: func() *driverABIStructs {
@@ -623,8 +624,9 @@ func Init() {
 							nvgpu.GF100_SUBDEVICE_MASTER:             nil, // No params
 							nvgpu.TURING_USERMODE_A:                  nil, // No params
 							nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:          nil, // No params
-							nvgpu.NV04_DISPLAY_COMMON:                nil,
+							nvgpu.NV04_DISPLAY_COMMON:                nil, // No params
 							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM: driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}, "NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS"),
+							nvgpu.NV20_SUBDEVICE_DIAG:                nil, // No params
 						},
 					}
 				},

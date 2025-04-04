@@ -105,6 +105,7 @@ const (
 	HOPPER_A                         = 0x0000cb97
 	HOPPER_SEC2_WORK_LAUNCH_A        = 0x0000cba2
 	HOPPER_COMPUTE_A                 = 0x0000cbc0
+	NV20_SUBDEVICE_DIAG              = 0x0000208f
 	NV04_DISPLAY_COMMON              = 0x00000073
 )
 
