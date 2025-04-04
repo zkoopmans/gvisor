@@ -175,6 +175,17 @@ type NV2080_ALLOC_PARAMETERS struct {
 	SubDeviceID uint32
 }
 
+const (
+	// From src/common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgpu.h
+	NV208F_CTRL_CMD_GPU_VERIFY_INFOROM = 0x208f1105
+)
+
+// +marshal
+type NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS struct {
+	Result   uint32
+	Checksum uint32
+}
+
 // NV_CONTEXT_DMA_ALLOCATION_PARAMS is the alloc params type for various NV01_CONTEXT_DMA
 // allocation classes, from src/common/sdk/nvidia/inc/nvos.h.
 //
