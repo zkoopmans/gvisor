@@ -360,6 +360,7 @@ func Init() {
 					nvgpu.GF100_SUBDEVICE_MASTER:     allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.TURING_USERMODE_A:          allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  allocHandler(rmAllocNoParams, compUtil),
+					nvgpu.NV04_DISPLAY_COMMON:        allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 				},
 
 				getStructs: func() *driverABIStructs {
@@ -619,6 +620,7 @@ func Init() {
 							nvgpu.GF100_SUBDEVICE_MASTER:     nil, // No params
 							nvgpu.TURING_USERMODE_A:          nil, // No params
 							nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  nil, // No params
+							nvgpu.NV04_DISPLAY_COMMON:        nil,
 						},
 					}
 				},

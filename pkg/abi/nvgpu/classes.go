@@ -105,6 +105,7 @@ const (
 	HOPPER_A                         = 0x0000cb97
 	HOPPER_SEC2_WORK_LAUNCH_A        = 0x0000cba2
 	HOPPER_COMPUTE_A                 = 0x0000cbc0
+	NV04_DISPLAY_COMMON              = 0x00000073
 )
 
 // From src/common/sdk/nvidia/inc/class/cl0000.h:
