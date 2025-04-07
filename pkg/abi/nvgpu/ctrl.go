@@ -439,6 +439,11 @@ const (
 	NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT = 0x20801358
 )
 
+// +marshal
+type NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS struct {
+	IsSupported uint32
+}
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h:
 const (
 	NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS = 0x2080110b
