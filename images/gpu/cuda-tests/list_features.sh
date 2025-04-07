@@ -28,7 +28,7 @@ if [[ "${NVIDIA_DRIVER_CAPABILITIES:-}" != "all" ]]; then
 fi
 
 cd /
-nvcc list_features.cu -lcuda -o list_features
+nvcc list_features.cu -Wno-deprecated-gpu-targets -lcuda -o list_features 
 ./list_features
 
 # Detect GL by using a simple test that uses it as reference.

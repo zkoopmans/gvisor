@@ -18,23 +18,11 @@
 
 set -euo pipefail
 
+cmake . &>/dev/null
+
 (
   while IFS= read -r makefile_path; do
     dirname "$makefile_path"
   done < <(find /cuda-samples -type f -name Makefile) \
-    | grep -vE '^/cuda-samples$' | grep -vE '/7_libNVVM'
-
-  # cuda-samples/Samples/7_libNVVM is not structured like the other tests.
-  # It is built with `cmake` and generates multiple test binaries.
-  # The generated ones all follow the pattern of being named after their
-  # parent directory name, so we look for that.
-  pushd /cuda-samples/Samples/7_libNVVM &>/dev/null
-    cmake . &>/dev/null
-    make TARGET_ARCH="$(uname -m)" all &>/dev/null
-  popd &>/dev/null
-  while IFS= read -r dir_path; do
-    if [[ -x "$dir_path/$(basename "$dir_path")" ]]; then
-      echo "$dir_path"
-    fi
-  done < <(find /cuda-samples/Samples/7_libNVVM -type d) | sort | uniq
+    | grep -vE '^/cuda-samples$' 
 ) | sed 's~/cuda-samples/Samples/~~' | sort
