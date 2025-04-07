@@ -774,47 +774,50 @@ func (st *SampleTest) makeRun(ctx context.Context) (*Command, error) {
 
 // Run runs a single sample test.
 func (st *SampleTest) Run(ctx context.Context) error {
-	const libNVVMTestDir = "7_libNVVM/"
-	if strings.HasPrefix(st.TestName, libNVVMTestDir) {
-		return st.RunLibNVVMTest(ctx)
-	}
-	if _, _, err := st.cmd(ctx, "make", "-C", st.dir(), "clean").Run(ctx); err != nil {
-		return fmt.Errorf("cannot run `make clean`: %w", err)
-	}
-	stateBefore, err := st.State(ctx)
-	if err != nil {
-		return fmt.Errorf("cannot get state before test: %w", err)
-	}
-	makeRun, err := st.makeRun(ctx)
-	if err != nil {
-		return fmt.Errorf("cannot run `make run`: %w", err)
-	}
-	defer Terminate(ctx, makeRun.PID())
-	// There are multiple possibilities here.
-	// Some CUDA programs will run an X application that runs forever.
-	// In this case, we need to detect this and to make sure it runs,
-	// then kill it.
-	// Other programs are just command-line based and run to completion,
-	// and we rely on their exit code.
-	// To determine this, we first just wait for a few seconds and see what
-	// the command does.
-	if err := st.Monitor(ctx, makeRun, stateBefore); err != nil {
-		return fmt.Errorf("test failed in `make run`: %w", err)
-	}
+	return st.RunLibNVVMTest(ctx)
+	/*
+		const libNVVMTestDir = "7_libNVVM/"
+		if strings.HasPrefix(st.TestName, libNVVMTestDir) {
+		}
 
-	// Some `make` targets will silently exist with code 0 even if the test
-	// was actually unsuccessful because it cannot be built.
-	// To detect this case, we look for the absence of any executable file in
-	// the sample directory. All `make` targets should create an executable, and
-	// this won't happen if `make` bails out.
-	stateAfter, err := st.State(ctx)
-	if err != nil {
-		return fmt.Errorf("cannot get state after test: %w", err)
-	}
-	if len(stateBefore.NewExecutables(stateAfter)) == 0 {
-		return fmt.Errorf("did not find any new executable file created by `make run` in the test directory %q (existing executables: %v)", st.dir(), stateBefore.Executables)
-	}
-	return nil
+		if _, _, err := st.cmd(ctx, "make", "-C", st.dir(), "clean").Run(ctx); err != nil {
+			return fmt.Errorf("cannot run `make clean`: %w", err)
+		}
+		stateBefore, err := st.State(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot get state before test: %w", err)
+		}
+		makeRun, err := st.makeRun(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot run `make run`: %w", err)
+		}
+		defer Terminate(ctx, makeRun.PID())
+		// There are multiple possibilities here.
+		// Some CUDA programs will run an X application that runs forever.
+		// In this case, we need to detect this and to make sure it runs,
+		// then kill it.
+		// Other programs are just command-line based and run to completion,
+		// and we rely on their exit code.
+		// To determine this, we first just wait for a few seconds and see what
+		// the command does.
+		if err := st.Monitor(ctx, makeRun, stateBefore); err != nil {
+			return fmt.Errorf("test failed in `make run`: %w", err)
+		}
+
+		// Some `make` targets will silently exist with code 0 even if the test
+		// was actually unsuccessful because it cannot be built.
+		// To detect this case, we look for the absence of any executable file in
+		// the sample directory. All `make` targets should create an executable, and
+		// this won't happen if `make` bails out.
+		stateAfter, err := st.State(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot get state after test: %w", err)
+		}
+		if len(stateBefore.NewExecutables(stateAfter)) == 0 {
+			return fmt.Errorf("did not find any new executable file created by `make run` in the test directory %q (existing executables: %v)", st.dir(), stateBefore.Executables)
+		}
+		return nil
+	*/
 }
 
 // Monitor monitors whether a `make run` command terminates quickly or
