@@ -16,7 +16,6 @@
 package boot
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,8 +23,8 @@ import (
 	"strconv"
 	gtime "time"
 
+	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
@@ -505,8 +504,10 @@ func New(args Args) (*Loader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
-	if specutils.NVProxyEnabled(args.Spec, args.Conf) && p.OwnsPageTables() {
-		return nil, fmt.Errorf("--nvproxy is incompatible with platform %s: owns page tables", args.Conf.Platform)
+	if args.Conf.Platform == "kvm" && specutils.NVProxyEnabled(args.Spec, args.Conf) {
+		if caps, err := specutils.NVProxyDriverCapsAllowed(args.Conf); err == nil && caps&nvconf.CapCompute != 0 {
+			log.Warningf("Application cudaMallocManaged() is flaky on -platform=kvm, see gvisor.dev/docs/user_guide/gpu/#platforms")
+		}
 	}
 	l.k = &kernel.Kernel{Platform: p}
 
@@ -2012,34 +2013,9 @@ func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 	return RuntimeStateStopped
 }
 
-// addContainerSpecsToCheckpoint adds the container specs to the kernel.
-func (l *Loader) addContainerSpecsToCheckpoint() {
+// GetContainerSpecs returns the container specs map.
+func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	l.mu.Lock()
-	s := l.containerSpecs
-	l.mu.Unlock()
-
-	specsMap := make(map[string][]byte)
-	for k, v := range s {
-		data, err := json.Marshal(v)
-		if err != nil {
-			log.Warningf("json marshal error for specs %v", err)
-			return
-		}
-		specsMap[k] = data
-	}
-	l.k.AddStateToCheckpoint(containerSpecsKey, specsMap)
-}
-
-// popContainerSpecsFromCheckpoint pops all the container specs from the kernel.
-func popContainerSpecsFromCheckpoint(k *kernel.Kernel) (map[string]*specs.Spec, error) {
-	specsMap := (k.PopCheckpointState(containerSpecsKey)).(map[string][]byte)
-	oldSpecs := make(map[string]*specs.Spec)
-	for k, v := range specsMap {
-		var s specs.Spec
-		if err := json.Unmarshal(v, &s); err != nil {
-			return nil, fmt.Errorf("json unmarshal error for specs %v", err)
-		}
-		oldSpecs[k] = &s
-	}
-	return oldSpecs, nil
+	defer l.mu.Unlock()
+	return l.containerSpecs
 }

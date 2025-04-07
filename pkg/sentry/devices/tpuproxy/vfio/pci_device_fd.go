@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/util"
@@ -67,7 +68,9 @@ func (fd *pciDeviceFD) Release(context.Context) {
 	}
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
-	unix.Close(int(fd.hostFD))
+	if err := unix.Close(int(fd.hostFD)); err != nil {
+		log.Warningf("close(%d) pciDeviceFD failed: %v", fd.hostFD, err)
+	}
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -285,12 +288,13 @@ func (fd *pciDeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
 	}
-	buf := make([]byte, dst.NumBytes())
 	if fd.isRestored() {
-		_, err := unix.Pread(int(fd.hostFD), buf, offset)
-		if err != nil {
-			return 0, err
-		}
+		return int64(dst.NumBytes()), nil
+	}
+	buf := make([]byte, dst.NumBytes())
+	_, err := unix.Pread(int(fd.hostFD), buf, offset)
+	if err != nil {
+		return 0, err
 	}
 	n, err := dst.CopyOut(ctx, buf)
 	return int64(n), err
@@ -298,11 +302,11 @@ func (fd *pciDeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset
 
 // PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (fd *pciDeviceFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
-	if fd.isRestored() {
-		return src.NumBytes(), nil
-	}
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
+	}
+	if fd.isRestored() {
+		return src.NumBytes(), nil
 	}
 	buf := make([]byte, src.NumBytes())
 	_, err := src.CopyIn(ctx, buf)

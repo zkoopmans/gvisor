@@ -35,7 +35,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
-	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -62,6 +61,9 @@ const (
 	VersionKey = "runsc_version"
 	// ContainerCountKey is the key used to save number of containers in the save metadata.
 	ContainerCountKey = "container_count"
+	// ContainerSpecsKey is the key used to add and pop the container specs to the
+	// metadata during save/restore.
+	ContainerSpecsKey = "container_specs"
 )
 
 // restorer manages a restore session for a sandbox. It stores information about
@@ -78,20 +80,32 @@ type restorer struct {
 	// containers is the list of containers restored so far.
 	containers []*containerInfo
 
-	// Files used by restore to rehydrate the state.
-	stateFile     io.ReadCloser
-	pagesMetadata *fd.FD
-	pagesFile     *fd.FD
+	// stateFile is a reader for the statefile.
+	stateFile io.ReadCloser
 
 	// If background is true, pagesFile may continue to be read after
 	// restorer.restore() returns.
 	background bool
+
+	// mainMF is the main MemoryFile of the sandbox.
+	// It is created as soon as possible, and may be restored to as soon as
+	// the first container is restored, which is earlier than when the sandbox's
+	// kernel object is created.
+	mainMF *pgalloc.MemoryFile
+
+	// pagesFileLoader is used to load the MemoryFile pages. It handles the
+	// possibly-asynchronous loading of the memory pages.
+	pagesFileLoader kernel.PagesFileLoader
 
 	// deviceFile is the required to start the platform.
 	deviceFile *fd.FD
 
 	// restoreDone is a callback triggered when restore is successful.
 	restoreDone func() error
+
+	// checkpointedSpecs contains the map of container specs used during
+	// checkpoint.
+	checkpointedSpecs map[string]*specs.Spec
 }
 
 func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []GoferMountConf) error {
@@ -133,6 +147,10 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	}
 
 	if len(r.containers) == r.totalContainers {
+		if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
+			return fmt.Errorf("failed to handle restore spec validation: %w", err)
+		}
+
 		// Trigger the restore if this is the last container.
 		return r.restore(l)
 	}
@@ -175,12 +193,7 @@ func (r *restorer) restore(l *Loader) error {
 	l.k = &kernel.Kernel{
 		Platform: p,
 	}
-
-	mf, err := createMemoryFile(l.root.conf.AppHugePages, l.hostTHP)
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
-	}
-	l.k.SetMemoryFile(mf)
+	l.k.SetMemoryFile(r.mainMF)
 
 	if l.root.conf.ProfileEnable {
 		// pprof.Initialize opens /proc/self/maps, so has to be called before
@@ -232,24 +245,8 @@ func (r *restorer) restore(l *Loader) error {
 	ctx = context.WithValue(ctx, devutil.CtxDevGoferClientProvider, l.k)
 
 	// Load the state.
-	loadOpts := state.LoadOpts{
-		Source:        r.stateFile,
-		PagesMetadata: r.pagesMetadata,
-		PagesFile:     r.pagesFile,
-		Background:    r.background,
-	}
-	err = loadOpts.Load(ctx, l.k, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet)
-	r.pagesFile = nil // transferred to loadOpts.Load()
-	if err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.pagesFileLoader, r.background, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
-	}
-
-	oldSpecs, err := popContainerSpecsFromCheckpoint(l.k)
-	if err != nil {
-		return fmt.Errorf("failed to pop container specs from checkpoint: %w", err)
-	}
-	if err := specutils.RestoreValidateSpec(oldSpecs, l.containerSpecs, l.root.conf); err != nil {
-		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
 
 	// Since we have a new kernel we also must make a new watchdog.
@@ -318,12 +315,6 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	r.stateFile.Close()
-	if r.pagesFile != nil {
-		r.pagesFile.Close()
-	}
-	if r.pagesMetadata != nil {
-		r.pagesMetadata.Close()
-	}
 
 	go func() {
 		if err := postRestoreImpl(l); err != nil {
@@ -362,7 +353,11 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 	o.Metadata[VersionKey] = version.Version()
 
 	// Save container specs.
-	l.addContainerSpecsToCheckpoint()
+	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
+	if err != nil {
+		return err
+	}
+	o.Metadata[ContainerSpecsKey] = specsStr
 
 	if err := preSaveImpl(l, o); err != nil {
 		return err
