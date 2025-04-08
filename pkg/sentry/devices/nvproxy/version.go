@@ -304,6 +304,7 @@ func Init() {
 					nvgpu.NV503C_CTRL_CMD_REGISTER_VA_SPACE:                                ctrlHandler(ctrlRegisterVASpace, compUtil),
 					nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               ctrlHandler(rmControlSimple, compUtil),
 					0x20810110:                                                             ctrlHandler(rmControlSimple, compUtil), // Unknown
+					0xa0830104:                                                             ctrlHandler(rmControlSimple, compUtil), // Unknown
 				},
 				allocationClass: map[nvgpu.ClassID]allocationClassHandler{
 					nvgpu.NV01_ROOT:                  allocHandler(rmAllocRootClient, compUtil),
@@ -364,6 +365,7 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.NV04_DISPLAY_COMMON:        allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 					nvgpu.NV20_SUBDEVICE_DIAG:        allocHandler(rmAllocNoParams, compUtil),
+					0xa083:                           nil, // Unknown params
 				},
 
 				getStructs: func() *driverABIStructs {
@@ -565,8 +567,10 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_GR_GET_INFO:                                      driverStructs(nvgpu.NV2080_CTRL_GR_GET_INFO_PARAMS{}),
 							nvgpu.NV2080_CTRL_CMD_FB_GET_INFO:                                      driverStructWithName(nvgpu.NvxxxCtrlXxxGetInfoParams{}, "NV2080_CTRL_FB_GET_INFO_PARAMS"),
 							nvgpu.NV503C_CTRL_CMD_REGISTER_VA_SPACE:                                driverStructs(nvgpu.NV503C_CTRL_REGISTER_VA_SPACE_PARAMS{}),
-							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}, "NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS"),
-							0x20810110:                                                             nil, // no params
+							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}),
+							0x20810110:                                                             nil, // unknown, paramsSize == TODO(zkoopmans)
+							0x20810107:                                                             nil, // unknown, paramsSize == TODO(ayushranjan)
+							0xa0830104:                                                             nil, // unknown, paramsSize == TODO(zkoopmans)
 						},
 						allocationStructs: map[nvgpu.ClassID][]DriverStruct{
 							nvgpu.NV01_ROOT:                  driverStructWithName(nvgpu.Handle{}, "NvHandle"),
@@ -627,6 +631,7 @@ func Init() {
 							nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  nil, // No params
 							nvgpu.NV04_DISPLAY_COMMON:        nil, // No params
 							nvgpu.NV20_SUBDEVICE_DIAG:        nil, // No params
+							0xa083:                           nil, // Unknown params
 						},
 					}
 				},
