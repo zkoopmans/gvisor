@@ -365,7 +365,7 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:  allocHandler(rmAllocNoParams, compUtil),
 					nvgpu.NV04_DISPLAY_COMMON:        allocHandler(rmAllocNoParams, nvconf.CapGraphics),
 					nvgpu.NV20_SUBDEVICE_DIAG:        allocHandler(rmAllocNoParams, compUtil),
-					0xa083:                           nil, // Unknown params
+					0xa083:                           allocHandler(rmAllocNoParams, compUtil),
 				},
 
 				getStructs: func() *driverABIStructs {
@@ -567,9 +567,8 @@ func Init() {
 							nvgpu.NV2080_CTRL_CMD_GR_GET_INFO:                                      driverStructs(nvgpu.NV2080_CTRL_GR_GET_INFO_PARAMS{}),
 							nvgpu.NV2080_CTRL_CMD_FB_GET_INFO:                                      driverStructWithName(nvgpu.NvxxxCtrlXxxGetInfoParams{}, "NV2080_CTRL_FB_GET_INFO_PARAMS"),
 							nvgpu.NV503C_CTRL_CMD_REGISTER_VA_SPACE:                                driverStructs(nvgpu.NV503C_CTRL_REGISTER_VA_SPACE_PARAMS{}),
-							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               driverStructWithName(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}),
+							nvgpu.NV208F_CTRL_CMD_GPU_VERIFY_INFOROM:                               driverStructs(nvgpu.NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS{}),
 							0x20810110:                                                             nil, // unknown, paramsSize == TODO(zkoopmans)
-							0x20810107:                                                             nil, // unknown, paramsSize == TODO(ayushranjan)
 							0xa0830104:                                                             nil, // unknown, paramsSize == TODO(zkoopmans)
 						},
 						allocationStructs: map[nvgpu.ClassID][]DriverStruct{
