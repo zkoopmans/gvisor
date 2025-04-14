@@ -385,6 +385,14 @@ const (
 	NV0080_CTRL_CMD_NVJPG_GET_CAPS_V2 = 0x801f02
 )
 
+const (
+	NV00DE_CTRL_CMD_REQUEST_DATA_POLL = 0xde0001
+)
+
+type NV00DE_CTRL_CMD_REQUEST_DATA_POLL_PARAMS struct {
+	PolledDataMask uint32
+}
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrl00f8.h:
 const (
 	NV00F8_CTRL_CMD_ATTACH_MEM = 0xf80103
