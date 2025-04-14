@@ -770,7 +770,7 @@ func Init() {
 		// 560.28.03 is an intermediate unqualified version from the main branch.
 		v560_28_03 := func() *driverABI {
 			abi := v555_42_02()
-			abi.allocationClass[nvgpu.NVCDB0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+
 			prevStructs := abi.getStructs
 			abi.getStructs = func() *driverABIStructs {
 				structs := prevStructs()
