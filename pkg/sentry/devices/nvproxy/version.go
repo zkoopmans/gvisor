@@ -784,11 +784,19 @@ func Init() {
 		// 560.28.03 is an intermediate unqualified version from the main branch.
 		v560_28_03 := func() *driverABI {
 			abi := v555_42_02()
+			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannel, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_DMA_COPY_A] = allocHandler(rmAllocSimple[nvgpu.NVB0B5_ALLOCATION_PARAMETERS], compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_A] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics)
+			// abi.allocationClass[nvgpu.BLACKWELL_COMPUTE_A] = nil
 			abi.allocationClass[nvgpu.NVCDB0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			prevStructs := abi.getStructs
 			abi.getStructs = func() *driverABIStructs {
 				structs := prevStructs()
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = driverStructs(nvgpu.NV_CHANNEL_ALLOC_PARAMS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_DMA_COPY_A] = driverStructs(nvgpu.NVB0B5_ALLOCATION_PARAMETERS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_A] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
 				structs.allocationStructs[nvgpu.NVCDB0_VIDEO_DECODER] = driverStructs(nvgpu.NV_BSP_ALLOCATION_PARAMETERS{})
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = driverStructs(nvgpu.NV_CHANNEL_ALLOC_PARAMS{})
 				return structs
 			}
 			return abi
@@ -804,6 +812,9 @@ func Init() {
 			abi.allocationClass[nvgpu.TURING_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
 			abi.allocationClass[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = allocHandler(rmAllocChannelV570, compUtil)
+			abi.allocationClass[nvgpu.BLACKWELL_B] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], nvconf.CapGraphics)
 
 			prevStructs := abi.getStructs
 			abi.getStructs = func() *driverABIStructs {
@@ -813,6 +824,9 @@ func Init() {
 				structs.allocationStructs[nvgpu.TURING_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.AMPERE_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
 				structs.allocationStructs[nvgpu.HOPPER_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_A] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.BLACKWELL_CHANNEL_GPFIFO_B] = driverStructWithName(nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570{}, "NV_CHANNEL_ALLOC_PARAMS")
+				structs.allocationStructs[nvgpu.BLACKWELL_B] = driverStructs(nvgpu.NV_GR_ALLOCATION_PARAMETERS{})
 				return structs
 			}
 			return abi
