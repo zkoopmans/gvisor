@@ -92,7 +92,7 @@ func TestCUDASmokeTests(t *testing.T) {
 	}
 
 	image := "gpu/cuda-tests"
-	if cudaVersion.IsAtLeast(dockerutil.CudaVersion{
+	if cudaVersion.IsAtLeast(&dockerutil.CudaVersion{
 		Major: 12,
 		Minor: 8,
 	}) {
