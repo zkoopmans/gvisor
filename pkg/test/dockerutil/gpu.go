@@ -16,9 +16,13 @@
 package dockerutil
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
+	"testing"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
@@ -225,4 +229,63 @@ func NumGPU() int {
 		numGPU++
 	}
 	return numGPU
+}
+
+// CudaVersion represents a cuda version.
+type CudaVersion struct {
+	Major int64
+	Minor int64
+}
+
+func (c *CudaVersion) IsAtLeast(other *CudaVersion) bool {
+	if c.Major > other.Major {
+		return true
+	}
+
+	if c.Major < other.Major {
+		return false
+	}
+
+	return c.Minor >= other.Minor
+}
+
+var cudaRE = regexp.MustCompile(`CUDA\s*Version\s*:\s*(\d+)\.(\d+)`)
+
+func NewCudaVersionFromOutput(out string) (*CudaVersion, error) {
+	parts := cudaRE.FindStringSubmatch(out)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("CUDA version not found in output: %v", parts)
+	}
+
+	major, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse major version %q: %v", parts[1], err)
+	}
+
+	minor, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse major version %q: %v", parts[2], err)
+	}
+
+	return &CudaVersion{Major: major, Minor: minor}, err
+}
+
+func GetCudaVersion(ctx context.Context, t *testing.T) (*CudaVersion, error) {
+	c := MakeContainer(ctx, t)
+	defer c.CleanUp(ctx)
+	opts, err := GPURunOpts(SniffGPUOpts{
+		DisableSnifferReason: "Get CUDA Version",
+		Capabilities:         "all",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not create opts: %w", err)
+	}
+	opts.Image = "gpu/cuda-tests"
+
+	out, err := c.Run(ctx, opts, "nvidia-smi", "--version")
+	if err != nil {
+		return nil, fmt.Errorf("failed to run container: %w", err)
+	}
+
+	return NewCudaVersionFromOutput(out)
 }
