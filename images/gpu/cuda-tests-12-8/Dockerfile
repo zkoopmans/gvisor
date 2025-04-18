@@ -26,16 +26,11 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
       llvm \
       mpich \
       pkg-config \
+      vim \
       x11-xserver-utils \
       xdotool \
       xvfb \
-      zlib1g zlib1g-dev \
-    && \
-    chmod 555 /*.sh 
-
-# From: https://github.com/NVIDIA/cuda-samples/releases
-# Ideally, pick a release that matches the CUDA version of the image above.
-ARG CUDA_SAMPLES_VERSION=v12.8
+      zlib1g zlib1g-dev
 
 RUN git clone --depth=1 --branch="$CUDA_SAMPLES_VERSION" --single-branch \
       https://github.com/NVIDIA/cuda-samples.git /cuda-samples
@@ -44,13 +39,17 @@ RUN apt install -y wget && apt -y purge golang*
 
 RUN wget https://go.dev/dl/go1.24.1.linux-amd64.tar.gz && tar -C /usr/local -xzf go1.24.1.linux-amd64.tar.gz && \
    ln -s /usr/local/go/bin/go /usr/local/bin/go
+
+ADD *.cu *.h *.sh *.go *.cc /
+
+RUN chmod 555 /*.sh 
+
 RUN export GO111MODULE=on; go install \
       github.com/TheZoraiz/ascii-image-converter@d05a757c5e02ab23e97b6f6fca4e1fbeb10ab559 && \
     mv "$HOME/go/bin/ascii-image-converter" /usr/bin/ && \
     gcc -o /unsupported_ioctl /unsupported_ioctl.cc && \
     go build -o /run_sample /run_sample.go
 
-COPY *.cu *.h *.sh *.go *.cc /
 
 # Override entrypoint to nothing, otherwise all invocations will have
 # a copyright notice printed, which breaks parsing the stdout logs.
