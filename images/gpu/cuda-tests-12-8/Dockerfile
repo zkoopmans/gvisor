@@ -5,7 +5,6 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_SAMPLES_VERSION=v12.8
 
 WORKDIR /
-COPY *.cu *.h *.sh *.go *.cc /
 ENV PATH=$PATH:/usr/local/nvidia/bin
 RUN export DEBIAN_FRONTEND=noninteractive; \
     apt-get update && \
@@ -50,6 +49,8 @@ RUN export GO111MODULE=on; go install \
     mv "$HOME/go/bin/ascii-image-converter" /usr/bin/ && \
     gcc -o /unsupported_ioctl /unsupported_ioctl.cc && \
     go build -o /run_sample /run_sample.go
+
+COPY *.cu *.h *.sh *.go *.cc /
 
 # Override entrypoint to nothing, otherwise all invocations will have
 # a copyright notice printed, which breaks parsing the stdout logs.
