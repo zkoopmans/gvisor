@@ -17,12 +17,40 @@ package smoke_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/bazel-gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 )
 
-/*
+func TestGPUHello(t *testing.T) {
+	ctx := context.Background()
+	version, err := dockerutil.GetCudaVersion(ctx, t)
+	if err != nil {
+		t.Fatalf("Failed to get cuda version: %v", err)
+	}
+
+	c := dockerutil.MakeContainer(ctx, t)
+	defer c.CleanUp(ctx)
+
+	opts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{
+		Capabilities: "all",
+	})
+	if err != nil {
+		t.Fatalf("failed to get GPU run options: %v", err)
+	}
+	opts.Image = "gpu/cuda-tests"
+	if version.IsAtLeast(&dockerutil.CudaVersion{Major: 12, Minor: 8}) {
+		t.Logf("Cuda Version at least 12.8")
+		opts.Image = "gpu/cuda-tests-12-8"
+	}
+	out, err := c.Run(ctx, opts, "/run_sample", "--timeout=120s", "0_Introduction/vectorAdd")
+	t.Logf("0_Introduction/vectorAdd output: %s", string(out))
+	if err != nil {
+		t.Fatalf("could not run 0_Introduction/vectorAdd: %v", err)
+	}
+}
 
 func TestNvidiaSmi(t *testing.T) {
 	ctx := context.Background()
@@ -47,25 +75,6 @@ func TestNvidiaSmi(t *testing.T) {
 	}
 }
 
-func TestGPUHello(t *testing.T) {
-	ctx := context.Background()
-	c := dockerutil.MakeContainer(ctx, t)
-	defer c.CleanUp(ctx)
-
-	opts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{
-		Capabilities: "all",
-	})
-	if err != nil {
-		t.Fatalf("failed to get GPU run options: %v", err)
-	}
-	opts.Image = "gpu/cuda-tests"
-	out, err := c.Run(ctx, opts, "/run_sample", "--timeout=120s", "0_Introduction/vectorAdd")
-	t.Logf("0_Introduction/vectorAdd output: %s", string(out))
-	if err != nil {
-		t.Fatalf("could not run 0_Introduction/vectorAdd: %v", err)
-	}
-}
-
 func TestCUDASmokeTests(t *testing.T) {
 	ctx := context.Background()
 	c := dockerutil.MakeContainer(ctx, t)
@@ -76,37 +85,6 @@ func TestCUDASmokeTests(t *testing.T) {
 		t.Fatalf("failed to get GPU run options: %v", err)
 	}
 	opts.Image = "gpu/cuda-tests"
-	out, err := c.Run(ctx, opts, "/run_smoke.sh")
-	t.Logf("cuda-tests smoke tests output: %s", string(out))
-	if err != nil {
-		t.Fatalf("could not run cuda-tests smoke tests: %v", err)
-	}
-}
-*/
-
-func TestCUDASmokeTests(t *testing.T) {
-	ctx := context.Background()
-	cudaVersion, err := dockerutil.GetCudaVersion(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to get cuda version: %v", err)
-	}
-
-	image := "gpu/cuda-tests"
-	if cudaVersion.IsAtLeast(&dockerutil.CudaVersion{
-		Major: 12,
-		Minor: 8,
-	}) {
-		image = "gpu/cuda-tests-12-8"
-	}
-
-	c := dockerutil.MakeContainer(ctx, t)
-	defer c.CleanUp(ctx)
-
-	opts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{AllowIncompatibleIoctl: true})
-	if err != nil {
-		t.Fatalf("failed to get GPU run options: %v", err)
-	}
-	opts.Image = image
 	out, err := c.Run(ctx, opts, "/run_smoke.sh")
 	t.Logf("cuda-tests smoke tests output: %s", string(out))
 	if err != nil {

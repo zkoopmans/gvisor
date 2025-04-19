@@ -17,6 +17,6 @@
 set -euxo pipefail
 
 cd /
-nvcc cuda_malloc.cu -o cuda-malloc -Wno-deprecated-gpu-targets
+nvcc cuda_malloc.cu -o cuda_malloc -Wno-deprecated-gpu-targets
 ./cuda_malloc
 echo 'All tests passed'
