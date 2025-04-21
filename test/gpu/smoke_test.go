@@ -20,7 +20,6 @@ import (
 	"strings"
 	"testing"
 
-	"gvisor.dev/gvisor/bazel-gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 )
 
@@ -45,7 +44,7 @@ func TestGPUHello(t *testing.T) {
 		t.Logf("Cuda Version at least 12.8")
 		opts.Image = "gpu/cuda-tests-12-8"
 	}
-	out, err := c.Run(ctx, opts, "/run_sample", "--timeout=120s", "0_Introduction/vectorAdd")
+	out, err := c.Run(ctx, opts, "python3", "run_cuda_test.py", "0_Introduction/vectorAdd")
 	t.Logf("0_Introduction/vectorAdd output: %s", string(out))
 	if err != nil {
 		t.Fatalf("could not run 0_Introduction/vectorAdd: %v", err)

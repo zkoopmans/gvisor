@@ -40,7 +40,7 @@ RUN apt install -y wget && apt -y purge golang*
 RUN wget https://go.dev/dl/go1.24.1.linux-amd64.tar.gz && tar -C /usr/local -xzf go1.24.1.linux-amd64.tar.gz && \
    ln -s /usr/local/go/bin/go /usr/local/bin/go
 
-ADD *.cu *.h *.sh *.go *.cc /
+ADD *.cu *.h *.sh *.py *.cc /
 
 RUN chmod 555 /*.sh 
 
