@@ -24,9 +24,8 @@ SAMPLES_DIR = ROOT_CMAKE_DIR + '/Samples'
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    'test-dir',
+    'test',
     help='Test to run. This should be someething like "0_Introduction/UnifiedMemoryStreams"',
-    required=True,
     type=str,
 )
 
@@ -38,7 +37,7 @@ def run_cmake():
     subprocess.run(
         args=args,
         check=True,
-        capture_output=False,
+        capture_output=True,
     )
     os.chdir(wd)
 
@@ -48,17 +47,20 @@ def run_test(test_dir: str=''):
     subprocess.run(
         args=args,
         check=True,
+        capture_output=True,
     )
     test_path = os.path.join(make_path,os.path.basename(test_dir))
     subprocess.run(
         args=[test_path],
         check=True,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
     )
 
 
 if __name__ == '__main__':
     args = parser.parse_args(sys.argv[1:])
     run_cmake()
-    run_test(args.test-dir)
+    run_test(test_dir=args.test)
 
     
