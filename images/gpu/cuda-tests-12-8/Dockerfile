@@ -42,13 +42,7 @@ RUN wget https://go.dev/dl/go1.24.1.linux-amd64.tar.gz && tar -C /usr/local -xzf
 
 ADD *.cu *.h *.sh *.py *.cc /
 
-RUN chmod 555 /*.sh 
-
-RUN export GO111MODULE=on; go install \
-      github.com/TheZoraiz/ascii-image-converter@d05a757c5e02ab23e97b6f6fca4e1fbeb10ab559 && \
-    mv "$HOME/go/bin/ascii-image-converter" /usr/bin/ && \
-    gcc -o /unsupported_ioctl /unsupported_ioctl.cc && \
-    go build -o /run_sample /run_sample.go
+RUN chmod 555 /*.sh && gcc -o /unsupported_ioctl /unsupported_ioctl.cc
 
 
 # Override entrypoint to nothing, otherwise all invocations will have
