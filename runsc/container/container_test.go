@@ -2762,7 +2762,7 @@ func TestUsage(t *testing.T) {
 			}
 			return nil
 		}, backoff.WithMaxRetries(backoff.NewConstantBackOff(100*time.Millisecond), 10)); err != nil {
-			t.Errorf("error getting usage: %v", err)
+			t.Errorf("failed to get Usage after retries: %v", err)
 		}
 	}
 }
@@ -2798,19 +2798,26 @@ func TestUsageFD(t *testing.T) {
 		t.Fatalf("error usageFD from container: %v", err)
 	}
 
-	mapped, unknown, total, err := m.Fetch()
-	if err != nil {
-		t.Fatalf("error Fetch memory usage: %v", err)
-	}
+	// Retry a few times to ensure the container has had a chance to start up and
+	// generate some memory usage.
+	if err := backoff.Retry(func() error {
+		mapped, unknown, total, err := m.Fetch()
+		if err != nil {
+			return fmt.Errorf("error Fetch memory usage: %v", err)
+		}
 
-	if mapped == 0 {
-		t.Errorf("UsageFD Mapped got zero")
-	}
-	if unknown == 0 {
-		t.Errorf("UsageFD unknown got zero")
-	}
-	if total == 0 {
-		t.Errorf("UsageFD total got zero")
+		if mapped == 0 {
+			return fmt.Errorf("UsageFD Mapped got zero")
+		}
+		if unknown == 0 {
+			return fmt.Errorf("UsageFD unknown got zero")
+		}
+		if total == 0 {
+			return fmt.Errorf("UsageFD total got zero")
+		}
+		return nil
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(100*time.Millisecond), 10)); err != nil {
+		t.Errorf("failed to get UsageFD after retries: %v", err)
 	}
 
 	// Set the image path, which is where the checkpoint image will be saved.
@@ -4083,6 +4090,26 @@ func TestCheckpointResume(t *testing.T) {
 			}
 			cont.Destroy()
 		})
+	}
+}
+
+func TestMarkerFile(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+	conf := testutil.TestConfig(t)
+
+	conf.GVisorMarkerFile = false
+	spec := testutil.NewSpecWithArgs(app, "gvisor-detect", "--exit-code-on-gvisor=1", "--exit-code-on-not-gvisor=0")
+	if err := run(spec, conf); err != nil {
+		t.Fatalf("unexpectedly detected gVisor when we expected to not be able to do so: %v", err)
+	}
+
+	conf.GVisorMarkerFile = true
+	spec = testutil.NewSpecWithArgs(app, "gvisor-detect", "--exit-code-on-gvisor=0", "--exit-code-on-not-gvisor=1")
+	if err := run(spec, conf); err != nil {
+		t.Fatalf("failed to detect gVisor when we expected to be able to do so: %v", err)
 	}
 }
 
