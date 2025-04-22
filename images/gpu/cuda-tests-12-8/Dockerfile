@@ -32,8 +32,9 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
       xvfb \
       zlib1g zlib1g-dev
 
-RUN git clone --depth=1 --branch="$CUDA_SAMPLES_VERSION" --single-branch \
-      https://github.com/NVIDIA/cuda-samples.git /cuda-samples
+RUN git clone  \
+      https://github.com/NVIDIA/cuda-samples.git /cuda-samples && cd /cuda-samples && \
+      git checkout 7b60178984e96bc09d066077d5455df71fee2a9f && cd /
 
 RUN apt install -y wget && apt -y purge golang*
 

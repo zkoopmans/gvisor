@@ -39,11 +39,7 @@ func TestGPUHello(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get GPU run options: %v", err)
 	}
-	opts.Image = "gpu/cuda-tests"
-	if version.IsAtLeast(&dockerutil.CudaVersion{Major: 12, Minor: 8}) {
-		t.Logf("Cuda Version at least 12.8")
-		opts.Image = "gpu/cuda-tests-12-8"
-	}
+	opts.Image = "gpu/cuda-tests-12-8"
 	out, err := c.Run(ctx, opts, "python3", "run_cuda_test.py", "0_Introduction/vectorAdd")
 	t.Logf("0_Introduction/vectorAdd output: %s", string(out))
 	if err != nil {
