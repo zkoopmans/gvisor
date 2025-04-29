@@ -97,7 +97,7 @@ var testCompatibility = map[string]Compatibility{
 			Reason: "Requires newer version of EGL libraries than Ubuntu has (eglCreateStreamKHR)",
 		},
 	),
-	"2_Concepts_and_Techniques/EGLSync_CUDAEvent_Interop":  &OnlyOnWindows{},
+	// "2_Concepts_and_Techniques/EGLSync_CUDAEvent_Interop":  &OnlyOnWindows{},
 	"2_Concepts_and_Techniques/streamOrderedAllocationIPC": &BrokenInGVisor{},
 	"2_Concepts_and_Techniques/streamOrderedAllocationP2P": &RequiresP2P{},
 	"3_CUDA_Features/bf16TensorCoreGemm":                   RequiresFeatures(FeatureTensorCores),
@@ -109,35 +109,35 @@ var testCompatibility = map[string]Compatibility{
 	"4_CUDA_Libraries/conjugateGradientMultiDeviceCG":      MultiCompatibility(&RequiresMultiGPU{}, &BrokenInGVisor{}),
 	"4_CUDA_Libraries/cudaNvSci":                           &RequiresNvSci{},
 	"4_CUDA_Libraries/cudaNvSciNvMedia":                    &RequiresNvSci{},
-	"4_CUDA_Libraries/cuDLAErrorReporting":                 &OnlyOnWindows{},
-	"4_CUDA_Libraries/cuDLAHybridMode":                     &OnlyOnWindows{},
-	"4_CUDA_Libraries/cuDLAStandaloneMode":                 &OnlyOnWindows{},
-	"4_CUDA_Libraries/cuDLALayerwiseStatsHybrid":           &OnlyOnWindows{},
-	"4_CUDA_Libraries/cuDLALayerwiseStatsStandalone":       &OnlyOnWindows{},
-	"4_CUDA_Libraries/simpleCUFFT_2d_MGPU":                 &RequiresMultiGPU{},
-	"4_CUDA_Libraries/simpleCUFFT_MGPU":                    &RequiresMultiGPU{},
-	"5_Domain_Specific/fluidsD3D9":                         &OnlyOnWindows{},
-	"5_Domain_Specific/fluidsGL":                           RequiresFeatures(FeatureGL),
-	"5_Domain_Specific/fluidsGLES":                         &OnlyOnWindows{},
-	"5_Domain_Specific/nbody_opengles":                     &OnlyOnWindows{},
-	"5_Domain_Specific/nbody_screen":                       &OnlyOnWindows{},
-	"5_Domain_Specific/postProcessGL":                      RequiresFeatures(FeatureGL),
-	"5_Domain_Specific/simpleD3D10":                        &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D10RenderTarget":            &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D10Texture":                 &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D11":                        &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D11Texture":                 &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D12":                        &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D9":                         &OnlyOnWindows{},
-	"5_Domain_Specific/simpleD3D9Texture":                  &OnlyOnWindows{},
-	"5_Domain_Specific/simpleGLES":                         &OnlyOnWindows{},
-	"5_Domain_Specific/simpleGLES_EGLOutput":               &OnlyOnWindows{},
-	"5_Domain_Specific/simpleGLES_screen":                  &OnlyOnWindows{},
-	"5_Domain_Specific/simpleVulkan":                       RequiresFeatures(FeatureGL),
-	"5_Domain_Specific/simpleVulkanMMAP":                   RequiresFeatures(FeatureGL),
-	"5_Domain_Specific/SLID3D10Texture":                    &OnlyOnWindows{},
-	"5_Domain_Specific/VFlockingD3D10":                     &OnlyOnWindows{},
-	"5_Domain_Specific/vulkanImageCUDA":                    RequiresFeatures(FeatureGL),
+	// "4_CUDA_Libraries/cuDLAErrorReporting":                 &OnlyOnWindows{},
+	"4_CUDA_Libraries/cuDLAHybridMode": &OnlyOnWindows{},
+	// "4_CUDA_Libraries/cuDLAStandaloneMode":                 &OnlyOnWindows{},
+	"4_CUDA_Libraries/cuDLALayerwiseStatsHybrid":     &OnlyOnWindows{},
+	"4_CUDA_Libraries/cuDLALayerwiseStatsStandalone": &OnlyOnWindows{},
+	"4_CUDA_Libraries/simpleCUFFT_2d_MGPU":           &RequiresMultiGPU{},
+	"4_CUDA_Libraries/simpleCUFFT_MGPU":              &RequiresMultiGPU{},
+	// "5_Domain_Specific/fluidsD3D9":                         &OnlyOnWindows{},
+	"5_Domain_Specific/fluidsGL":   RequiresFeatures(FeatureGL),
+	"5_Domain_Specific/fluidsGLES": &OnlyOnWindows{},
+	// "5_Domain_Specific/nbody_opengles":                     &OnlyOnWindows{},
+	"5_Domain_Specific/nbody_screen":  &OnlyOnWindows{},
+	"5_Domain_Specific/postProcessGL": RequiresFeatures(FeatureGL),
+	"5_Domain_Specific/simpleD3D10":   &OnlyOnWindows{},
+	// "5_Domain_Specific/simpleD3D10RenderTarget": &OnlyOnWindows{},
+	"5_Domain_Specific/simpleD3D10Texture": &OnlyOnWindows{},
+	"5_Domain_Specific/simpleD3D11":        &OnlyOnWindows{},
+	"5_Domain_Specific/simpleD3D11Texture": &OnlyOnWindows{},
+	"5_Domain_Specific/simpleD3D12":        &OnlyOnWindows{},
+	// "5_Domain_Specific/simpleD3D9":              &OnlyOnWindows{},
+	"5_Domain_Specific/simpleD3D9Texture": &OnlyOnWindows{},
+	// "5_Domain_Specific/simpleGLES":           &OnlyOnWindows{},
+	"5_Domain_Specific/simpleGLES_EGLOutput": &OnlyOnWindows{},
+	"5_Domain_Specific/simpleGLES_screen":    &OnlyOnWindows{},
+	"5_Domain_Specific/simpleVulkan":         RequiresFeatures(FeatureGL),
+	"5_Domain_Specific/simpleVulkanMMAP":     RequiresFeatures(FeatureGL),
+	"5_Domain_Specific/SLID3D10Texture":      &OnlyOnWindows{},
+	"5_Domain_Specific/VFlockingD3D10":       &OnlyOnWindows{},
+	"5_Domain_Specific/vulkanImageCUDA":      RequiresFeatures(FeatureGL),
 }
 
 // flakyTests is a list of tests that are flaky.
@@ -786,7 +786,7 @@ func TestCUDA(t *testing.T) {
 			continue
 		}
 
-		if !strings.Contains("/") {
+		if !strings.Contains(testName, "/") {
 			continue
 		}
 
@@ -796,13 +796,6 @@ func TestCUDA(t *testing.T) {
 	numTests := len(allTests)
 	testLog(t, "Number of CUDA sample tests detected: %d", numTests)
 
-	t.Logf("...............................")
-
-	for _, test := range allTests {
-		t.Logf("found test: %s", test)
-	}
-	return
-
 	// Check that all tests in test maps still exist.
 	t.Run("CUDA test existence", func(t *testing.T) {
 		for testName := range testCompatibility {
@@ -811,6 +804,8 @@ func TestCUDA(t *testing.T) {
 			}
 		}
 	})
+
+	return
 
 	// Filter tests if partitioning is enabled.
 	testIndices, err := testutil.TestIndicesForShard(numTests)

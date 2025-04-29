@@ -22,5 +22,5 @@ set -euo pipefail
   while IFS= read -r makefile_path; do
     dirname "$makefile_path"
   done < <(find /cuda-samples -type f -name Makefile) \
-    | grep -vE '^/cuda-samples$'  | grep -vE '^/cuda-samples/build$' | grep -vE '^/cuda-samples/build/SAMPLES$'
+    | grep -vE '^/cuda-samples$'  | grep -vE '^/cuda-samples/build$' | grep -vE '^/cuda-samples/build/Samples$'
 ) | sed 's~/cuda-samples/build/Samples/~~' | sort
