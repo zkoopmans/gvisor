@@ -464,7 +464,7 @@ func getContainerOpts() (dockerutil.RunOpts, error) {
 	if err != nil {
 		return dockerutil.RunOpts{}, fmt.Errorf("failed to get GPU run options: %w", err)
 	}
-	opts.Image = "gpu/cuda-tests"
+	opts.Image = "gpu/cuda-tests-12-8"
 	return opts, nil
 }
 
