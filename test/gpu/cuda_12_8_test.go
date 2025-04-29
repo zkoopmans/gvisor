@@ -110,7 +110,7 @@ var testCompatibility = map[string]Compatibility{
 	"3_CUDA_Features/tf32TensorCoreGemm":                   RequiresFeatures(FeatureTensorCores),
 	"4_CUDA_Libraries/conjugateGradientMultiDeviceCG":      MultiCompatibility(&RequiresMultiGPU{}, &BrokenInGVisor{}),
 	// "4_CUDA_Libraries/cudaNvSci":                           &RequiresNvSci{},
-	"4_CUDA_Libraries/cudaNvSciNvMedia": &RequiresNvSci{},
+	// "4_CUDA_Libraries/cudaNvSciNvMedia": &RequiresNvSci{},
 	// "4_CUDA_Libraries/cuDLAErrorReporting":                 &OnlyOnWindows{},
 	// "4_CUDA_Libraries/cuDLAHybridMode": &OnlyOnWindows{},
 	// "4_CUDA_Libraries/cuDLAStandaloneMode":                 &OnlyOnWindows{},
@@ -643,7 +643,7 @@ func runSampleTest(ctx context.Context, t *testing.T, testName string, te *TestE
 		testLog(t, "Running test in parallel mode in container %s (attempt %d/%d)...", c.Name, attempt+1, parallelAttempts)
 		parallelCtx, parallelCancel := context.WithTimeoutCause(ctx, testTimeout, errors.New("parallel execution took too long"))
 		testStartedAt := time.Now()
-		output, err := c.Exec(parallelCtx, dockerutil.ExecOpts{}, "/run_sample", fmt.Sprintf("--timeout=%v", execTestTimeout), testName)
+		output, err := c.Exec(parallelCtx, dockerutil.ExecOpts{}, "python3", "run_cuda_test.py", testName)
 		testDuration := time.Since(testStartedAt)
 		parallelCancel()
 		release()
@@ -688,7 +688,7 @@ func runSampleTest(ctx context.Context, t *testing.T, testName string, te *TestE
 		exclusiveCtx, exclusiveCancel := context.WithTimeoutCause(ctx, testTimeout, errors.New("exclusive execution took too long"))
 		testStartedAt := time.Now()
 		var output string
-		output, testErr = c.Exec(exclusiveCtx, dockerutil.ExecOpts{}, "/run_sample", fmt.Sprintf("--timeout=%v", execTestTimeout), testName)
+		output, testErr = c.Exec(exclusiveCtx, dockerutil.ExecOpts{}, "python3", "run_cuda-test.py", testName)
 		testDuration := time.Since(testStartedAt)
 		exclusiveCancel()
 		if testErr == nil {
@@ -806,8 +806,6 @@ func TestCUDA(t *testing.T) {
 			}
 		}
 	})
-
-	return
 
 	// Filter tests if partitioning is enabled.
 	testIndices, err := testutil.TestIndicesForShard(numTests)
@@ -937,7 +935,7 @@ func TestCUDA(t *testing.T) {
 		if len(failedTests) > 0 {
 			t.Errorf("To re-run a specific test locally, either re-run this test with filtering enabled (example: --test.run=%s/%s), or:", samplesTestName, failedTests[0])
 			t.Errorf(
-				"  $ docker run --runtime=%s --gpus=all -e %s --rm %s /run_sample %s",
+				"  $ docker run --runtime=%s --gpus=all -e %s --rm %s python3 run_cuda_test.py %s",
 				dockerutil.Runtime(),
 				dockerutil.AllGPUCapabilitiesEnv,
 				runOpts.Image,
