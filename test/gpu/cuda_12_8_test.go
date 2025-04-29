@@ -785,11 +785,18 @@ func TestCUDA(t *testing.T) {
 		if testName == "" {
 			continue
 		}
+
+		if !strings.Contains("/") {
+			continue
+		}
+
 		allTestsMap[testName] = struct{}{}
 		allTests = append(allTests, testName)
 	}
 	numTests := len(allTests)
 	testLog(t, "Number of CUDA sample tests detected: %d", numTests)
+
+	t.Logf("...............................")
 
 	for _, test := range allTests {
 		t.Logf("found test: %s", test)
