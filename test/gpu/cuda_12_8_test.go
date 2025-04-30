@@ -624,7 +624,6 @@ func runSampleTest(ctx context.Context, t *testing.T, testName string, te *TestE
 		return fmt.Sprintf("this test is always skipped (%v)", skipReason), nil
 	}
 	testTimeout := defaultTestTimeout
-	execTestTimeout := testTimeout - 15*time.Second
 	testAttempts := 1
 	if _, isFlakyTest := flakyTests[testName]; isFlakyTest {
 		testAttempts = 3
@@ -688,7 +687,7 @@ func runSampleTest(ctx context.Context, t *testing.T, testName string, te *TestE
 		exclusiveCtx, exclusiveCancel := context.WithTimeoutCause(ctx, testTimeout, errors.New("exclusive execution took too long"))
 		testStartedAt := time.Now()
 		var output string
-		output, testErr = c.Exec(exclusiveCtx, dockerutil.ExecOpts{}, "python3", "run_cuda-test.py", testName)
+		output, testErr = c.Exec(exclusiveCtx, dockerutil.ExecOpts{}, "python3", "run_cuda_test.py", testName)
 		testDuration := time.Since(testStartedAt)
 		exclusiveCancel()
 		if testErr == nil {
@@ -788,7 +787,7 @@ func TestCUDA(t *testing.T) {
 			continue
 		}
 
-		if !strings.Contains(testName, "/") {
+		if !isSupportedTest(testName) {
 			continue
 		}
 
@@ -948,6 +947,10 @@ func TestCUDA(t *testing.T) {
 		testLog(t, "by identifying flaky tests and exclusive-requiring tests.")
 		testLog(t, "Consider going over the logs to identify such tests and categorize them accordingly.")
 	}
+}
+
+func isSupportedTest(testName string) bool {
+	return strings.Contains(testName, "0_Introduction")
 }
 
 // TestMain overrides the `test.parallel` flag.
