@@ -85,22 +85,9 @@ var testCompatibility = map[string]Compatibility{
 	"0_Introduction/simpleAttributes": RequiresFeatures(FeaturePersistentL2Caching),
 	"0_Introduction/simpleCUDA2GL":    RequiresFeatures(FeatureGL),
 	"0_Introduction/simpleP2P":        &RequiresP2P{},
-	/*
-		"2_Concepts_and_Techniques/cuHook": &BrokenEverywhere{
-			Reason: "Requires ancient version of glibc (<=2.33)",
-		},
-	*/
-	"2_Concepts_and_Techniques/EGLStream_CUDA_Interop": &BrokenEverywhere{
-		Reason: "Requires newer version of EGL libraries than Ubuntu has (eglCreateStreamKHR)",
-	},
 	"2_Concepts_and_Techniques/EGLSync_CUDAEvent_Interop":  &OnlyOnWindows{},
-	"2_Concepts_and_Techniques/streamOrderedAllocationIPC": &BrokenInGVisor{},
 	"2_Concepts_and_Techniques/streamOrderedAllocationP2P": &RequiresP2P{},
 	"3_CUDA_Features/bf16TensorCoreGemm":                   RequiresFeatures(FeatureTensorCores),
-	"3_CUDA_Features/cdpAdvancedQuicksort":                 RequiresFeatures(FeatureDynamicParallelism),
-	"3_CUDA_Features/dmmaTensorCoreGemm":                   RequiresFeatures(FeatureTensorCores),
-	"3_CUDA_Features/tf32TensorCoreGemm":                   RequiresFeatures(FeatureTensorCores),
-	"4_CUDA_Libraries/conjugateGradientMultiDeviceCG":      MultiCompatibility(&RequiresMultiGPU{}, &BrokenInGVisor{}),
 	"4_CUDA_Libraries/cudaNvSci":                           &RequiresNvSci{},
 	"4_CUDA_Libraries/cudaNvSciNvMedia": &RequiresNvSci{},
 	"4_CUDA_Libraries/cuDLAErrorReporting":                 &OnlyOnWindows{},
@@ -783,6 +770,9 @@ func TestCUDA(t *testing.T) {
 	// Check that all tests in test maps still exist.
 	t.Run("CUDA test existence", func(t *testing.T) {
 		for testName := range testCompatibility {
+			if !isSupportedTest(testName) {
+				continue
+			}
 			if _, ok := allTestsMap[testName]; !ok {
 				t.Errorf("CUDA test %q referenced in `testCompatibility` but it no longer exists, please remove it.", testName)
 			}
