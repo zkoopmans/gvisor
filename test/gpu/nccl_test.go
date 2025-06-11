@@ -39,11 +39,14 @@ func runNCCL(ctx context.Context, t *testing.T, testName string) {
 		t.Fatalf("Failed to get GPU run options: %v", err)
 	}
 	opts.Image = "gpu/nccl-tests"
-	cmd := fmt.Sprintf("/nccl-tests/build/%s --ngpus %d", testName, numGPU)
-	if *ncclTimeout > 0 {
-		cmd = fmt.Sprintf("%s --timeout %s", *ncclTimeout)
+	cmd := []string{
+		fmt.Sprintf("/nccl-tests/build/%s", testName),
+		fmt.Sprintf("-ngpus=%d", numGPU),
 	}
-	out, err := c.Run(ctx, opts, cmd)
+	if *ncclTimeout > 0 {
+		cmd = append(cmd, fmt.Sprintf("-T=%d", *ncclTimeout))
+	}
+	out, err := c.Run(ctx, opts, cmd...)
 	if err != nil {
 		t.Errorf("Failed: %v\nContainer output:\n%s", err, out)
 	} else {
