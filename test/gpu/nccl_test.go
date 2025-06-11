@@ -17,22 +17,32 @@ package nccl_test
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 )
 
+var (
+	ncclTimeout = flag.Int64("nccl_timeout", 0, "passes this as the timeout (s) flag to the nccl container")
+)
+
 // runNCCL runs the given script and command in a NCCL container.
 func runNCCL(ctx context.Context, t *testing.T, testName string) {
 	t.Helper()
+	numGPU := dockerutil.NumGPU()
 	c := dockerutil.MakeContainer(ctx, t)
 	opts, err := dockerutil.GPURunOpts(dockerutil.SniffGPUOpts{})
 	if err != nil {
 		t.Fatalf("Failed to get GPU run options: %v", err)
 	}
 	opts.Image = "gpu/nccl-tests"
-	cmd := fmt.Sprintf("/nccl-tests/build/%s", testName)
+	cmd := fmt.Sprintf("/nccl-tests/build/%s --ngpus %d", testName, numGPU)
+	if *ncclTimeout > 0 {
+		cmd = fmt.Sprintf("%s --timeout %s", *ncclTimeout)
+	}
 	out, err := c.Run(ctx, opts, cmd)
 	if err != nil {
 		t.Errorf("Failed: %v\nContainer output:\n%s", err, out)
@@ -61,4 +71,10 @@ func TestNCCL(t *testing.T) {
 			runNCCL(ctx, t, test)
 		})
 	}
+}
+
+func TestMain(m *testing.M) {
+	dockerutil.EnsureSupportedDockerVersion()
+	flag.Parse()
+	os.Exit(m.Run())
 }
