@@ -17,6 +17,7 @@ package smoke_test
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -48,6 +49,9 @@ func TestNvidiaSmi(t *testing.T) {
 
 func TestGPUHello(t *testing.T) {
 	ctx := context.Background()
+	if strings.Contains(runtime.GOARCH, "arm64"){
+        t.Skipf("Test does not run on ARM")
+    }
 	runGPUHello(ctx, t, "gpu/cuda-tests")
 }
 
