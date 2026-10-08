@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"strings"
@@ -240,9 +241,14 @@ func (r *Route) Empty() bool {
 }
 
 func (r *Route) toTcpipRoute(id tcpip.NICID) (tcpip.Route, error) {
-	subnet, err := tcpip.NewSubnet(ipToAddress(r.Destination.IP), ipMaskToAddressMask(r.Destination.Mask))
-	if err != nil {
-		return tcpip.Route{}, err
+	address := ipToAddress(r.Destination.IP)
+	ones, bits := r.Destination.Mask.Size()
+	if bits != address.BitLen() || !address.IsValid() {
+		return tcpip.Route{}, fmt.Errorf("invalid route destination %s", r.Destination)
+	}
+	subnet := netip.PrefixFrom(address, ones)
+	if subnet != subnet.Masked() {
+		return tcpip.Route{}, fmt.Errorf("route destination %s has host bits set", r.Destination)
 	}
 	return tcpip.Route{
 		Destination: subnet,
@@ -611,11 +617,8 @@ func (n *Network) createNICWithAddrs(id tcpip.NICID, ep stack.LinkEndpoint, opts
 	for _, addr := range addrs {
 		proto, tcpipAddr := ipToAddressAndProto(addr.Address)
 		protocolAddr := tcpip.ProtocolAddress{
-			Protocol: proto,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpipAddr,
-				PrefixLen: addr.PrefixLen,
-			},
+			Protocol:          proto,
+			AddressWithPrefix: netip.PrefixFrom(tcpipAddr, addr.PrefixLen),
 		}
 		if err := n.Stack.AddProtocolAddress(id, protocolAddr, stack.AddressProperties{}); err != nil {
 			return fmt.Errorf("AddProtocolAddress(%d, %+v, {}) failed: %s", id, protocolAddr, err)
@@ -624,25 +627,21 @@ func (n *Network) createNICWithAddrs(id tcpip.NICID, ep stack.LinkEndpoint, opts
 	return nil
 }
 
-// ipToAddressAndProto converts IP to tcpip.Address and a protocol number.
-//
-// Note: don't use 'len(ip)' to determine IP version because length is always 16.
-func ipToAddressAndProto(ip net.IP) (tcpip.NetworkProtocolNumber, tcpip.Address) {
-	if i4 := ip.To4(); i4 != nil {
-		return ipv4.ProtocolNumber, tcpip.AddrFromSlice(i4)
+// ipToAddressAndProto converts IP to netip.Addr and a protocol number.
+func ipToAddressAndProto(ip net.IP) (tcpip.NetworkProtocolNumber, netip.Addr) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return ipv6.ProtocolNumber, netip.Addr{}
 	}
-	return ipv6.ProtocolNumber, tcpip.AddrFromSlice(ip)
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return ipv4.ProtocolNumber, addr
+	}
+	return ipv6.ProtocolNumber, addr
 }
 
-// ipToAddress converts IP to tcpip.Address, ignoring the protocol.
-func ipToAddress(ip net.IP) tcpip.Address {
+// ipToAddress converts IP to netip.Addr, ignoring the protocol.
+func ipToAddress(ip net.IP) netip.Addr {
 	_, addr := ipToAddressAndProto(ip)
 	return addr
-}
-
-// ipMaskToAddressMask converts IPMask to tcpip.AddressMask, ignoring the
-// protocol.
-func ipMaskToAddressMask(ipMask net.IPMask) tcpip.AddressMask {
-	addr := ipToAddress(net.IP(ipMask))
-	return tcpip.MaskFromBytes(addr.AsSlice())
 }

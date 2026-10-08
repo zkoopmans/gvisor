@@ -16,9 +16,9 @@ package stack
 
 import (
 	"math/rand"
+	"net/netip"
 	"testing"
 
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/testutil"
@@ -41,7 +41,7 @@ var (
 	dstAddr    = testutil.MustParse6("c::3")
 )
 
-func v6PacketBufferWithSrcAddr(srcAddr tcpip.Address) *PacketBuffer {
+func v6PacketBufferWithSrcAddr(srcAddr netip.Addr) *PacketBuffer {
 	pkt := NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: header.IPv6MinimumSize + header.UDPMinimumSize,
 	})
