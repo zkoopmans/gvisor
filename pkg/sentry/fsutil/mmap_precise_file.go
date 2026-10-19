@@ -207,14 +207,13 @@ func (f *MmapPreciseFile) mapInternalSegment(fr *memmap.FileRange, seg mappingIt
 	addr := seg.Value().addr + uintptr(fr.Start-seg.Start())
 	if !seg.Value().writable && write {
 		seg = f.mappings.Isolate(seg, *fr)
-		_, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
+		// The backing FD is immutable, so changing permissions does not
+		// require a destructive MAP_FIXED replacement.
+		_, _, errno := unix.Syscall(
+			unix.SYS_MPROTECT,
 			addr,
 			uintptr(seg.Range().Length()),
-			uintptr(prot),
-			unix.MAP_SHARED|unix.MAP_FIXED,
-			uintptr(f.fd),
-			uintptr(seg.Start()))
+			uintptr(prot))
 		if errno != 0 {
 			return safemem.Block{}, seg, errno
 		}

@@ -62,6 +62,11 @@ type MmapCachedFile struct {
 	// mappings maps chunk start offsets to mappings of those chunks.
 	// +checklocks:mapsMu
 	mappings map[uint64]mapping `state:"nosave"`
+
+	// oldMappings holds replaced mappings until their chunk's last reference
+	// is released. MapInternal callers may still be using these addresses.
+	// +checklocks:mapsMu
+	oldMappings map[uint64][]uintptr `state:"nosave"`
 }
 
 const (
@@ -226,12 +231,28 @@ func (f *MmapCachedFile) decRefUnaccounted(fr memmap.FileRange) {
 //
 // +checklocks:f.mapsMu
 func (f *MmapCachedFile) unmapAndRemove(chunkStart uint64, m mapping) {
-	if _, _, errno := unix.Syscall(unix.SYS_MUNMAP, m.addr, chunkSize, 0); errno != 0 {
+	unmapCachedMapping(chunkStart, m.addr)
+	for _, addr := range f.oldMappings[chunkStart] {
+		unmapCachedMapping(chunkStart, addr)
+	}
+	delete(f.oldMappings, chunkStart)
+	delete(f.mappings, chunkStart)
+}
+
+func unmapCachedMapping(chunkStart uint64, addr uintptr) {
+	if _, _, errno := unix.Syscall(unix.SYS_MUNMAP, addr, chunkSize, 0); errno != 0 {
 		// This leaks address space and is unexpected, but is otherwise
 		// harmless, so complain but don't panic.
-		log.Warningf("fsutil.MmapCachedFile: failed to unmap mapping %#x for chunk %#x: %v", m.addr, chunkStart, errno)
+		log.Warningf("fsutil.MmapCachedFile: failed to unmap mapping %#x for chunk %#x: %v", addr, chunkStart, errno)
 	}
-	delete(f.mappings, chunkStart)
+}
+
+// +checklocks:f.mapsMu
+func (f *MmapCachedFile) retainOldMappingLocked(chunkStart uint64, addr uintptr) {
+	if f.oldMappings == nil {
+		f.oldMappings = make(map[uint64][]uintptr)
+	}
+	f.oldMappings[chunkStart] = append(f.oldMappings[chunkStart], addr)
 }
 
 // MapInternal implements memmap.File.MapInternal.
@@ -270,7 +291,10 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 	}
 	for {
 		m, ok := f.mappings[chunkStart]
-		if !ok {
+		if !ok || write && !m.writable {
+			// MAP_FIXED can remove the old mapping before returning an error.
+			// Allocate a new mapping so both failures and existing users of the
+			// old address are safe.
 			addr, _, errno := unix.Syscall6(
 				unix.SYS_MMAP,
 				0,
@@ -282,19 +306,8 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 			if errno != 0 {
 				return errno
 			}
-			m = mapping{addr, write}
-			f.mappings[chunkStart] = m
-		} else if write && !m.writable {
-			addr, _, errno := unix.Syscall6(
-				unix.SYS_MMAP,
-				m.addr,
-				chunkSize,
-				uintptr(prot),
-				unix.MAP_SHARED|unix.MAP_FIXED,
-				uintptr(fd),
-				uintptr(chunkStart))
-			if errno != 0 {
-				return errno
+			if ok {
+				f.retainOldMappingLocked(chunkStart, m.addr)
 			}
 			m = mapping{addr, write}
 			f.mappings[chunkStart] = m
@@ -317,7 +330,9 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 }
 
 // RegenerateMappings must be called when the file description mapped by f
-// changes, to replace existing mappings of the previous file description.
+// changes. Callers must then invalidate translations using the previous file
+// description. Previously returned internal mappings remain valid until their
+// page references are released.
 //
 // Preconditions:
 //   - f.MappableRelease() is not called concurrently with, or before,
@@ -332,23 +347,34 @@ func (f *MmapCachedFile) RegenerateMappings() error {
 	f.mapsMu.Lock()
 	defer f.mapsMu.Unlock()
 
+	newMappings := make(map[uint64]mapping, len(f.mappings))
 	for chunkStart, m := range f.mappings {
 		prot := unix.PROT_READ
 		if m.writable {
 			prot |= unix.PROT_WRITE
 		}
-		_, _, errno := unix.Syscall6(
+		addr, _, errno := unix.Syscall6(
 			unix.SYS_MMAP,
-			m.addr,
+			0,
 			chunkSize,
 			uintptr(prot),
-			unix.MAP_SHARED|unix.MAP_FIXED,
+			unix.MAP_SHARED,
 			uintptr(fd),
 			uintptr(chunkStart))
 		if errno != 0 {
+			// No replacement has been published, so only the new mappings
+			// may be discarded.
+			for start, nm := range newMappings {
+				unmapCachedMapping(start, nm.addr)
+			}
 			return errno
 		}
+		newMappings[chunkStart] = mapping{addr, m.writable}
 	}
+	for chunkStart, m := range f.mappings {
+		f.retainOldMappingLocked(chunkStart, m.addr)
+	}
+	f.mappings = newMappings
 	return nil
 }
 

@@ -158,6 +158,7 @@ go_test(
     size = "small",
     srcs = [
         "dirty_set_test.go",
+        "mmap_cached_file_test.go",
     ],
     embed = [":fsutil"],
     deps = [

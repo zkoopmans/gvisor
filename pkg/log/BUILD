@@ -10,6 +10,8 @@ go_library(
     srcs = [
         "bug.go",
         "file.go",
+        "file_linux.go",
+        "file_other.go",
         "glog.go",
         "json.go",
         "json_k8s.go",
@@ -25,6 +27,7 @@ go_library(
     deps = [
         "//pkg/linewriter",
         "//pkg/sync",
+        "@org_golang_x_sys//unix:go_default_library",
         "@org_golang_x_time//rate:go_default_library",
     ],
 )
@@ -38,4 +41,16 @@ go_test(
         "log_test.go",
     ],
     embed = [":log"],
+)
+
+go_test(
+    name = "file_linux_test",
+    size = "small",
+    srcs = [
+        "file_linux_test.go",
+    ],
+    embed = [":log"],
+    deps = [
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )

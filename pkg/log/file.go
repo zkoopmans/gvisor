@@ -17,7 +17,6 @@ package log
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 )
 
 // FileOpts contains options for creating a log file.
@@ -37,6 +36,8 @@ func (f *DefaultFileOpts) Build(logPattern string) string {
 
 // OpenFile opens a log file using the specified flags. It uses `opts` to
 // construct the log file path based on the given `logPattern`.
+// On Linux, the path must not contain symlinks and must name a regular file
+// with one link on a filesystem suitable for storing logs.
 func OpenFile(logPattern string, flags int, opts FileOpts) (*os.File, error) {
 	if len(logPattern) == 0 {
 		return nil, nil
@@ -45,16 +46,9 @@ func OpenFile(logPattern string, flags int, opts FileOpts) (*os.File, error) {
 	// Replace variables in the log pattern.
 	logPath := opts.Build(logPattern)
 
-	// Create parent directory if it doesn't exist.
-	dir := filepath.Dir(logPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("error creating dir %q: %v", dir, err)
-	}
-
-	// Open file with the specified flags.
-	f, err := os.OpenFile(logPath, flags, 0644)
+	f, err := openLogFile(logPath, flags)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file %q: %v", logPath, err)
+		return nil, fmt.Errorf("error opening file %q: %w", logPath, err)
 	}
 	return f, nil
 }
