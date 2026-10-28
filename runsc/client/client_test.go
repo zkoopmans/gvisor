@@ -19,6 +19,8 @@ import (
 	"os"
 	"testing"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 )
@@ -56,6 +58,25 @@ func TestClientNew(t *testing.T) {
 	cRoot := NewFromRootDir("/tmp/custom-root")
 	if got := cRoot.RootDir(); got != "/tmp/custom-root" {
 		t.Errorf("NewFromRootDir().RootDir() = %q, want %q", got, "/tmp/custom-root")
+	}
+
+	// Test default options: exact=false, skipCheck=false
+	baseOpts := c.baseLoadOpts()
+	if baseOpts.Exact {
+		t.Errorf("default baseLoadOpts().Exact = true, want false")
+	}
+	if baseOpts.SkipCheck {
+		t.Errorf("default baseLoadOpts().SkipCheck = true, want false")
+	}
+
+	// Test ClientOption overrides
+	cOpts := New(conf, WithExact(true), WithSkipCheck(true))
+	customOpts := cOpts.baseLoadOpts()
+	if !customOpts.Exact {
+		t.Errorf("customOpts.Exact = false, want true")
+	}
+	if !customOpts.SkipCheck {
+		t.Errorf("customOpts.SkipCheck = false, want true")
 	}
 }
 
@@ -133,5 +154,118 @@ func TestClientContextCancellation(t *testing.T) {
 	_, err = c.List(ctx)
 	if err != context.Canceled {
 		t.Errorf("List() with canceled context: got %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestContainerMethods(t *testing.T) {
+	c := New(nil)
+	cont := &container.Container{
+		ID:     "test-container",
+		Status: container.Stopped,
+		Spec:   &specs.Spec{},
+	}
+
+	state := c.StateContainer(cont)
+	if state.ID != "test-container" {
+		t.Errorf("StateContainer().ID = %q, want test-container", state.ID)
+	}
+
+	spec := c.SpecContainer(cont)
+	if spec == nil {
+		t.Errorf("SpecContainer() = nil, want non-nil")
+	}
+}
+
+func TestParseSignal(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    unix.Signal
+		wantErr bool
+	}{
+		{"KILL", unix.SIGKILL, false},
+		{"SIGKILL", unix.SIGKILL, false},
+		{"9", unix.SIGKILL, false},
+		{"TERM", unix.SIGTERM, false},
+		{"SIGTERM", unix.SIGTERM, false},
+		{"15", unix.SIGTERM, false},
+		{"HUP", unix.SIGHUP, false},
+		{"SIGHUP", unix.SIGHUP, false},
+		{"1", unix.SIGHUP, false},
+		{"INVALID_SIGNAL", 0, true},
+		{"9999", 0, true},
+	}
+
+	for _, tt := range tests {
+		got, err := ParseSignal(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ParseSignal(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if !tt.wantErr && got != tt.want {
+			t.Errorf("ParseSignal(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestClientKillInvalidOpts(t *testing.T) {
+	c := New(nil)
+	ctx := context.Background()
+
+	// More than one mode specified
+	if err := c.Kill(ctx, "id", KillOpts{All: true, PID: 123}); err == nil {
+		t.Errorf("Kill() with All and PID: want error, got nil")
+	}
+	if err := c.Kill(ctx, "id", KillOpts{All: true, PGID: 123}); err == nil {
+		t.Errorf("Kill() with All and PGID: want error, got nil")
+	}
+	if err := c.Kill(ctx, "id", KillOpts{PID: 123, PGID: 123}); err == nil {
+		t.Errorf("Kill() with PID and PGID: want error, got nil")
+	}
+}
+
+func TestClientKillDeleteNonExistent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "runsc-client-test-")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	c := NewFromRootDir(tmpDir)
+	ctx := context.Background()
+
+	// Kill non-existent container should fail
+	if err := c.Kill(ctx, "nonexistent", KillOpts{}); err == nil {
+		t.Errorf("Kill() on non-existent container: want error, got nil")
+	}
+
+	// Delete non-existent without force should fail
+	if err := c.Delete(ctx, "nonexistent", DeleteOpts{Force: false}); err == nil {
+		t.Errorf("Delete() on non-existent container without force: want error, got nil")
+	}
+
+	// Delete non-existent with force should succeed (no-op)
+	if err := c.Delete(ctx, "nonexistent", DeleteOpts{Force: true}); err != nil {
+		t.Errorf("Delete() on non-existent container with force: want nil, got %v", err)
+	}
+}
+
+func TestClientKillDeleteCancellation(t *testing.T) {
+	c := New(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := c.Kill(ctx, "id", KillOpts{}); err != context.Canceled {
+		t.Errorf("Kill() with canceled context: got %v, want %v", err, context.Canceled)
+	}
+	if err := c.Delete(ctx, "id", DeleteOpts{}); err != context.Canceled {
+		t.Errorf("Delete() with canceled context: got %v, want %v", err, context.Canceled)
+	}
+
+	fakeCont := &container.Container{ID: "fake"}
+	if err := c.KillContainer(ctx, fakeCont, KillOpts{}); err != context.Canceled {
+		t.Errorf("KillContainer() with canceled context: got %v, want %v", err, context.Canceled)
+	}
+	if err := c.DeleteContainer(ctx, fakeCont, DeleteOpts{}); err != context.Canceled {
+		t.Errorf("DeleteContainer() with canceled context: got %v, want %v", err, context.Canceled)
 	}
 }
