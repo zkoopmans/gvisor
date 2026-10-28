@@ -17,12 +17,10 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/client"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -69,7 +67,7 @@ func (k *Kill) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.S
 }
 
 // Execute implements subcommands.Command.Execute.
-func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+func (k *Kill) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() == 0 || f.NArg() > 2 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -77,19 +75,14 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	conf := args[0].(*config.Config)
 
-	// Validate that at most one targeting mode is used.
-	modes := 0
-	if k.all {
-		modes++
+	signalStr := f.Arg(1)
+	if signalStr == "" {
+		signalStr = "TERM"
 	}
-	if k.pid != 0 {
-		modes++
-	}
-	if k.pgid != 0 {
-		modes++
-	}
-	if modes > 1 {
-		util.Fatalf("it is invalid to specify more than one of --all, --pid, and --pgid")
+
+	sig, err := client.ParseSignal(signalStr)
+	if err != nil {
+		util.Fatalf("%v", err)
 	}
 
 	c, err := k.loadContainer(conf, f, container.LoadOpts{})
@@ -97,85 +90,15 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		util.Fatalf("loading container: %v", err)
 	}
 
-	// The OCI command-line spec says that the signal should be specified
-	// via a flag, but runc (and things that call runc) pass it as an
-	// argument.
-	signal := f.Arg(1)
-	if signal == "" {
-		signal = "TERM"
-	}
-
-	sig, err := parseSignal(signal)
-	if err != nil {
+	cl := client.New(conf)
+	if err := cl.KillContainer(ctx, c, client.KillOpts{
+		Signal: sig,
+		All:    k.all,
+		PID:    int32(k.pid),
+		PGID:   int32(k.pgid),
+	}); err != nil {
 		util.Fatalf("%v", err)
 	}
 
-	if k.pid != 0 {
-		if err := c.SignalProcess(sig, int32(k.pid)); err != nil {
-			util.Fatalf("failed to signal pid %d: %v", k.pid, err)
-		}
-	} else if k.pgid != 0 {
-		if err := c.SignalProcessGroup(sig, int32(k.pgid)); err != nil {
-			util.Fatalf("failed to signal process group %d: %v", k.pgid, err)
-		}
-	} else {
-		if err := c.SignalContainer(sig, k.all); err != nil {
-			util.Fatalf("%v", err)
-		}
-	}
 	return subcommands.ExitSuccess
-}
-
-func parseSignal(s string) (unix.Signal, error) {
-	n, err := strconv.Atoi(s)
-	if err == nil {
-		sig := unix.Signal(n)
-		for _, msig := range signalMap {
-			if sig == msig {
-				return sig, nil
-			}
-		}
-		return -1, fmt.Errorf("unknown signal %q", s)
-	}
-	if sig, ok := signalMap[strings.TrimPrefix(strings.ToUpper(s), "SIG")]; ok {
-		return sig, nil
-	}
-	return -1, fmt.Errorf("unknown signal %q", s)
-}
-
-var signalMap = map[string]unix.Signal{
-	"ABRT":   unix.SIGABRT,
-	"ALRM":   unix.SIGALRM,
-	"BUS":    unix.SIGBUS,
-	"CHLD":   unix.SIGCHLD,
-	"CLD":    unix.SIGCLD,
-	"CONT":   unix.SIGCONT,
-	"FPE":    unix.SIGFPE,
-	"HUP":    unix.SIGHUP,
-	"ILL":    unix.SIGILL,
-	"INT":    unix.SIGINT,
-	"IO":     unix.SIGIO,
-	"IOT":    unix.SIGIOT,
-	"KILL":   unix.SIGKILL,
-	"PIPE":   unix.SIGPIPE,
-	"POLL":   unix.SIGPOLL,
-	"PROF":   unix.SIGPROF,
-	"PWR":    unix.SIGPWR,
-	"QUIT":   unix.SIGQUIT,
-	"SEGV":   unix.SIGSEGV,
-	"STKFLT": unix.SIGSTKFLT,
-	"STOP":   unix.SIGSTOP,
-	"SYS":    unix.SIGSYS,
-	"TERM":   unix.SIGTERM,
-	"TRAP":   unix.SIGTRAP,
-	"TSTP":   unix.SIGTSTP,
-	"TTIN":   unix.SIGTTIN,
-	"TTOU":   unix.SIGTTOU,
-	"URG":    unix.SIGURG,
-	"USR1":   unix.SIGUSR1,
-	"USR2":   unix.SIGUSR2,
-	"VTALRM": unix.SIGVTALRM,
-	"WINCH":  unix.SIGWINCH,
-	"XCPU":   unix.SIGXCPU,
-	"XFSZ":   unix.SIGXFSZ,
 }

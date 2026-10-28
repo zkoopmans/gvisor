@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -31,6 +32,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/client"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -106,9 +108,9 @@ func TestDeleteRunningRequiresForce(t *testing.T) {
 					NoRootContainer: tc.noRootContainer,
 				},
 			}
-			err := requireForce(conf, c)
+			err := client.RequireForce(conf.RootDir, conf, c)
 			if gotErr := err != nil; gotErr != tc.wantErr {
-				t.Errorf("requireForce() = %v, wantErr: %t", err, tc.wantErr)
+				t.Errorf("RequireForce() = %v, wantErr: %t", err, tc.wantErr)
 			}
 		})
 	}
@@ -180,7 +182,10 @@ func TestKillBootingSandbox(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return c.SignalContainer(unix.SIGKILL, false)
+		cl := client.New(conf)
+		return cl.KillContainer(context.Background(), c, client.KillOpts{
+			Signal: unix.SIGKILL,
+		})
 	})
 }
 
