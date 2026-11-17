@@ -5,12 +5,25 @@
 # Area fields:
 #   name:             Area name. Areas must be sorted by name.
 #   enforced_review:  Whether the area gets a CODEOWNERS section, making review
-#                     by one of its specialized maintainers mandatory.
+#                     by one of its approvers mandatory. Requires at least one
+#                     owner and one approver. Set for two reasons: the area is
+#                     security- or release-sensitive and its approver list is
+#                     deliberately short (seccomp, release_pipeline), or its
+#                     owners have confirmed the list and landed the area's
+#                     STANDARDS.md. Sensitive areas do not widen by default.
+#   owners:           Sorted GitHub usernames of the maintainers accountable
+#                     for the area: they curate its approvers and write its
+#                     standards. Must be a subset of approvers.
+#   approvers:        Sorted GitHub usernames of the non-emeritus maintainers
+#                     who review and approve changes in the area. The reviewer
+#                     assigner routes pull requests to the active ones.
 #   paths:            Repo-root-relative directories (each starting with a
 #                     slash, no trailing slash) covered by the area.
 areas:
   - name: benchmarks
     enforced_review: false
+    owners: [zkoopmans]
+    approvers: [aaltinaydev, riverafernando, zkoopmans]
     paths:
       - /images/benchmarks
       - /runsc/profile
@@ -19,12 +32,44 @@ areas:
       - /tools/bigquery
       - /tools/parsers
       - /tools/profiletool
+  - name: build_tooling
+    enforced_review: false
+    owners: [relkochta]
+    approvers: [parth-opensrc, relkochta, rexren-gif]
+    paths:
+      - /tools/actionlint
+      - /tools/bazeldefs
+      - /tools/buildkite
+      - /tools/buildkite_coordinator
+      - /tools/checkaligned
+      - /tools/checkconst
+      - /tools/checkescape
+      - /tools/checkimports
+      - /tools/checklinkname
+      - /tools/clang_tidy
+      - /tools/compat
+      - /tools/constraintutil
+      - /tools/cstate_wake_probe
+      - /tools/go_fieldenum
+      - /tools/go_generics
+      - /tools/go_hostlayout
+      - /tools/go_marshal
+      - /tools/licensecheck
+      - /tools/nogo
+      - /tools/stucktasks
+      - /tools/tpucheckpoint
+      - /tools/yamltest
+      - /tools/zstd
   - name: checklocks
     enforced_review: false
+    owners: [relkochta]
+    approvers: [parth-opensrc, relkochta, rexren-gif]
     paths:
       - /tools/checklocks
   - name: checkpointing
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [aaltinaydev, etienneperot, manninglucas, nybidari, rexren-gif, trantoji]
     paths:
       - /pkg/aio
       - /pkg/compressio
@@ -36,17 +81,23 @@ areas:
       - /tools/go_stateify
   - name: erofs
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [ayushr2, kerumeto, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /pkg/erofs
       - /pkg/sentry/fsimpl/erofs
   - name: fuse
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [ayushr2, kerumeto, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /images/fuse
       - /pkg/sentry/fsimpl/fuse
       - /test/fuse_host
   - name: gpu
     enforced_review: false
+    owners: [nixprime]
+    approvers: [aaltinaydev, ayushr2, kerumeto, nixprime, parth-opensrc, trantoji, zkoopmans]
     paths:
       - /images/gpu
       - /pkg/sentry/devices/nvproxy
@@ -56,12 +107,69 @@ areas:
       - /tools/nvidia_driver_differ
   - name: kubernetes
     enforced_review: false
+    owners: [zkoopmans]
+    approvers: [aaltinaydev, riverafernando, zkoopmans]
     paths:
       - /test/kubernetes
       - /tools/gvisor_k8s_tool
       - /webhook
+  - name: libs
+    enforced_review: false
+    owners: [aaltinaydev]
+    approvers: [aaltinaydev, kerumeto, parth-opensrc, relkochta, rexren-gif, xinzhong, zkoopmans]
+    paths:
+      - /pkg/abi
+      - /pkg/binary
+      - /pkg/bitmap
+      - /pkg/bits
+      - /pkg/buffer
+      - /pkg/cleanup
+      - /pkg/context
+      - /pkg/control
+      - /pkg/coretag
+      - /pkg/coverage
+      - /pkg/cpuid
+      - /pkg/crypto
+      - /pkg/devutil
+      - /pkg/errors
+      - /pkg/eventfd
+      - /pkg/fd
+      - /pkg/fdchannel
+      - /pkg/fdnotifier
+      - /pkg/flipcall
+      - /pkg/fsutil
+      - /pkg/gohacks
+      - /pkg/goid
+      - /pkg/gomaxprocs
+      - /pkg/gvisordetect
+      - /pkg/hostarch
+      - /pkg/hostos
+      - /pkg/hostsyscall
+      - /pkg/hosttid
+      - /pkg/ilist
+      - /pkg/linewriter
+      - /pkg/log
+      - /pkg/marshal
+      - /pkg/pinring
+      - /pkg/pool
+      - /pkg/rand
+      - /pkg/refs
+      - /pkg/ringdeque
+      - /pkg/secio
+      - /pkg/segment
+      - /pkg/sighandling
+      - /pkg/spinlock
+      - /pkg/syserr
+      - /pkg/timing
+      - /pkg/trie
+      - /pkg/unet
+      - /pkg/urpc
+      - /pkg/waiter
+      - /pkg/zip
   - name: metrics
     enforced_review: false
+    owners: [xinzhong]
+    approvers: [fvoznika, rexren-gif, xinzhong]
     paths:
       - /pkg/metric
       - /pkg/prometheus
@@ -71,6 +179,8 @@ areas:
       - /test/metricsviz
   - name: mm
     enforced_review: false
+    owners: [nixprime]
+    approvers: [ayushr2, kerumeto, konstantin-s-bogom, nixprime]
     paths:
       - /pkg/memutil
       - /pkg/safecopy
@@ -83,6 +193,8 @@ areas:
       - /pkg/usermem
   - name: networking
     enforced_review: false
+    owners: [nybidari]
+    approvers: [carzh, kerumeto, nybidari, parth-opensrc, relkochta, rexren-gif]
     paths:
       - /images/iptables
       - /images/nftables
@@ -103,40 +215,55 @@ areas:
       - /tools/xdp
   - name: oci
     enforced_review: false
+    owners: [etienneperot]
+    approvers: [ayushr2, etienneperot, xinzhong]
     paths:
-      - /pkg/shim
       - /runsc/container
       - /runsc/specutils
-      - /shim
   - name: platform_kvm
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom, rexren-gif]
     paths:
       - /pkg/sentry/platform/kvm
   - name: platform_ptrace
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom, rexren-gif]
     paths:
       - /pkg/sentry/platform/ptrace
   - name: platform_slimvm
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom, rexren-gif]
     paths:
       - /pkg/sentry/platform/slimvm
   - name: platform_systrap
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom, rexren-gif]
     paths:
       - /pkg/sentry/platform/systrap
   - name: platforms
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom, rexren-gif]
     paths:
       - /pkg/ring0
       - /pkg/sentry/platform
       - /pkg/sigframe
   - name: rdma
     enforced_review: false
+    owners: [ayushr2]
+    approvers: [aaltinaydev, ayushr2, kerumeto, nixprime, parth-opensrc, trantoji, zkoopmans]
     paths:
       - /pkg/rdma
       - /pkg/sentry/devices/rdmaproxy
   - name: release_pipeline
+    # Sensitive: builds and signs what users run. Short list by design.
     enforced_review: true
+    owners: [relkochta]
+    approvers: [etienneperot, relkochta]
     paths:
       - /.buildkite
       - /.github
@@ -144,10 +271,14 @@ areas:
       - /tools/github
   - name: runsc
     enforced_review: false
+    owners: [etienneperot]
+    approvers: [aaltinaydev, ayushr2, carzh, etienneperot, parth-opensrc, rexren-gif]
     paths:
       - /runsc
   - name: runtime_monitoring
     enforced_review: false
+    owners: [xinzhong]
+    approvers: [fvoznika, rexren-gif, xinzhong]
     paths:
       - /examples/seccheck
       - /pkg/eventchannel
@@ -157,11 +288,16 @@ areas:
       - /tools/tracereplay
   - name: sandboxexec
     enforced_review: false
+    owners: [milantracy]
+    approvers: [carzh, milantracy]
     paths:
       - /examples/sandboxexec
       - /sandboxexec
   - name: seccomp
+    # Sensitive: the syscall allowlist is part of the TCB. Short list by design.
     enforced_review: true
+    owners: [etienneperot]
+    approvers: [etienneperot, fvoznika]
     paths:
       - /pkg/bpf
       - /pkg/seccomp
@@ -173,11 +309,59 @@ areas:
       - /test/secfuzz
   - name: sentry
     enforced_review: false
+    owners: [fvoznika]
+    approvers: [ayushr2, fvoznika, konstantin-s-bogom, milantracy, nixprime, parth-opensrc, shailend-g, xinzhong]
     paths:
+      - /pkg/atomicbitops
       - /pkg/sentry
+      - /pkg/sleep
+      - /pkg/sync
+      - /pkg/syncevent
       - /vdso
+  - name: shim
+    enforced_review: false
+    owners: [milantracy]
+    approvers: [milantracy, nybidari, xinzhong, zkoopmans]
+    paths:
+      - /pkg/shim
+      - /shim
+  - name: tests
+    enforced_review: false
+    owners: []
+    approvers: [carzh, parth-opensrc, relkochta, rexren-gif, xinzhong]
+    paths:
+      - /images/arch-systemd
+      - /images/arm-qemu
+      - /images/basic
+      - /images/certs
+      - /images/compatibility
+      - /images/containerd
+      - /images/default
+      - /images/image-test
+      - /images/moby
+      - /images/runtimes
+      - /images/systemd-integ
+      - /images/systemd-services
+      - /images/systemd-user
+      - /images/syzkaller
+      - /images/ubi10-init
+      - /pkg/test
+      - /test/cmd
+      - /test/compatibility
+      - /test/e2e
+      - /test/image
+      - /test/moby
+      - /test/podman
+      - /test/root
+      - /test/runner
+      - /test/runtimes
+      - /test/syscalls
+      - /test/uds
+      - /test/util
   - name: tpu
     enforced_review: false
+    owners: [trantoji]
+    approvers: [aaltinaydev, milantracy, trantoji]
     paths:
       - /images/tpu
       - /pkg/sentry/devices/tpuproxy
@@ -185,6 +369,8 @@ areas:
       - /tools/tpu
   - name: vfs
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [ayushr2, kerumeto, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /pkg/fspath
       - /pkg/lisafs
@@ -196,6 +382,8 @@ areas:
       - /test/fsstress
   - name: website
     enforced_review: false
+    owners: []
+    approvers: [etienneperot, konstantin-s-bogom, zkoopmans]
     paths:
       - /g3doc
       - /images/jekyll

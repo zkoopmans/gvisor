@@ -3,13 +3,16 @@ const path = require('path');
 const yaml = require('js-yaml');
 
 /**
- * Auto-assigns maintainers from governance/maintainers.yaml and areas.yaml to
- * incoming Pull Requests by combining area specialization with a randomized roster fallback.
+ * Auto-assigns maintainers to incoming Pull Requests: the approvers of the
+ * areas (governance/areas.yaml) covering the changed files, filtered to
+ * active maintainers (governance/maintainers.yaml), with a randomized roster
+ * fallback.
  *
  * This function is executed as a GitHub Action. It parses the active
  * maintainers roster, filters out the PR author and bots, and assigns up to
- * two reviewers: prioritizing one suggested domain expert (if available) and
- * randomly selecting fallback reviewer(s) from the remaining eligible roster
+ * two reviewers: prioritizing approvers from the areas covering the changed
+ * files (both seats when the area has them), and only then randomly
+ * selecting fallback reviewer(s) from the remaining eligible roster
  * to encourage knowledge sharing.
  *
  * @param {{
@@ -72,19 +75,22 @@ module.exports = async ({github, context, core, delayMs = 5 * 60 * 1000}) => {
     return;
   }
 
-  // Filter for active maintainers and build area mapping
-  const maintainersByArea = new Map();
+  // Active maintainers (status from maintainers.yaml) form the general pool;
+  // each area's approvers (from areas.yaml) form its specialist pool. Only
+  // active maintainers are ever assigned, whichever list names them.
+  const activeLogins = new Set();
   const eligibleApprovers = [];
   for (const m of maintainersData?.maintainers || []) {
     if (m.status === 'ACTIVE' && m.github && m.github.toLowerCase() !== authorLower) {
+      activeLogins.add(m.github.toLowerCase());
       eligibleApprovers.push(m.github);
-      for (const area of (m.areas || [])) {
-        if (!maintainersByArea.has(area)) {
-          maintainersByArea.set(area, []);
-        }
-        maintainersByArea.get(area).push(m.github);
-      }
     }
+  }
+  const maintainersByArea = new Map();
+  for (const area of areasData?.areas || []) {
+    maintainersByArea.set(
+        area.name,
+        (area.approvers || []).filter(login => activeLogins.has(login.toLowerCase())));
   }
 
   if (eligibleApprovers.length === 0) {
@@ -108,8 +114,7 @@ module.exports = async ({github, context, core, delayMs = 5 * 60 * 1000}) => {
         .map(area => area.name);
 
     eligibleAreaSpecialists = [
-      ...new Set(matchedAreas.flatMap(area => maintainersByArea.get(area) || [])
-          .filter(login => eligibleApprovers.includes(login))),
+      ...new Set(matchedAreas.flatMap(area => maintainersByArea.get(area) || [])),
     ];
   } catch (error) {
     core.warning(
@@ -136,16 +141,28 @@ module.exports = async ({github, context, core, delayMs = 5 * 60 * 1000}) => {
     }
   }
 
-  // Fallback: Fill remaining slot(s) (up to 2 total reviewers) from general eligible roster
+  // Fill remaining slot(s) (up to 2 total reviewers), preferring the matched
+  // areas: a second specialist from the same areas if one is available, and
+  // only then the general eligible roster. This keeps both seats inside the
+  // area whenever the area has the people for it.
   const selectedReviewersLower = selectedReviewers.map(r => r.toLowerCase());
-  const remainingEligible = eligibleApprovers.filter(
-      login => !selectedReviewersLower.includes(login.toLowerCase()));
+  const notSelected = login => !selectedReviewersLower.includes(login.toLowerCase());
+  const remainingSpecialists = eligibleAreaSpecialists.filter(notSelected);
+  const remainingGeneral = eligibleApprovers.filter(
+      login => notSelected(login) &&
+          !remainingSpecialists.some(s => s.toLowerCase() === login.toLowerCase()));
+  const remainingEligible = [
+    ...shuffle(remainingSpecialists),
+    ...shuffle(remainingGeneral),
+  ];
   if (remainingEligible.length > 0 && selectedReviewers.length < 2) {
     const needed = 2 - selectedReviewers.length;
-    const fallbackToAssign = shuffle(remainingEligible).slice(0, needed);
+    const fallbackToAssign = remainingEligible.slice(0, needed);
     for (const reviewer of fallbackToAssign) {
       selectedReviewers.push(reviewer);
-      console.log(`Selected fallback roster reviewer: ${reviewer}`);
+      const kind = remainingSpecialists.includes(reviewer) ?
+          'area specialist' : 'fallback roster reviewer';
+      console.log(`Selected ${kind}: ${reviewer}`);
     }
   }
 

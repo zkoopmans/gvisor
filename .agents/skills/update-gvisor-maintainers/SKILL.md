@@ -31,23 +31,35 @@ Each entry under `maintainers:`:
         until: 2025-03-01
     started: 2018-05-08         # First contribution. The list is sorted by this.
     status: HIATUS_SINCE:2026-07-17
-    areas: [gpu, networking]    # Optional. Sorted area names from areas.yaml;
-                                # grants CODEOWNERS ownership of the paths of
-                                # areas with enforced_review. Not for emeritus.
 ```
+
+Who reviews what is *not* on the person: it is on the area, in `areas.yaml`.
 
 Each entry under `areas:` in `areas.yaml`:
 
 ```yaml
   - name: gpu                   # Sorted by name.
     enforced_review: false      # Required. `true` generates a CODEOWNERS
-                                # section for the area, making
-                                # specialized-maintainer review mandatory.
-                                # Needs at least one non-emeritus maintainer
-                                # with the area.
+                                # section for the area, making approver
+                                # review mandatory. Needs at least one owner
+                                # and one approver. Sensitive areas (seccomp,
+                                # release_pipeline) are enforced with short
+                                # lists by design; others earn it by landing
+                                # STANDARDS.md.
+    owners: [nixprime]          # Sorted GitHub usernames accountable for the
+                                # area: curate its approvers, write its
+                                # STANDARDS.md. Subset of approvers.
+    approvers: [nixprime, zkoopmans]  # Sorted GitHub usernames who review and
+                                # approve here. Non-emeritus maintainers only;
+                                # the assigner routes to the active ones.
     paths:                      # Repo-root-relative dirs (/like/this), no
       - /images/gpu             # trailing slash. Each path in one area only.
 ```
+
+Owners and approvers are rendered into `MAINTAINERS.md` (an areas table, plus
+an "Areas" column on each maintainer) and, for enforced areas, into
+`CODEOWNERS`. Moving a maintainer to emeritus requires removing them from
+every `approvers` list in the same change; the generator refuses otherwise.
 
 `status` is one of three, and it drives everything downstream:
 
@@ -79,6 +91,8 @@ The two that are not:
     file. Look up `github_id` rather than guessing it.
 -   Changed employer: update `affiliation`, and move the old one to
     `past_affiliation` with the date it ended as `until`.
+-   Changes specialization: edit the area's `approvers` (and `owners`) in
+    `areas.yaml`, not the person's entry.
 
 Dates are real calendar dates, so go look up today's date rather than guessing
 at one. If the user gave you a date, use theirs.
