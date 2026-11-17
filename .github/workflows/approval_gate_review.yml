@@ -1,0 +1,25 @@
+# Companion to "Approval gate": fires on every review (read-only token on
+# fork pull requests, so it cannot set a status itself) and records the pull
+# request number as an artifact for the gate's workflow_run step.
+name: Approval gate (review)
+
+"on":
+  pull_request_review:
+    types: [submitted, dismissed, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    if: github.repository == 'gvisor/gvisor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: Record pull request number
+      run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: pr-number
+        path: pr-number.txt
+        retention-days: 1
