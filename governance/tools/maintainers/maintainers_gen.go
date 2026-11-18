@@ -51,7 +51,6 @@ type maintainer struct {
 	PastAffiliations []pastAffiliation `yaml:"past_affiliation"`
 	Started          string            `yaml:"started"`
 	Status           string            `yaml:"status"`
-	Areas            []string          `yaml:"areas"`
 }
 
 // roster is the schema of maintainers.yaml.
@@ -63,6 +62,8 @@ type roster struct {
 type area struct {
 	Name           string   `yaml:"name"`
 	EnforcedReview *bool    `yaml:"enforced_review"`
+	Owners         []string `yaml:"owners"`
+	Approvers      []string `yaml:"approvers"`
 	Paths          []string `yaml:"paths"`
 }
 
@@ -91,9 +92,34 @@ func parseAreas(yamlData []byte) (map[string]area, error) {
 			return nil, fmt.Errorf("areas must be sorted by name and unique: %q comes after %q", a.Name, prev.Name)
 		}
 		prev = a
+		if err := checkSortedUnique("approvers", a.Approvers); err != nil {
+			return nil, fmt.Errorf("area %q: %w", a.Name, err)
+		}
+		if err := checkSortedUnique("owners", a.Owners); err != nil {
+			return nil, fmt.Errorf("area %q: %w", a.Name, err)
+		}
+		for _, o := range a.Owners {
+			if !slices.Contains(a.Approvers, o) {
+				return nil, fmt.Errorf("area %q: owner %q is not an approver; owners must be a subset of approvers", a.Name, o)
+			}
+		}
+		if *a.EnforcedReview {
+			if len(a.Approvers) == 0 {
+				return nil, fmt.Errorf("area %q: enforced_review requires at least one approver", a.Name)
+			}
+			if len(a.Owners) == 0 {
+				return nil, fmt.Errorf("area %q: enforced_review requires at least one owner", a.Name)
+			}
+		}
 		for _, p := range a.Paths {
 			if !strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
 				return nil, fmt.Errorf("area %q: path %q must start with a slash and not end with one", a.Name, p)
+			}
+			if strings.Contains(p, "**") {
+				return nil, fmt.Errorf("area %q: path %q: only single-segment wildcards (*) are supported", a.Name, p)
+			}
+			if i := strings.Index(p, "*"); i >= 0 && strings.Contains(p[i:], "/") {
+				return nil, fmt.Errorf("area %q: path %q: a wildcard may only appear in the last path segment", a.Name, p)
 			}
 			if other, ok := pathArea[p]; ok {
 				return nil, fmt.Errorf("area %q: path %q already appears in area %q", a.Name, p, other)
@@ -103,6 +129,20 @@ func parseAreas(yamlData []byte) (map[string]area, error) {
 		byName[a.Name] = a
 	}
 	return byName, nil
+}
+
+// checkSortedUnique validates that a list of GitHub usernames is sorted
+// case-insensitively and has no duplicates.
+func checkSortedUnique(field string, logins []string) error {
+	for i, l := range logins {
+		if l == "" {
+			return fmt.Errorf("%s: empty username", field)
+		}
+		if i > 0 && strings.ToLower(l) <= strings.ToLower(logins[i-1]) {
+			return fmt.Errorf("%s must be sorted (case-insensitively) and unique: %q comes after %q", field, l, logins[i-1])
+		}
+	}
+	return nil
 }
 
 // parseStatus splits a status into its kind ("ACTIVE", "HIATUS_SINCE" or
@@ -150,20 +190,8 @@ func parseRoster(yamlData []byte, areasByName map[string]area) (*roster, error) 
 				return nil, fmt.Errorf("maintainer %q: invalid until date %q in past_affiliation", m.GitHub, p.Until)
 			}
 		}
-		kind, _, err := parseStatus(m.Status)
-		if err != nil {
+		if _, _, err := parseStatus(m.Status); err != nil {
 			return nil, fmt.Errorf("maintainer %q: %w", m.GitHub, err)
-		}
-		for i, a := range m.Areas {
-			if _, ok := areasByName[a]; !ok {
-				return nil, fmt.Errorf("maintainer %q: unknown area %q", m.GitHub, a)
-			}
-			if i > 0 && a <= m.Areas[i-1] {
-				return nil, fmt.Errorf("maintainer %q: areas must be sorted and unique: %q comes after %q", m.GitHub, a, m.Areas[i-1])
-			}
-		}
-		if kind == "EMERITUS_SINCE" && len(m.Areas) > 0 {
-			return nil, fmt.Errorf("maintainer %q: emeritus maintainers may not own any path", m.GitHub)
 		}
 		if m.Started < prev.Started {
 			return nil, fmt.Errorf("maintainers are not sorted by started date: %q (%s) comes after %q (%s)", m.Name, m.Started, prev.Name, prev.Started)
@@ -178,18 +206,42 @@ func parseRoster(yamlData []byte, areasByName map[string]area) (*roster, error) 
 		}
 		seenIDs[m.GitHubID] = true
 	}
+	// Every owner and approver must be a maintainer who still has merge
+	// permissions. Moving someone to emeritus therefore requires removing
+	// them from their areas in the same change.
+	kindOf := make(map[string]string, len(r.Maintainers))
+	for _, m := range r.Maintainers {
+		k, _, _ := parseStatus(m.Status)
+		kindOf[m.GitHub] = k
+	}
+	for _, name := range slices.Sorted(maps.Keys(areasByName)) {
+		a := areasByName[name]
+		for _, l := range a.Approvers {
+			k, ok := kindOf[l]
+			if !ok {
+				return nil, fmt.Errorf("area %q: approver %q is not in maintainers.yaml", name, l)
+			}
+			if k == "EMERITUS_SINCE" {
+				return nil, fmt.Errorf("area %q: approver %q is emeritus; emeritus maintainers may not own any path", name, l)
+			}
+		}
+	}
 	return &r, nil
 }
 
-// generateCODEOWNERS renders `CODEOWNERS` contents. Only areas with
-// enforced_review get a CODEOWNERS section.
-func generateCODEOWNERS(r *roster, areasByName map[string]area) ([]byte, error) {
-	ownersByArea := make(map[string][]string)
-	for _, m := range r.Maintainers {
-		for _, a := range m.Areas {
-			ownersByArea[a] = append(ownersByArea[a], "@"+m.GitHub)
-		}
+// handles prefixes each GitHub username with "@".
+func handles(logins []string) []string {
+	out := make([]string, len(logins))
+	for i, l := range logins {
+		out[i] = "@" + l
 	}
+	return out
+}
+
+// generateCODEOWNERS renders `CODEOWNERS` contents. Only areas with
+// enforced_review get a CODEOWNERS section; its reviewers are the area's
+// approvers. Owners are rendered in MAINTAINERS.md.
+func generateCODEOWNERS(areasByName map[string]area) ([]byte, error) {
 	var b bytes.Buffer
 	b.WriteString("# Generated from governance/maintainers.yaml and governance/areas.yaml by\n")
 	b.WriteString("# //governance/tools/maintainers:maintainers_gen; do not edit directly.\n")
@@ -198,16 +250,16 @@ func generateCODEOWNERS(r *roster, areasByName map[string]area) ([]byte, error) 
 		if !*a.EnforcedReview {
 			continue
 		}
-		owners := ownersByArea[name]
-		if len(owners) == 0 {
-			return nil, fmt.Errorf("area %q: enforced_review requires at least one maintainer specialized in the area", name)
-		}
-		slices.SortFunc(owners, func(a, b string) int {
-			return strings.Compare(strings.ToLower(a), strings.ToLower(b))
-		})
 		fmt.Fprintf(&b, "\n# Area: %s\n", name)
 		for _, p := range slices.Sorted(slices.Values(a.Paths)) {
-			fmt.Fprintf(&b, "%s/ %s\n", p, strings.Join(owners, " "))
+			// A directory gets a trailing slash so CODEOWNERS matches its
+			// contents; a wildcard pattern is passed through as-is (CODEOWNERS
+			// globs share the one-segment semantics of areas.yaml).
+			if strings.Contains(p, "*") {
+				fmt.Fprintf(&b, "%s %s\n", p, strings.Join(handles(a.Approvers), " "))
+			} else {
+				fmt.Fprintf(&b, "%s/ %s\n", p, strings.Join(handles(a.Approvers), " "))
+			}
 		}
 	}
 	return b.Bytes(), nil
@@ -268,11 +320,25 @@ func formatTable(headers []string, rows [][]string) string {
 }
 
 // generateMaintainersMD renders `MAINTAINERS.md` contents.
-func generateMaintainersMD(r *roster) ([]byte, error) {
+func generateMaintainersMD(r *roster, areasByName map[string]area) ([]byte, error) {
 	var b bytes.Buffer
-	b.WriteString("<!-- Generated from governance/maintainers.yaml by\n")
+	b.WriteString("<!-- Generated from governance/maintainers.yaml and governance/areas.yaml by\n")
 	b.WriteString("     //governance/tools/maintainers:maintainers_gen; do not edit directly. -->\n\n")
 	b.WriteString("The current maintainers of the gVisor project are listed below.\n\n")
+
+	// Invert the areas so each maintainer's row can list where they approve
+	// and which of those areas they own (marked with an asterisk).
+	areasOf := make(map[string][]string)
+	for _, name := range slices.Sorted(maps.Keys(areasByName)) {
+		a := areasByName[name]
+		for _, l := range a.Approvers {
+			label := name
+			if slices.Contains(a.Owners, l) {
+				label += "*"
+			}
+			areasOf[l] = append(areasOf[l], label)
+		}
+	}
 
 	var activeRows [][]string
 	for _, m := range r.Maintainers {
@@ -281,10 +347,41 @@ func generateMaintainersMD(r *roster) ([]byte, error) {
 				m.Name,
 				fmt.Sprintf("[@%s](https://github.com/%s)", m.GitHub, m.GitHub),
 				m.Affiliation,
+				strings.Join(areasOf[m.GitHub], ", "),
 			})
 		}
 	}
-	b.WriteString(formatTable([]string{"Name", "GitHub ID", "Company/Organization"}, activeRows))
+	b.WriteString(formatTable([]string{"Name", "GitHub ID", "Company/Organization", "Areas (* = owner)"}, activeRows))
+
+	b.WriteString(`
+## Specialization areas
+
+Each area of the repository (see governance/areas.yaml for the paths) has
+owners and approvers. **Owners** are accountable for the area: they curate who
+may approve in it and write its standards. **Approvers** review and approve
+changes in it; the reviewer assigner routes pull requests to them. Owners are
+always approvers. An area marked *enforced* requires an approver's review
+before merge (see CODEOWNERS): either because it is security- or
+release-sensitive and its approver list is deliberately short, or because its
+owners have confirmed the list and landed the area's standards.
+
+`)
+
+	var areaRows [][]string
+	for _, name := range slices.Sorted(maps.Keys(areasByName)) {
+		a := areasByName[name]
+		enforced := ""
+		if *a.EnforcedReview {
+			enforced = "yes"
+		}
+		areaRows = append(areaRows, []string{
+			name,
+			strings.Join(handles(a.Owners), " "),
+			strings.Join(handles(a.Approvers), " "),
+			enforced,
+		})
+	}
+	b.WriteString(formatTable([]string{"Area", "Owners", "Approvers", "Enforced"}, areaRows))
 
 	b.WriteString(`
 ## Emeritus Maintainers
@@ -343,9 +440,9 @@ func main() {
 	var outData []byte
 	switch *format {
 	case "MAINTAINERS.md":
-		outData, err = generateMaintainersMD(r)
+		outData, err = generateMaintainersMD(r, areasByName)
 	case "CODEOWNERS":
-		outData, err = generateCODEOWNERS(r, areasByName)
+		outData, err = generateCODEOWNERS(areasByName)
 	default:
 		err = fmt.Errorf("invalid format %q", *format)
 	}

@@ -5,12 +5,30 @@
 # Area fields:
 #   name:             Area name. Areas must be sorted by name.
 #   enforced_review:  Whether the area gets a CODEOWNERS section, making review
-#                     by one of its specialized maintainers mandatory.
-#   paths:            Repo-root-relative directories (each starting with a
-#                     slash, no trailing slash) covered by the area.
+#                     by one of its approvers mandatory. Requires at least one
+#                     owner and one approver. Set for two reasons: the area is
+#                     security- or release-sensitive and its approver list is
+#                     deliberately short (seccomp, release_pipeline), or its
+#                     owners have confirmed the list and landed the area's
+#                     STANDARDS.md. Sensitive areas do not widen by default.
+#   owners:           Sorted GitHub usernames of the maintainers accountable
+#                     for the area: they curate its approvers and write its
+#                     standards. Must be a subset of approvers.
+#   approvers:        Sorted GitHub usernames of the non-emeritus maintainers
+#                     who review and approve changes in the area. The reviewer
+#                     assigner routes pull requests to the active ones.
+#   paths:            Repo-root-relative paths (each starting with a slash,
+#                     no trailing slash) covered by the area, and everything
+#                     beneath them. The last segment may contain `*`, which
+#                     matches within that segment only (never `/`), so
+#                     `/test/syscalls/linux/socket_*` covers the socket tests
+#                     without claiming the directory. Areas nest: a file is
+#                     routed to the most specific (longest) matching path.
 areas:
   - name: benchmarks
     enforced_review: false
+    owners: [zkoopmans]
+    approvers: [aaltinaydev, etienneperot, riverafernando, zkoopmans]
     paths:
       - /images/benchmarks
       - /runsc/profile
@@ -19,12 +37,39 @@ areas:
       - /tools/bigquery
       - /tools/parsers
       - /tools/profiletool
-  - name: checklocks
+  - name: build_tooling
     enforced_review: false
+    owners: [relkochta]
+    approvers: [parth-opensrc, relkochta, rexren-gif]
     paths:
+      - /tools/actionlint
+      - /tools/bazeldefs
+      - /tools/buildkite
+      - /tools/buildkite_coordinator
+      - /tools/checkaligned
+      - /tools/checkconst
+      - /tools/checkescape
+      - /tools/checkimports
+      - /tools/checklinkname
       - /tools/checklocks
+      - /tools/clang_tidy
+      - /tools/compat
+      - /tools/constraintutil
+      - /tools/cstate_wake_probe
+      - /tools/go_fieldenum
+      - /tools/go_generics
+      - /tools/go_hostlayout
+      - /tools/go_marshal
+      - /tools/licensecheck
+      - /tools/nogo
+      - /tools/stucktasks
+      - /tools/tpucheckpoint
+      - /tools/yamltest
+      - /tools/zstd
   - name: checkpointing
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [aaltinaydev, etienneperot, manninglucas, nybidari, rexren-gif, riverafernando, trantoji]
     paths:
       - /pkg/aio
       - /pkg/compressio
@@ -34,43 +79,108 @@ areas:
       - /pkg/state
       - /runsc/checkpointgofer
       - /tools/go_stateify
-  - name: erofs
-    enforced_review: false
-    paths:
-      - /pkg/erofs
-      - /pkg/sentry/fsimpl/erofs
   - name: fuse
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /images/fuse
       - /pkg/sentry/fsimpl/fuse
       - /test/fuse_host
+      - /test/syscalls/linux/fuse*
+  - name: gofer
+    # Host boundary: the gofer protocol (lisafs/p9), the gofer process, and its client.
+    enforced_review: false
+    owners: [ayushr2]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
+    paths:
+      - /pkg/lisafs
+      - /pkg/p9
+      - /pkg/sentry/fsimpl/gofer
+      - /runsc/gofer
+      - /test/syscalls/linux/chroot*
+      - /test/syscalls/linux/host_pty*
+      - /test/syscalls/linux/mount*
+      - /test/syscalls/linux/overlay*
+      - /test/syscalls/linux/pivot_root*
   - name: gpu
     enforced_review: false
+    owners: [ayushr2]
+    approvers: [aaltinaydev, ayushr2, kerumeto, nixprime, parth-opensrc, trantoji, zkoopmans]
     paths:
       - /images/gpu
+      - /pkg/rdma
       - /pkg/sentry/devices/nvproxy
+      - /pkg/sentry/devices/rdmaproxy
       - /test/gpu
       - /tools/gpu
       - /tools/ioctl_sniffer
       - /tools/nvidia_driver_differ
   - name: kubernetes
     enforced_review: false
+    owners: [zkoopmans]
+    approvers: [aaltinaydev, etienneperot, riverafernando, zkoopmans]
     paths:
       - /test/kubernetes
       - /tools/gvisor_k8s_tool
       - /webhook
-  - name: metrics
+  - name: libs
     enforced_review: false
+    owners: [aaltinaydev]
+    approvers: [aaltinaydev, parth-opensrc, relkochta, rexren-gif, xinzhong, zkoopmans]
     paths:
-      - /pkg/metric
-      - /pkg/prometheus
-      - /runsc/cmd/metricserver
-      - /runsc/metricserver
-      - /test/metricclient
-      - /test/metricsviz
+      - /pkg/abi
+      - /pkg/binary
+      - /pkg/bitmap
+      - /pkg/bits
+      - /pkg/buffer
+      - /pkg/cleanup
+      - /pkg/context
+      - /pkg/control
+      - /pkg/coretag
+      - /pkg/coverage
+      - /pkg/cpuid
+      - /pkg/crypto
+      - /pkg/devutil
+      - /pkg/errors
+      - /pkg/eventfd
+      - /pkg/fd
+      - /pkg/fdchannel
+      - /pkg/fdnotifier
+      - /pkg/flipcall
+      - /pkg/fsutil
+      - /pkg/gohacks
+      - /pkg/goid
+      - /pkg/gomaxprocs
+      - /pkg/gvisordetect
+      - /pkg/hostarch
+      - /pkg/hostos
+      - /pkg/hostsyscall
+      - /pkg/hosttid
+      - /pkg/ilist
+      - /pkg/linewriter
+      - /pkg/log
+      - /pkg/marshal
+      - /pkg/pinring
+      - /pkg/pool
+      - /pkg/rand
+      - /pkg/refs
+      - /pkg/ringdeque
+      - /pkg/secio
+      - /pkg/segment
+      - /pkg/sighandling
+      - /pkg/spinlock
+      - /pkg/syserr
+      - /pkg/timing
+      - /pkg/trie
+      - /pkg/unet
+      - /pkg/urpc
+      - /pkg/waiter
+      - /pkg/zip
   - name: mm
     enforced_review: false
+    owners: [nixprime]
+    approvers: [ayushr2, konstantin-s-bogom, nixprime]
     paths:
       - /pkg/memutil
       - /pkg/safecopy
@@ -81,8 +191,26 @@ areas:
       - /pkg/sentry/pgalloc
       - /pkg/sentry/usage
       - /pkg/usermem
+      - /test/syscalls/linux/brk*
+      - /test/syscalls/linux/fault*
+      - /test/syscalls/linux/madvise*
+      - /test/syscalls/linux/membarrier*
+      - /test/syscalls/linux/memfd*
+      - /test/syscalls/linux/memory_accounting*
+      - /test/syscalls/linux/mempolicy*
+      - /test/syscalls/linux/mincore*
+      - /test/syscalls/linux/mlock*
+      - /test/syscalls/linux/mmap*
+      - /test/syscalls/linux/mremap*
+      - /test/syscalls/linux/msync*
+      - /test/syscalls/linux/munmap*
+      - /test/syscalls/linux/partial_bad_buffer*
+      - /test/syscalls/linux/process_vm_read_write*
+      - /test/syscalls/linux/shm*
   - name: networking
     enforced_review: false
+    owners: [nybidari]
+    approvers: [carzh, kerumeto, nybidari, parth-opensrc, relkochta, rexren-gif]
     paths:
       - /images/iptables
       - /images/nftables
@@ -99,44 +227,78 @@ areas:
       - /test/packetdrill
       - /test/packetimpact
       - /test/rtnetlink
+      - /test/syscalls/linux/accept_bind*
+      - /test/syscalls/linux/base_poll_test*
+      - /test/syscalls/linux/bind*
+      - /test/syscalls/linux/bridge*
+      - /test/syscalls/linux/connect_external*
+      - /test/syscalls/linux/ip6tables*
+      - /test/syscalls/linux/ip_socket_test_util*
+      - /test/syscalls/linux/iptables*
+      - /test/syscalls/linux/network_namespace*
+      - /test/syscalls/linux/packet_*
+      - /test/syscalls/linux/ping_socket*
+      - /test/syscalls/linux/proc_net*
+      - /test/syscalls/linux/raw_socket*
+      - /test/syscalls/linux/readv_socket*
+      - /test/syscalls/linux/sendfile_socket*
+      - /test/syscalls/linux/socket*
+      - /test/syscalls/linux/tcp_socket*
+      - /test/syscalls/linux/tuntap*
+      - /test/syscalls/linux/udp_*
+      - /test/syscalls/linux/unix_domain_socket_test_util*
       - /tools/gvisor2pcap
       - /tools/xdp
-  - name: oci
+  - name: observability
     enforced_review: false
+    owners: [xinzhong]
+    approvers: [etienneperot, fvoznika, rexren-gif, xinzhong]
     paths:
-      - /pkg/shim
-      - /runsc/container
-      - /runsc/specutils
-      - /shim
-  - name: platform_kvm
-    enforced_review: false
-    paths:
-      - /pkg/sentry/platform/kvm
-  - name: platform_ptrace
-    enforced_review: false
-    paths:
-      - /pkg/sentry/platform/ptrace
-  - name: platform_slimvm
-    enforced_review: false
-    paths:
-      - /pkg/sentry/platform/slimvm
-  - name: platform_systrap
-    enforced_review: false
-    paths:
-      - /pkg/sentry/platform/systrap
+      - /examples/seccheck
+      - /pkg/eventchannel
+      - /pkg/metric
+      - /pkg/prometheus
+      - /pkg/seccheck
+      - /pkg/sentry/seccheck
+      - /runsc/cmd/metricserver
+      - /runsc/metricserver
+      - /test/metricclient
+      - /test/metricsviz
+      - /test/trace
+      - /tools/tracereplay
   - name: platforms
     enforced_review: false
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom]
     paths:
       - /pkg/ring0
       - /pkg/sentry/platform
+      - /pkg/sentry/platform/kvm
+      - /pkg/sentry/platform/ptrace
+      - /pkg/sentry/platform/slimvm
+      - /pkg/sentry/platform/systrap
       - /pkg/sigframe
-  - name: rdma
-    enforced_review: false
-    paths:
-      - /pkg/rdma
-      - /pkg/sentry/devices/rdmaproxy
+      - /test/syscalls/linux/32bit*
+      - /test/syscalls/linux/affinity*
+      - /test/syscalls/linux/arch_prctl*
+      - /test/syscalls/linux/exceptions*
+      - /test/syscalls/linux/fpsig*
+      - /test/syscalls/linux/fpstate*
+      - /test/syscalls/linux/getcpu*
+      - /test/syscalls/linux/kcov*
+      - /test/syscalls/linux/pointer_auth*
+      - /test/syscalls/linux/ptrace*
+      - /test/syscalls/linux/rseq*
+      - /test/syscalls/linux/sigaltstack*
+      - /test/syscalls/linux/sigreturn*
+      - /test/syscalls/linux/sysret*
+      - /test/syscalls/linux/vdso*
+      - /test/syscalls/linux/vsyscall*
   - name: release_pipeline
+    # Sensitive: builds and signs what users run. Short list by design.
     enforced_review: true
+    owners: [relkochta]
+    approvers: [etienneperot, relkochta]
     paths:
       - /.buildkite
       - /.github
@@ -144,24 +306,24 @@ areas:
       - /tools/github
   - name: runsc
     enforced_review: false
+    owners: [etienneperot]
+    approvers: [aaltinaydev, carzh, etienneperot, manninglucas, parth-opensrc, rexren-gif, xinzhong]
     paths:
       - /runsc
-  - name: runtime_monitoring
-    enforced_review: false
-    paths:
-      - /examples/seccheck
-      - /pkg/eventchannel
-      - /pkg/seccheck
-      - /pkg/sentry/seccheck
-      - /test/trace
-      - /tools/tracereplay
+      - /runsc/container
+      - /runsc/specutils
   - name: sandboxexec
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [carzh, etienneperot, manninglucas, milantracy]
     paths:
       - /examples/sandboxexec
       - /sandboxexec
   - name: seccomp
+    # Sensitive: the syscall allowlist is part of the TCB. Short list by design.
     enforced_review: true
+    owners: [etienneperot]
+    approvers: [etienneperot, fvoznika]
     paths:
       - /pkg/bpf
       - /pkg/seccomp
@@ -172,12 +334,113 @@ areas:
       - /test/secbench
       - /test/secfuzz
   - name: sentry
+    # The kernel: task lifecycle and scheduling, the syscall table, the
+    # control server (the Task API's sentry side), arch, loader, devices
+    # not claimed by gpu/tpu -- everything under /pkg/sentry that no more
+    # specific area (vfs, mm, networking, platforms, ...) claims. The
+    # subtrees below are listed for legibility; /pkg/sentry already covers
+    # them.
     enforced_review: false
+    owners: [fvoznika]
+    approvers: [ayushr2, fvoznika, konstantin-s-bogom, milantracy, nixprime, parth-opensrc, shailend-g, xinzhong]
     paths:
+      - /pkg/atomicbitops
       - /pkg/sentry
+      - /pkg/sentry/arch
+      - /pkg/sentry/control
+      - /pkg/sentry/devices
+      - /pkg/sentry/kernel
+      - /pkg/sentry/loader
+      - /pkg/sentry/strace
+      - /pkg/sentry/syscalls
+      - /pkg/sleep
+      - /pkg/sync
+      - /pkg/syncevent
+      - /test/syscalls/linux/alarm*
+      - /test/syscalls/linux/bad*
+      - /test/syscalls/linux/capabilities*
+      - /test/syscalls/linux/cgroup*
+      - /test/syscalls/linux/clock_*
+      - /test/syscalls/linux/concurrency*
+      - /test/syscalls/linux/exec*
+      - /test/syscalls/linux/exit*
+      - /test/syscalls/linux/fork*
+      - /test/syscalls/linux/futex*
+      - /test/syscalls/linux/getrandom*
+      - /test/syscalls/linux/getrusage*
+      - /test/syscalls/linux/itimer*
+      - /test/syscalls/linux/kill*
+      - /test/syscalls/linux/landlock*
+      - /test/syscalls/linux/pause*
+      - /test/syscalls/linux/personality*
+      - /test/syscalls/linux/pidfd*
+      - /test/syscalls/linux/prctl*
+      - /test/syscalls/linux/priority*
+      - /test/syscalls/linux/rlimits*
+      - /test/syscalls/linux/rtsignal*
+      - /test/syscalls/linux/sched*
+      - /test/syscalls/linux/seccomp*
+      - /test/syscalls/linux/setgid*
+      - /test/syscalls/linux/setns*
+      - /test/syscalls/linux/sigaction*
+      - /test/syscalls/linux/sigprocmask*
+      - /test/syscalls/linux/sigstop*
+      - /test/syscalls/linux/sigtimedwait*
+      - /test/syscalls/linux/sysinfo*
+      - /test/syscalls/linux/syslog*
+      - /test/syscalls/linux/tgkill*
+      - /test/syscalls/linux/time*
+      - /test/syscalls/linux/tkill*
+      - /test/syscalls/linux/uidgid*
+      - /test/syscalls/linux/uname*
+      - /test/syscalls/linux/unshare*
+      - /test/syscalls/linux/vfork*
+      - /test/syscalls/linux/wait*
       - /vdso
+  - name: shim
+    enforced_review: false
+    owners: [milantracy]
+    approvers: [etienneperot, milantracy, nybidari, xinzhong, zkoopmans]
+    paths:
+      - /pkg/shim
+      - /shim
+  - name: tests
+    enforced_review: false
+    owners: []
+    approvers: [carzh, parth-opensrc, relkochta, rexren-gif, xinzhong]
+    paths:
+      - /images/arch-systemd
+      - /images/arm-qemu
+      - /images/basic
+      - /images/certs
+      - /images/compatibility
+      - /images/containerd
+      - /images/default
+      - /images/image-test
+      - /images/moby
+      - /images/runtimes
+      - /images/systemd-integ
+      - /images/systemd-services
+      - /images/systemd-user
+      - /images/syzkaller
+      - /images/ubi10-init
+      - /pkg/test
+      - /test/cmd
+      - /test/compatibility
+      - /test/e2e
+      - /test/image
+      - /test/moby
+      - /test/podman
+      - /test/root
+      - /test/runner
+      - /test/runtimes
+      - /test/syscalls
+      - /test/uds
+      - /test/util
   - name: tpu
     enforced_review: false
+    owners: [manninglucas]
+    approvers: [aaltinaydev, manninglucas, milantracy, trantoji]
     paths:
       - /images/tpu
       - /pkg/sentry/devices/tpuproxy
@@ -185,17 +448,82 @@ areas:
       - /tools/tpu
   - name: vfs
     enforced_review: false
+    owners: [nixprime]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
+      - /pkg/erofs
       - /pkg/fspath
-      - /pkg/lisafs
-      - /pkg/p9
       - /pkg/sentry/fsimpl
+      - /pkg/sentry/fsimpl/erofs
       - /pkg/sentry/fsutil
       - /pkg/sentry/vfs
-      - /runsc/gofer/fs
       - /test/fsstress
+      - /test/syscalls/linux/access*
+      - /test/syscalls/linux/aio*
+      - /test/syscalls/linux/chdir*
+      - /test/syscalls/linux/chmod*
+      - /test/syscalls/linux/chown*
+      - /test/syscalls/linux/close_range*
+      - /test/syscalls/linux/copy_file_range*
+      - /test/syscalls/linux/creat*
+      - /test/syscalls/linux/deleted*
+      - /test/syscalls/linux/dev*
+      - /test/syscalls/linux/dup*
+      - /test/syscalls/linux/epoll*
+      - /test/syscalls/linux/eventfd*
+      - /test/syscalls/linux/fadvise64*
+      - /test/syscalls/linux/fallocate*
+      - /test/syscalls/linux/fchdir*
+      - /test/syscalls/linux/fcntl*
+      - /test/syscalls/linux/fifo*
+      - /test/syscalls/linux/file_base*
+      - /test/syscalls/linux/flock*
+      - /test/syscalls/linux/fsync*
+      - /test/syscalls/linux/getdents*
+      - /test/syscalls/linux/inotify*
+      - /test/syscalls/linux/io_uring*
+      - /test/syscalls/linux/ioctl*
+      - /test/syscalls/linux/keys*
+      - /test/syscalls/linux/link*
+      - /test/syscalls/linux/lseek*
+      - /test/syscalls/linux/mkdir*
+      - /test/syscalls/linux/mknod*
+      - /test/syscalls/linux/mq*
+      - /test/syscalls/linux/msgqueue*
+      - /test/syscalls/linux/open*
+      - /test/syscalls/linux/pipe*
+      - /test/syscalls/linux/poll*
+      - /test/syscalls/linux/posix_acl*
+      - /test/syscalls/linux/ppoll*
+      - /test/syscalls/linux/pread*
+      - /test/syscalls/linux/proc*
+      - /test/syscalls/linux/pselect*
+      - /test/syscalls/linux/pty*
+      - /test/syscalls/linux/pwrite*
+      - /test/syscalls/linux/read*
+      - /test/syscalls/linux/rename*
+      - /test/syscalls/linux/select*
+      - /test/syscalls/linux/semaphore*
+      - /test/syscalls/linux/sendfile*
+      - /test/syscalls/linux/signalfd*
+      - /test/syscalls/linux/splice*
+      - /test/syscalls/linux/stat*
+      - /test/syscalls/linux/sticky*
+      - /test/syscalls/linux/symlink*
+      - /test/syscalls/linux/sync*
+      - /test/syscalls/linux/sysfs*
+      - /test/syscalls/linux/timerfd*
+      - /test/syscalls/linux/truncate*
+      - /test/syscalls/linux/unlink*
+      - /test/syscalls/linux/utimes*
+      - /test/syscalls/linux/write*
+      - /test/syscalls/linux/xattr*
   - name: website
+    # Not a code area: the owner is the product lead; review is about message
+    # and accuracy. The owner holds no other area.
     enforced_review: false
+    owners: [stevems]
+    approvers: [etienneperot, konstantin-s-bogom, stevems, zkoopmans]
     paths:
       - /g3doc
       - /images/jekyll

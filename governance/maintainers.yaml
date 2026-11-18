@@ -11,9 +11,6 @@
 #                       - "ACTIVE" (does reviews, has merge permissions)
 #                       - "HIATUS_SINCE:YYYY-MM-DD" (doesn't do reviews, has permissions)
 #                       - "EMERITUS_SINCE:YYYY-MM-DD" (doesn't do reviews, no permissions)
-#   areas:            Optional sorted list of area names from areas.yaml that
-#                     the maintainer has specialization in.
-#                     Emeritus maintainers may not have areas.
 maintainers:
   - name: Adin Scannell
     github: amscanne
@@ -27,7 +24,6 @@ maintainers:
     affiliation: Google
     started: 2018-04-28
     status: ACTIVE
-    areas: [oci, runsc, runtime_monitoring, seccomp]
   - name: Nicolas Lacasse
     github: nlacasse
     github_id: 153325
@@ -63,8 +59,7 @@ maintainers:
     github_id: 1673371
     affiliation: Google
     started: 2018-05-08
-    status: HIATUS_SINCE:2026-07-17
-    areas: [checkpointing, mm, platform_kvm, platform_ptrace, platform_systrap, platforms, sentry, vfs]
+    status: ACTIVE
   - name: Rahat Mahmood
     github: mrahatm
     github_id: 46939889
@@ -80,7 +75,10 @@ maintainers:
   - name: Tamir Duberstein
     github: tamird
     github_id: 1535036
-    affiliation: Google
+    affiliation: OpenAI
+    past_affiliation:
+      - affiliation: Google
+        until: 2022-07-12
     started: 2018-08-25
     status: EMERITUS_SINCE:2022-07-12
   - name: Ian Lewis
@@ -95,7 +93,6 @@ maintainers:
     affiliation: Google
     started: 2018-11-26
     status: ACTIVE
-    areas: [benchmarks, kubernetes]
   - name: Ayush Ranjan
     github: ayushr2
     github_id: 21375263
@@ -104,8 +101,7 @@ maintainers:
       - affiliation: Google
         until: 2026-07-04
     started: 2019-05-23
-    status: EMERITUS_SINCE:2026-06-24
-    # areas: [checkpointing, erofs, gpu, mm, rdma, runsc, sentry, vfs]
+    status: ACTIVE
   - name: Ghanan Gowripalan
     github: ghananigans
     github_id: 7963952
@@ -118,35 +114,36 @@ maintainers:
     affiliation: Google
     started: 2020-01-09
     status: HIATUS_SINCE:2026-11-09
-    areas: [networking]
   - name: Etienne Perot
     github: etienneperot
     github_id: 1330673
     affiliation: Google
     started: 2020-11-18
-    status: HIATUS_SINCE:2026-10-28
-    areas: [benchmarks, kubernetes, metrics, oci, release_pipeline, runsc, seccomp, website]
+    status: ACTIVE
+  - name: Steve Silva
+    github: stevems
+    github_id: 2355354
+    affiliation: Google
+    started: 2021-05-06
+    status: ACTIVE
   - name: Lucas Manning
     github: manninglucas
     github_id: 6645699
     affiliation: Google
     started: 2021-06-29
     status: ACTIVE
-    areas: [checkpointing, fuse, networking, runsc, sandboxexec, sentry, tpu, vfs]
   - name: Jing Chen
     github: milantracy
     github_id: 6878258
     affiliation: Google
     started: 2021-10-20
     status: ACTIVE
-    areas: [sandboxexec, tpu]
   - name: Konstantin Bogomolov
     github: konstantin-s-bogom
     github_id: 99754858
     affiliation: Google
     started: 2022-02-28
     status: ACTIVE
-    areas: [platform_kvm, platform_ptrace, platform_systrap, platforms]
   - name: Shambhavi Srivastava
     github: sshambhavi-252
     github_id: 100318101
@@ -177,14 +174,12 @@ maintainers:
     affiliation: Google
     started: 2025-11-06
     status: ACTIVE
-    areas: [gpu]
   - name: Ryan El Kochta
     github: relkochta
     github_id: 38051123
     affiliation: Google
     started: 2026-05-04
     status: ACTIVE
-    areas: [release_pipeline]
   - name: Rex Ren
     github: rexren-gif
     github_id: 274333150
@@ -197,14 +192,12 @@ maintainers:
     affiliation: Google
     started: 2026-05-22
     status: ACTIVE
-    areas: [runtime_monitoring]
   - name: Caroline Zhu
     github: carzh
     github_id: 22922935
     affiliation: Google
     started: 2026-06-29
     status: ACTIVE
-    areas: [sandboxexec]
   - name: Alexander Cueva
     github: kerumeto
     github_id: 117316944
