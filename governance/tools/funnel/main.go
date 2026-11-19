@@ -18,11 +18,13 @@
 //	funnel floor   holds a pull request that lacks a description or an
 //	               Assisted-by: line: label, one comment to the author,
 //	               exit status 1. Clears the hold once they are present.
+//	funnel assign  requests reviewers: one specialist for the areas the
+//	               changed files fall in, filled to two from the roster.
 //
-// It reads the pull request through the GitHub API and treats everything in
+// Both read the pull request through the GitHub API and treat everything in
 // it as data. Under GitHub Actions the repository and pull request come from
-// the event; -repo and -pr override them, and -dry-run reports what would be
-// done and changes nothing.
+// the event; -repo and -pr override them, and -dry-run makes either command
+// report what it would do and change nothing.
 package main
 
 import (
@@ -32,18 +34,23 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v84/github"
 )
 
 var (
-	repoFlag = flag.String("repo", os.Getenv("GITHUB_REPOSITORY"), "repository as owner/name (default $GITHUB_REPOSITORY)")
-	prFlag   = flag.Int("pr", 0, "pull request number (default: the one in $GITHUB_EVENT_PATH)")
-	dryRun   = flag.Bool("dry-run", false, "decide and report; change nothing on GitHub")
-	enforce  = flag.Bool("enforce", os.Getenv("FLOOR_ENFORCE") == "true", "floor: hold pull requests that fail, instead of only reporting (default $FLOOR_ENFORCE == \"true\")")
+	repoFlag   = flag.String("repo", os.Getenv("GITHUB_REPOSITORY"), "repository as owner/name (default $GITHUB_REPOSITORY)")
+	prFlag     = flag.Int("pr", 0, "pull request number (default: the one in $GITHUB_EVENT_PATH)")
+	dryRun     = flag.Bool("dry-run", false, "decide and report; change nothing on GitHub")
+	enforce    = flag.Bool("enforce", os.Getenv("FLOOR_ENFORCE") == "true", "floor: hold pull requests that fail, instead of only reporting (default $FLOOR_ENFORCE == \"true\")")
+	delay      = flag.Duration("delay", 5*time.Minute, "assign: wait before assigning, so humans can pick reviewers first")
+	governance = flag.String("governance", "governance", "assign: directory holding maintainers.yaml and areas.yaml")
 )
 
 // errHold is returned by the floor when it holds a pull request; main turns it
@@ -54,7 +61,7 @@ func (e errHold) Error() string { return "held at the floor: " + strings.Join(e.
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: funnel [flags] floor\n\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: funnel [flags] floor|assign\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -86,6 +93,8 @@ func main() {
 	switch cmd := flag.Arg(0); cmd {
 	case "floor":
 		err = runFloor(ctx, gh, owner, repo, num)
+	case "assign":
+		err = runAssign(ctx, gh, owner, repo, num)
 	default:
 		log.Fatalf("unknown command %q", cmd)
 	}
@@ -258,6 +267,78 @@ func findHoldComment(ctx context.Context, gh *github.Client, owner, repo string,
 		page = resp.NextPage
 	}
 	return 0, nil
+}
+
+// runAssign requests reviewers for the pull request, unless it is a draft,
+// closed, from a bot, or already has reviewers or assignees.
+func runAssign(ctx context.Context, gh *github.Client, owner, repo string, num int) error {
+	pr, _, err := gh.PullRequests.Get(ctx, owner, repo, num)
+	if err != nil {
+		return err
+	}
+	if pr.GetUser().GetType() == "Bot" {
+		return nil
+	}
+	if *delay > 0 && !*dryRun {
+		log.Printf("Waiting %v before assigning PR #%d", *delay, num)
+		time.Sleep(*delay)
+		if pr, _, err = gh.PullRequests.Get(ctx, owner, repo, num); err != nil {
+			return err
+		}
+	}
+	if pr.GetState() != "open" || pr.GetDraft() {
+		return nil
+	}
+	if len(pr.RequestedReviewers) > 0 || len(pr.RequestedTeams) > 0 || len(pr.Assignees) > 0 {
+		log.Printf("PR #%d already has reviewers or assignees; skipping.", num)
+		return nil
+	}
+
+	maintainersYAML, err := os.ReadFile(filepath.Join(*governance, "maintainers.yaml"))
+	if err != nil {
+		return err
+	}
+	areasYAML, err := os.ReadFile(filepath.Join(*governance, "areas.yaml"))
+	if err != nil {
+		return err
+	}
+	roster, err := LoadRoster(maintainersYAML, areasYAML)
+	if err != nil {
+		return err
+	}
+
+	// Changed files are a hint, not a requirement: without them the pull
+	// request still gets roster reviewers.
+	var files []string
+	for page := 1; page != 0; {
+		fs, resp, err := gh.PullRequests.ListFiles(ctx, owner, repo, num, &github.ListOptions{PerPage: 100, Page: page})
+		if err != nil {
+			log.Printf("Notice: could not list changed files: %v", err)
+			files = nil
+			break
+		}
+		for _, f := range fs {
+			files = append(files, "/"+f.GetFilename())
+		}
+		page = resp.NextPage
+	}
+
+	eligible, specialists := roster.Candidates(pr.GetUser().GetLogin(), files)
+	if len(eligible) == 0 {
+		return errors.New("no eligible approvers available to assign")
+	}
+	picked := Pick(eligible, specialists, rand.New(rand.NewSource(time.Now().UnixNano())))
+	log.Printf("Specialists: %s", strings.Join(specialists, ", "))
+	log.Printf("Selected: %s", strings.Join(picked, ", "))
+	if *dryRun {
+		summary("Would request review from %s for PR #%d.\n", strings.Join(picked, ", "), num)
+		return nil
+	}
+	if _, _, err := gh.PullRequests.RequestReviewers(ctx, owner, repo, num, github.ReviewersRequest{Reviewers: picked}); err != nil {
+		return fmt.Errorf("requesting reviewers: %w", err)
+	}
+	log.Printf("Requested review from [%s] for PR #%d", strings.Join(picked, ", "), num)
+	return nil
 }
 
 // isNotFound reports whether err is a GitHub 404.

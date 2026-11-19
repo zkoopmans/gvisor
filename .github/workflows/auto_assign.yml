@@ -1,11 +1,11 @@
 # This workflow holds pull requests at the floor and, once they clear it,
-# assigns reviewers.
+# assigns reviewers. Both halves are governance/tools/funnel.
 #
-# The floor (governance/tools/funnel) is what a pull request must have before
-# anyone is asked to read it: a description in the author's words and an
-# `Assisted-by:` line (`Assisted-by: none` is valid). A pull request that
-# lacks them gets a label and one comment to the author, and no reviewer is
-# requested. The floor is never a required check and never blocks a merge.
+# The floor is what a pull request must have before anyone is asked to read
+# it: a description in the author's words and an `Assisted-by:` line
+# (`Assisted-by: none` is valid). A pull request that lacks them gets a label
+# and one comment to the author, and no reviewer is requested. The floor is
+# never a required check and never blocks a merge.
 #
 # Rollout: the floor only holds when the repository variable FLOOR_ENFORCE is
 # "true". Otherwise it reports in the job summary and reviewers are assigned
@@ -14,9 +14,8 @@ name: Auto Assign
 
 "on":
   # Requesting reviewers on fork PRs requires a write token. Checkout uses
-  # the trusted base branch; the floor reads PR metadata through the API and
-  # the assigner treats it as data for matching and API requests, never as
-  # executable code.
+  # the trusted base branch; the funnel reads PR metadata through the API
+  # and treats it as data, never as executable code.
   pull_request_target:  # zizmor: ignore[dangerous-triggers]
     types: [opened, reopened, ready_for_review, edited, synchronize]
 
@@ -72,13 +71,10 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-
-    - name: Install dependencies
-      run: npm install js-yaml
-
-    - name: PR Assigner Bot
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        script: |-
-            const autoAssign = require('./.github/workflows/auto_assign.js');
-            await autoAssign({ github, context, core });
+        go-version-file: 'go.mod'
+    - name: Assign reviewers
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: go run ./governance/tools/funnel assign
