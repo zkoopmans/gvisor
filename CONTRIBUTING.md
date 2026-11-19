@@ -47,6 +47,13 @@ standard before seeking review, respecting maintainers' time, and must be
 process. AI tools must not add `Signed-off-by` lines: only a human can certify
 the [Developer Certificate of Origin](#developer-certificate-of-origin).
 
+Every pull request says how AI tools were used, in an `Assisted-by:` line in
+the description or in a commit message — `Assisted-by: none` when they were
+not. It is the mirror of `Signed-off-by`: one line from a human saying what the
+tools did, so reviewers know where to look. A pull request without it, or
+without a description in the author's own words, is held with a comment to the
+author before any reviewer is asked.
+
 ## Editor Setup
 
 ### Visual Studio Code

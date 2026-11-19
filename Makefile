@@ -265,8 +265,8 @@ nogo-tests:
 # pull in all directories in runsc except runsc/container.
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
-unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/runner/... test/trace/...)
+unit-tests: ## Local package unit tests in pkg/..., tools/..., governance/..., etc.
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... governance/... runsc/... vdso/... sandboxexec/... examples/... test/runner/... test/trace/...)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
