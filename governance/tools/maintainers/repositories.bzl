@@ -18,6 +18,22 @@ load("@bazel_lib//lib:repo_utils.bzl", "repo_utils")
 load("@yq.bzl//yq/toolchain:platforms.bzl", "yq_platform_repo")
 load("@yq.bzl//yq/toolchain:versions.bzl", "DEFAULT_YQ_VERSION")
 
+def _segment_matches(pattern, name):
+    """Reports whether name matches pattern, where `*` matches any run of
+    characters within the segment."""
+    parts = pattern.split("*")
+    if not name.startswith(parts[0]) or not name.endswith(parts[-1]):
+        return False
+    if len(name) < len(parts[0]) + len(parts[-1]):
+        return False
+    pos = len(parts[0])
+    for part in parts[1:-1]:
+        index = name.find(part, pos)
+        if index < 0:
+            return False
+        pos = index + len(part)
+    return pos <= len(name) - len(parts[-1])
+
 def _governance_areas_impl(ctx):
     # Remote generation cannot inspect undeclared checkout directories. Check
     # the listed paths here, anchored to this module even when it is a dependency.
@@ -28,10 +44,31 @@ def _governance_areas_impl(ctx):
     if result.return_code:
         fail("Cannot read governance area paths: " + result.stderr)
     for path in json.decode(result.stdout):
-        directory = root.get_child(path.removeprefix("/"))
-        ctx.watch(directory)
-        if not directory.is_dir:
-            fail("Area path %r is not a repository directory" % path)
+        relative = path.removeprefix("/")
+        if "*" not in relative:
+            directory = root.get_child(relative)
+            ctx.watch(directory)
+            if not directory.is_dir:
+                fail("Area path %r is not a repository directory" % path)
+            continue
+
+        # A pattern: `*` is allowed in the last segment only, and matches
+        # within that segment. The parent must be a directory with at least
+        # one matching entry.
+        parent_relative, _, pattern = relative.rpartition("/")
+        if "*" in parent_relative:
+            fail("Area path %r has a wildcard outside its last segment" % path)
+        parent = root.get_child(parent_relative)
+        ctx.watch(parent)
+        if not parent.is_dir:
+            fail("Area path %r is not under a repository directory" % path)
+        matched = False
+        for entry in parent.readdir():
+            if _segment_matches(pattern, entry.basename):
+                matched = True
+                break
+        if not matched:
+            fail("Area path %r matches nothing in its directory" % path)
     ctx.symlink(areas, "areas.yaml")
     ctx.file("BUILD.bazel", 'exports_files(["areas.yaml"])\n')
 
