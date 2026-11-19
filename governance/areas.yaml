@@ -37,12 +37,35 @@ areas:
       - /tools/bigquery
       - /tools/parsers
       - /tools/profiletool
-  - name: checklocks
+  - name: build_tooling
     enforced_review: false
     owners: []
     approvers: []
     paths:
+      - /tools/actionlint
+      - /tools/bazeldefs
+      - /tools/buildkite
+      - /tools/buildkite_coordinator
+      - /tools/checkaligned
+      - /tools/checkconst
+      - /tools/checkescape
+      - /tools/checkimports
+      - /tools/checklinkname
       - /tools/checklocks
+      - /tools/clang_tidy
+      - /tools/compat
+      - /tools/constraintutil
+      - /tools/cstate_wake_probe
+      - /tools/go_fieldenum
+      - /tools/go_generics
+      - /tools/go_hostlayout
+      - /tools/go_marshal
+      - /tools/licensecheck
+      - /tools/nogo
+      - /tools/stucktasks
+      - /tools/tpucheckpoint
+      - /tools/yamltest
+      - /tools/zstd
   - name: checkpointing
     enforced_review: false
     owners: []
@@ -56,13 +79,6 @@ areas:
       - /pkg/state
       - /runsc/checkpointgofer
       - /tools/go_stateify
-  - name: erofs
-    enforced_review: false
-    owners: []
-    approvers: [ayushr2]
-    paths:
-      - /pkg/erofs
-      - /pkg/sentry/fsimpl/erofs
   - name: fuse
     enforced_review: false
     owners: []
@@ -71,13 +87,25 @@ areas:
       - /images/fuse
       - /pkg/sentry/fsimpl/fuse
       - /test/fuse_host
+  - name: gofer
+    # Host boundary: the gofer protocol (lisafs/p9), the gofer process, and its client.
+    enforced_review: false
+    owners: []
+    approvers: [ayushr2, manninglucas, nixprime]
+    paths:
+      - /pkg/lisafs
+      - /pkg/p9
+      - /pkg/sentry/fsimpl/gofer
+      - /runsc/gofer
   - name: gpu
     enforced_review: false
     owners: []
     approvers: [ayushr2, parth-opensrc]
     paths:
       - /images/gpu
+      - /pkg/rdma
       - /pkg/sentry/devices/nvproxy
+      - /pkg/sentry/devices/rdmaproxy
       - /test/gpu
       - /tools/gpu
       - /tools/ioctl_sniffer
@@ -90,17 +118,59 @@ areas:
       - /test/kubernetes
       - /tools/gvisor_k8s_tool
       - /webhook
-  - name: metrics
+  - name: libs
     enforced_review: false
     owners: []
-    approvers: [etienneperot]
+    approvers: []
     paths:
-      - /pkg/metric
-      - /pkg/prometheus
-      - /runsc/cmd/metricserver
-      - /runsc/metricserver
-      - /test/metricclient
-      - /test/metricsviz
+      - /pkg/abi
+      - /pkg/binary
+      - /pkg/bitmap
+      - /pkg/bits
+      - /pkg/buffer
+      - /pkg/cleanup
+      - /pkg/context
+      - /pkg/control
+      - /pkg/coretag
+      - /pkg/coverage
+      - /pkg/cpuid
+      - /pkg/crypto
+      - /pkg/devutil
+      - /pkg/errors
+      - /pkg/eventfd
+      - /pkg/fd
+      - /pkg/fdchannel
+      - /pkg/fdnotifier
+      - /pkg/flipcall
+      - /pkg/fsutil
+      - /pkg/gohacks
+      - /pkg/goid
+      - /pkg/gomaxprocs
+      - /pkg/gvisordetect
+      - /pkg/hostarch
+      - /pkg/hostos
+      - /pkg/hostsyscall
+      - /pkg/hosttid
+      - /pkg/ilist
+      - /pkg/linewriter
+      - /pkg/log
+      - /pkg/marshal
+      - /pkg/pinring
+      - /pkg/pool
+      - /pkg/rand
+      - /pkg/refs
+      - /pkg/ringdeque
+      - /pkg/secio
+      - /pkg/segment
+      - /pkg/sighandling
+      - /pkg/spinlock
+      - /pkg/syserr
+      - /pkg/timing
+      - /pkg/trie
+      - /pkg/unet
+      - /pkg/urpc
+      - /pkg/waiter
+      - /pkg/zip
   - name: mm
     enforced_review: false
     owners: []
@@ -137,39 +207,23 @@ areas:
       - /test/rtnetlink
       - /tools/gvisor2pcap
       - /tools/xdp
-  - name: oci
+  - name: observability
     enforced_review: false
     owners: []
-    approvers: [etienneperot, fvoznika]
+    approvers: [etienneperot, fvoznika, xinzhong]
     paths:
-      - /pkg/shim
-      - /runsc/container
-      - /runsc/specutils
-      - /shim
-  - name: platform_kvm
-    enforced_review: false
-    owners: []
-    approvers: [konstantin-s-bogom, nixprime]
-    paths:
-      - /pkg/sentry/platform/kvm
-  - name: platform_ptrace
-    enforced_review: false
-    owners: []
-    approvers: [konstantin-s-bogom, nixprime]
-    paths:
-      - /pkg/sentry/platform/ptrace
-  - name: platform_slimvm
-    enforced_review: false
-    owners: []
-    approvers: []
-    paths:
-      - /pkg/sentry/platform/slimvm
-  - name: platform_systrap
-    enforced_review: false
-    owners: []
-    approvers: [konstantin-s-bogom, nixprime]
-    paths:
-      - /pkg/sentry/platform/systrap
+      - /examples/seccheck
+      - /pkg/eventchannel
+      - /pkg/metric
+      - /pkg/prometheus
+      - /pkg/seccheck
+      - /pkg/sentry/seccheck
+      - /runsc/cmd/metricserver
+      - /runsc/metricserver
+      - /test/metricclient
+      - /test/metricsviz
+      - /test/trace
+      - /tools/tracereplay
   - name: platforms
     enforced_review: false
     owners: []
@@ -177,14 +231,11 @@ areas:
     paths:
       - /pkg/ring0
       - /pkg/sentry/platform
+      - /pkg/sentry/platform/kvm
+      - /pkg/sentry/platform/ptrace
+      - /pkg/sentry/platform/slimvm
+      - /pkg/sentry/platform/systrap
       - /pkg/sigframe
-  - name: rdma
-    enforced_review: false
-    owners: []
-    approvers: [ayushr2]
-    paths:
-      - /pkg/rdma
-      - /pkg/sentry/devices/rdmaproxy
   - name: release_pipeline
     # Sensitive: builds and signs what users run. Short list by design.
     enforced_review: true
@@ -201,17 +252,8 @@ areas:
     approvers: [ayushr2, etienneperot, fvoznika, manninglucas]
     paths:
       - /runsc
-  - name: runtime_monitoring
-    enforced_review: false
-    owners: []
-    approvers: [fvoznika, xinzhong]
-    paths:
-      - /examples/seccheck
-      - /pkg/eventchannel
-      - /pkg/seccheck
-      - /pkg/sentry/seccheck
-      - /test/trace
-      - /tools/tracereplay
+      - /runsc/container
+      - /runsc/specutils
   - name: sandboxexec
     enforced_review: false
     owners: []
@@ -234,12 +276,69 @@ areas:
       - /test/secbench
       - /test/secfuzz
   - name: sentry
+    # The kernel: task lifecycle and scheduling, the syscall table, the
+    # control server (the Task API's sentry side), arch, loader, devices
+    # not claimed by gpu/tpu -- everything under /pkg/sentry that no more
+    # specific area (vfs, mm, networking, platforms, ...) claims. The
+    # subtrees below are listed for legibility; /pkg/sentry already covers
+    # them.
     enforced_review: false
     owners: []
     approvers: [ayushr2, manninglucas, nixprime]
     paths:
+      - /pkg/atomicbitops
       - /pkg/sentry
+      - /pkg/sentry/arch
+      - /pkg/sentry/control
+      - /pkg/sentry/devices
+      - /pkg/sentry/kernel
+      - /pkg/sentry/loader
+      - /pkg/sentry/strace
+      - /pkg/sentry/syscalls
+      - /pkg/sleep
+      - /pkg/sync
+      - /pkg/syncevent
       - /vdso
+  - name: shim
+    enforced_review: false
+    owners: []
+    approvers: [etienneperot, fvoznika]
+    paths:
+      - /pkg/shim
+      - /shim
+  - name: tests
+    enforced_review: false
+    owners: []
+    approvers: []
+    paths:
+      - /images/arch-systemd
+      - /images/arm-qemu
+      - /images/basic
+      - /images/certs
+      - /images/compatibility
+      - /images/containerd
+      - /images/default
+      - /images/image-test
+      - /images/moby
+      - /images/runtimes
+      - /images/systemd-integ
+      - /images/systemd-services
+      - /images/systemd-user
+      - /images/syzkaller
+      - /images/ubi10-init
+      - /pkg/test
+      - /test/cmd
+      - /test/compatibility
+      - /test/e2e
+      - /test/image
+      - /test/moby
+      - /test/podman
+      - /test/root
+      - /test/runner
+      - /test/runtimes
+      - /test/syscalls
+      - /test/uds
+      - /test/util
   - name: tpu
     enforced_review: false
     owners: []
@@ -254,15 +353,16 @@ areas:
     owners: []
     approvers: [ayushr2, manninglucas, nixprime]
     paths:
+      - /pkg/erofs
       - /pkg/fspath
-      - /pkg/lisafs
-      - /pkg/p9
       - /pkg/sentry/fsimpl
+      - /pkg/sentry/fsimpl/erofs
       - /pkg/sentry/fsutil
       - /pkg/sentry/vfs
-      - /runsc/gofer/fs
       - /test/fsstress
   - name: website
+    # Not a code area: the owner is the product lead; review is about message
+    # and accuracy. The owner holds no other area.
     enforced_review: false
     owners: []
     approvers: [etienneperot]
