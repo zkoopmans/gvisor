@@ -135,26 +135,33 @@ func runFloor(ctx context.Context, gh *github.Client, owner, repo string, num in
 		return nil
 	}
 
-	var commits []string
+	var commits []Commit
 	for page := 1; page != 0; {
 		cs, resp, err := gh.PullRequests.ListCommits(ctx, owner, repo, num, &github.ListOptions{PerPage: 100, Page: page})
 		if err != nil {
 			return fmt.Errorf("listing commits: %w", err)
 		}
 		for _, c := range cs {
-			commits = append(commits, c.GetCommit().GetMessage())
+			commits = append(commits, Commit{Message: c.GetCommit().GetMessage(), Parents: len(c.Parents)})
 		}
 		page = resp.NextPage
 	}
 
-	f := CheckFloor(pr.GetBody(), commits)
+	f := CheckFloor(Request{
+		Title:        pr.GetTitle(),
+		Body:         pr.GetBody(),
+		BaseBranch:   pr.GetBase().GetRef(),
+		ChangedFiles: pr.GetChangedFiles(),
+		Mergeable:    pr.Mergeable,
+		Commits:      commits,
+	})
 	verdict := "assign"
 	if !f.Clear() {
 		verdict = "hold"
 	}
 	summary("## Floor: %s\n\n", verdict)
 	if f.Clear() {
-		summary("Description and `Assisted-by:` present.\n")
+		summary("Clear.\n")
 	} else {
 		summary("Missing:\n")
 		for _, m := range f.Missing {

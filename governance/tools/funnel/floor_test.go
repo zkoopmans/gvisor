@@ -15,59 +15,134 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
 
+// ok is a pull request that clears the floor; tests vary one thing at a time.
+func ok() Request {
+	yes := true
+	return Request{
+		Title:        "tcpip: fix the thing",
+		Body:         "Fix the thing because reasons.\n\nAssisted-by: none",
+		BaseBranch:   "master",
+		ChangedFiles: 1,
+		Mergeable:    &yes,
+		Commits:      []Commit{{Message: "tcpip: fix the thing\n\nSigned-off-by: A <a@b.c>", Parents: 1}},
+	}
+}
+
+// missing returns which checks a Floor failed, by a keyword in each message.
+func missing(f Floor) []string {
+	var got []string
+	for _, m := range f.Missing {
+		switch {
+		case strings.Contains(m, "Assisted-by"):
+			got = append(got, "assisted-by")
+		case strings.Contains(m, "description"):
+			got = append(got, "description")
+		case strings.Contains(m, "target"):
+			got = append(got, "base")
+		case strings.Contains(m, "draft"):
+			got = append(got, "wip")
+		case strings.Contains(m, "touches no files"):
+			got = append(got, "empty")
+		case strings.Contains(m, "merge commit"):
+			got = append(got, "merges")
+		case strings.Contains(m, "conflicts"):
+			got = append(got, "conflict")
+		default:
+			got = append(got, "?"+m)
+		}
+	}
+	return got
+}
+
 func TestCheckFloor(t *testing.T) {
+	no := false
 	for _, tc := range []struct {
-		name          string
-		body          string
-		commits       []string
-		wantAssisted  bool // Assisted-by: satisfied
-		wantDescribed bool // description satisfied
+		name string
+		edit func(r *Request)
+		want []string // failed checks, in the order the author sees them
 	}{
-		{"empty body", "", nil, false, false},
-		{"prose, no trailer", "Fix the thing because reasons.\n\nFixes #123", nil, false, true},
-		{"prose and none", "Fix the thing.\n\nAssisted-by: none", nil, true, true},
-		{"only an issue reference", "Fixes #123", nil, false, false},
-		{"only a heading", "## Summary\n\n", nil, false, false},
-		{"only trailers", "Signed-off-by: A <a@b.c>\nAssisted-by: Gemini", nil, true, false},
-		{"lowercase trailer", "Does stuff.\nassisted-by: Gemini (tests)", nil, true, true},
-		{"trailer with no value", "Does stuff.\nAssisted-by:   ", nil, false, true},
-		{"trailer in a commit only", "Does stuff.", []string{"fix: thing\n\nAssisted-by: Claude\nSigned-off-by: A <a@b.c>"}, true, true},
-		{"trailer in a later commit", "Does stuff.", []string{"first", "second\n\nAssisted-by: none"}, true, true},
-		{"trailer mid-line is not a trailer", "Does stuff. Assisted-by: none", nil, false, true},
-		{"CRLF body", "Does stuff.\r\n\r\nAssisted-by: none\r\n", nil, true, true},
+		{"clears", func(r *Request) {}, nil},
+
+		// Description and Assisted-by.
+		{"empty body", func(r *Request) { r.Body = "" }, []string{"assisted-by", "description"}},
+		{"prose, no trailer", func(r *Request) { r.Body = "Fix the thing because reasons.\n\nFixes #123" }, []string{"assisted-by"}},
+		{"only an issue reference", func(r *Request) { r.Body = "Fixes #123" }, []string{"assisted-by", "description"}},
+		{"only a heading", func(r *Request) { r.Body = "## Summary\n\n" }, []string{"assisted-by", "description"}},
+		{"only trailers", func(r *Request) { r.Body = "Signed-off-by: A <a@b.c>\nAssisted-by: Gemini" }, []string{"description"}},
+		{"lowercase trailer", func(r *Request) { r.Body = "Does stuff.\nassisted-by: Gemini (tests)" }, nil},
+		{"trailer with no value", func(r *Request) { r.Body = "Does stuff.\nAssisted-by:   " }, []string{"assisted-by"}},
+		{"trailer mid-line is not a trailer", func(r *Request) { r.Body = "Does stuff. Assisted-by: none" }, []string{"assisted-by"}},
+		{"CRLF body", func(r *Request) { r.Body = "Does stuff.\r\n\r\nAssisted-by: none\r\n" }, nil},
+		{"trailer in a commit only", func(r *Request) {
+			r.Body = "Does stuff."
+			r.Commits = []Commit{{Message: "fix: thing\n\nAssisted-by: Claude\nSigned-off-by: A <a@b.c>", Parents: 1}}
+		}, nil},
+		{"trailer in a later commit", func(r *Request) {
+			r.Body = "Does stuff."
+			r.Commits = []Commit{{Message: "first", Parents: 1}, {Message: "second\n\nAssisted-by: none", Parents: 1}}
+		}, nil},
+
+		// Shape.
+		{"targets go", func(r *Request) { r.BaseBranch = "go" }, []string{"base"}},
+		{"targets a release branch", func(r *Request) { r.BaseBranch = "release-20260727.0" }, []string{"base"}},
+		{"WIP in title", func(r *Request) { r.Title = "WIP: tcpip: fix the thing" }, []string{"wip"}},
+		{"[WIP] in title", func(r *Request) { r.Title = "[WIP] tcpip: fix the thing" }, []string{"wip"}},
+		{"wip lowercase mid-title", func(r *Request) { r.Title = "tcpip: fix the thing (wip)" }, []string{"wip"}},
+		{"do not merge", func(r *Request) { r.Title = "tcpip: fix the thing -- DO NOT MERGE" }, []string{"wip"}},
+		{"DNM", func(r *Request) { r.Title = "DNM tcpip: fix the thing" }, []string{"wip"}},
+		{"draft prefix", func(r *Request) { r.Title = "Draft: tcpip: fix the thing" }, []string{"wip"}},
+		{"[draft] prefix", func(r *Request) { r.Title = "[draft] tcpip: fix the thing" }, []string{"wip"}},
+		{"draft as a word is fine", func(r *Request) { r.Title = "tcpip: handle draft segments" }, nil},
+		{"wipe is not wip", func(r *Request) { r.Title = "mm: wipe the page cache" }, nil},
+		{"no files", func(r *Request) { r.ChangedFiles = 0 }, []string{"empty"}},
+		{"one merge commit", func(r *Request) {
+			r.Commits = append(r.Commits, Commit{Message: "Merge branch 'master' into fix", Parents: 2})
+		}, []string{"merges"}},
+		{"octopus merge counts once", func(r *Request) {
+			r.Commits = append(r.Commits, Commit{Message: "Merge", Parents: 3})
+		}, []string{"merges"}},
+		{"root commit is not a merge", func(r *Request) { r.Commits[0].Parents = 0 }, nil},
+		{"conflicts", func(r *Request) { r.Mergeable = &no }, []string{"conflict"}},
+		{"mergeability unknown assumes the best", func(r *Request) { r.Mergeable = nil }, nil},
+
+		// Order: shape before words, so fixing top to bottom is not redone.
+		{"everything wrong, in order", func(r *Request) {
+			*r = Request{Title: "WIP", BaseBranch: "go", Mergeable: &no, Commits: []Commit{{Message: "Merge", Parents: 2}}}
+		}, []string{"base", "wip", "empty", "merges", "conflict", "assisted-by", "description"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := CheckFloor(tc.body, tc.commits)
-			gotAssisted, gotDescribed := true, true
-			for _, m := range f.Missing {
-				switch {
-				case strings.Contains(m, "Assisted-by"):
-					gotAssisted = false
-				case strings.Contains(m, "description"):
-					gotDescribed = false
-				default:
-					t.Errorf("unexpected missing item %q", m)
-				}
+			r := ok()
+			tc.edit(&r)
+			f := CheckFloor(r)
+			if got := missing(f); !slices.Equal(got, tc.want) {
+				t.Errorf("failed checks = %q, want %q\nmessages: %q", got, tc.want, f.Missing)
 			}
-			if gotAssisted != tc.wantAssisted {
-				t.Errorf("Assisted-by satisfied = %v, want %v (missing: %q)", gotAssisted, tc.wantAssisted, f.Missing)
-			}
-			if gotDescribed != tc.wantDescribed {
-				t.Errorf("description satisfied = %v, want %v (missing: %q)", gotDescribed, tc.wantDescribed, f.Missing)
-			}
-			if f.Clear() != (tc.wantAssisted && tc.wantDescribed) {
-				t.Errorf("Clear() = %v, want %v", f.Clear(), tc.wantAssisted && tc.wantDescribed)
+			if f.Clear() != (len(tc.want) == 0) {
+				t.Errorf("Clear() = %v, want %v", f.Clear(), len(tc.want) == 0)
 			}
 		})
 	}
 }
 
+func TestMergeCommitMessage(t *testing.T) {
+	r := ok()
+	r.Commits = append(r.Commits, Commit{Parents: 2})
+	if f := CheckFloor(r); !strings.Contains(f.Missing[0], "1 merge commit,") {
+		t.Errorf("singular: %q", f.Missing[0])
+	}
+	r.Commits = append(r.Commits, Commit{Parents: 2})
+	if f := CheckFloor(r); !strings.Contains(f.Missing[0], "2 merge commits,") {
+		t.Errorf("plural: %q", f.Missing[0])
+	}
+}
+
 func TestHoldComment(t *testing.T) {
-	f := CheckFloor("", nil)
+	f := CheckFloor(Request{})
 	c := holdComment(f)
 	if !isHoldComment(c) {
 		t.Errorf("holdComment is not recognised by isHoldComment:\n%s", c)
