@@ -551,6 +551,12 @@ func Close(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	defer file.DecRef(t)
 
 	err := file.OnClose(t)
+	if linuxerr.Equals(linuxerr.EFBIG, err) {
+		// HandleIOError sends SIGXFSZ along with EFBIG, as write(2) does when
+		// it exceeds RLIMIT_FSIZE. close(2) only returns the error of the
+		// file's flush; Linux sends no signal for it.
+		return 0, nil, linuxerr.EFBIG
+	}
 	return 0, nil, HandleIOError(t, false /* partial */, err, linuxerr.EINTR, "close", file)
 }
 
