@@ -68,8 +68,8 @@ areas:
       - /tools/zstd
   - name: checkpointing
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, manninglucas, nixprime]
+    owners: [manninglucas]
+    approvers: [aaltinaydev, etienneperot, manninglucas, nybidari, rexren-gif, riverafernando, trantoji]
     paths:
       - /pkg/aio
       - /pkg/compressio
