@@ -5,14 +5,14 @@ The current maintainers of the gVisor project are listed below.
 
 Name                 | GitHub ID                                                    | Company/Organization | Areas (* = owner)
 -------------------- | ------------------------------------------------------------ | -------------------- | ----------------------------------------------------------------------------------------
-Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp, shim
+Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | checkpointing, gofer, mm, platforms, sentry, vfs
-Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, kubernetes*
+Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, kubernetes*, shim
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | checkpointing, gofer, gpu, mm, sentry, vfs
-Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | networking
+Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | networking, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, kubernetes, observability, release_pipeline, runsc*, seccomp*, shim, website
 Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing, fuse, gofer, networking, runsc, sandboxexec, sentry, tpu, vfs
-Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, tpu
+Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | platforms
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | 
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, kubernetes, runsc
@@ -20,7 +20,7 @@ Shailend Chand       | [@shailend-g](https://github.com/shailend-g)             
 Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, runsc
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, release_pipeline*
 Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability, runsc
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability, runsc, shim
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | 
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, kubernetes
@@ -55,7 +55,7 @@ runsc            | @etienneperot | @aaltinaydev @carzh @etienneperot @manningluc
 sandboxexec      |               | @carzh @manninglucas @milantracy                                                     | 
 seccomp          | @etienneperot | @etienneperot @fvoznika                                                              | yes
 sentry           |               | @ayushr2 @manninglucas @nixprime                                                     | 
-shim             |               | @etienneperot @fvoznika                                                              | 
+shim             | @milantracy   | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                             | 
 tests            |               |                                                                                      | 
 tpu              |               | @manninglucas @milantracy                                                            | 
 vfs              |               | @ayushr2 @manninglucas @nixprime                                                     | 
