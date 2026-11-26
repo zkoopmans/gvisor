@@ -80,7 +80,10 @@ maintainers:
   - name: Tamir Duberstein
     github: tamird
     github_id: 1535036
-    affiliation: Google
+    affiliation: OpenAI
+    past_affiliation:
+      - affiliation: Google
+        until: 2022-07-12
     started: 2018-08-25
     status: EMERITUS_SINCE:2022-07-12
   - name: Ian Lewis
