@@ -4,14 +4,14 @@
 The current maintainers of the gVisor project are listed below.
 
 Name                 | GitHub ID                                                    | Company/Organization | Areas (* = owner)
--------------------- | ------------------------------------------------------------ | -------------------- | -------------------------------------------------------------------------------------------------------
+-------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------
 Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, mm, sentry, vfs
 Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, kubernetes*, shim
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer, gpu, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
-Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, seccomp*, shim, website
-Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec, sentry, tpu, vfs
+Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
+Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, sentry, tpu, vfs
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | platforms*
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing
@@ -52,7 +52,7 @@ observability    | @xinzhong           | @etienneperot @fvoznika @rexren-gif @xi
 platforms        | @konstantin-s-bogom | @aaltinaydev @kerumeto @konstantin-s-bogom                                               | 
 release_pipeline | @relkochta          | @etienneperot @relkochta                                                                 | yes
 runsc            | @etienneperot       | @aaltinaydev @carzh @etienneperot @manninglucas @parth-opensrc @rexren-gif @xinzhong     | 
-sandboxexec      |                     | @carzh @manninglucas @milantracy                                                         | 
+sandboxexec      | @manninglucas       | @carzh @etienneperot @manninglucas @milantracy                                           | 
 seccomp          | @etienneperot       | @etienneperot @fvoznika                                                                  | yes
 sentry           |                     | @ayushr2 @manninglucas @nixprime                                                         | 
 shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                 | 
