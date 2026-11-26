@@ -7,7 +7,7 @@ Name                 | GitHub ID                                                
 -------------------- | ------------------------------------------------------------ | -------------------- | ----------------------------------------------------------------------------------------
 Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp, shim
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | checkpointing, gofer, mm, platforms, sentry, vfs
-Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks, kubernetes
+Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, kubernetes
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | checkpointing, gofer, gpu, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | networking
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, kubernetes, observability, release_pipeline, runsc*, seccomp*, shim, website
@@ -15,7 +15,7 @@ Lucas Manning        | [@manninglucas](https://github.com/manninglucas)         
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | platforms
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | 
-Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | runsc
+Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, runsc
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
 Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, runsc
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, release_pipeline*
@@ -23,7 +23,7 @@ Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)             
 Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability, runsc
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | 
-Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | 
+Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks
 
 ## Specialization areas
 
@@ -38,7 +38,7 @@ owners have confirmed the list and landed the area's standards.
 
 Area             | Owners        | Approvers                                                                            | Enforced
 ---------------- | ------------- | ------------------------------------------------------------------------------------ | --------
-benchmarks       |               | @etienneperot @zkoopmans                                                             | 
+benchmarks       | @zkoopmans    | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                | 
 build_tooling    | @relkochta    | @parth-opensrc @relkochta @rexren-gif                                                | 
 checkpointing    |               | @ayushr2 @manninglucas @nixprime                                                     | 
 fuse             |               | @manninglucas                                                                        | 
