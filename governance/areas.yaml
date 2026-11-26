@@ -187,8 +187,8 @@ areas:
       - /pkg/usermem
   - name: networking
     enforced_review: false
-    owners: []
-    approvers: [manninglucas, nybidari]
+    owners: [nybidari]
+    approvers: [carzh, kerumeto, nybidari, parth-opensrc, relkochta, rexren-gif]
     paths:
       - /images/iptables
       - /images/nftables
@@ -205,6 +205,26 @@ areas:
       - /test/packetdrill
       - /test/packetimpact
       - /test/rtnetlink
+      - /test/syscalls/linux/accept_bind*
+      - /test/syscalls/linux/base_poll_test*
+      - /test/syscalls/linux/bind*
+      - /test/syscalls/linux/bridge*
+      - /test/syscalls/linux/connect_external*
+      - /test/syscalls/linux/ip6tables*
+      - /test/syscalls/linux/ip_socket_test_util*
+      - /test/syscalls/linux/iptables*
+      - /test/syscalls/linux/network_namespace*
+      - /test/syscalls/linux/packet_*
+      - /test/syscalls/linux/ping_socket*
+      - /test/syscalls/linux/proc_net*
+      - /test/syscalls/linux/raw_socket*
+      - /test/syscalls/linux/readv_socket*
+      - /test/syscalls/linux/sendfile_socket*
+      - /test/syscalls/linux/socket*
+      - /test/syscalls/linux/tcp_socket*
+      - /test/syscalls/linux/tuntap*
+      - /test/syscalls/linux/udp_*
+      - /test/syscalls/linux/unix_domain_socket_test_util*
       - /tools/gvisor2pcap
       - /tools/xdp
   - name: observability

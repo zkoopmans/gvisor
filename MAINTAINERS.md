@@ -9,20 +9,20 @@ Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                 
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | checkpointing, gofer, mm, sentry, vfs
 Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, kubernetes*, shim
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | checkpointing, gofer, gpu, mm, sentry, vfs
-Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | networking, shim
+Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, kubernetes, observability, release_pipeline, runsc*, seccomp*, shim, website
-Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing, fuse, gofer, networking, runsc, sandboxexec, sentry, tpu, vfs
+Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing, fuse, gofer, runsc, sandboxexec, sentry, tpu, vfs
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | platforms*
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | 
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, kubernetes, platforms, runsc
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
-Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, runsc
-Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, release_pipeline*
-Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, observability, runsc
+Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, networking, runsc
+Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, networking, release_pipeline*
+Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, networking, observability, runsc
 Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability*, runsc, shim
-Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | runsc, sandboxexec
-Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | platforms
+Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec
+Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | networking, platforms
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, kubernetes
 
 ## Specialization areas
@@ -47,7 +47,7 @@ gpu              |                     | @ayushr2 @parth-opensrc                
 kubernetes       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                | 
 libs             |                     |                                                                                      | 
 mm               |                     | @ayushr2 @nixprime                                                                   | 
-networking       |                     | @manninglucas @nybidari                                                              | 
+networking       | @nybidari           | @carzh @kerumeto @nybidari @parth-opensrc @relkochta @rexren-gif                     | 
 observability    | @xinzhong           | @etienneperot @fvoznika @rexren-gif @xinzhong                                        | 
 platforms        | @konstantin-s-bogom | @aaltinaydev @kerumeto @konstantin-s-bogom                                           | 
 release_pipeline | @relkochta          | @etienneperot @relkochta                                                             | yes
