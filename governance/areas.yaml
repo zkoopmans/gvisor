@@ -112,8 +112,8 @@ areas:
       - /tools/nvidia_driver_differ
   - name: kubernetes
     enforced_review: false
-    owners: []
-    approvers: [etienneperot, zkoopmans]
+    owners: [zkoopmans]
+    approvers: [aaltinaydev, etienneperot, riverafernando, zkoopmans]
     paths:
       - /test/kubernetes
       - /tools/gvisor_k8s_tool
