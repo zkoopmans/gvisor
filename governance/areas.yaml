@@ -39,8 +39,8 @@ areas:
       - /tools/profiletool
   - name: build_tooling
     enforced_review: false
-    owners: []
-    approvers: []
+    owners: [relkochta]
+    approvers: [parth-opensrc, relkochta, rexren-gif]
     paths:
       - /tools/actionlint
       - /tools/bazeldefs

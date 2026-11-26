@@ -17,9 +17,9 @@ Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bog
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | 
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | runsc
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
-Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | gpu, runsc
-Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | release_pipeline*
-Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | runsc
+Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, runsc
+Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, release_pipeline*
+Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, runsc
 Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability, runsc
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | 
@@ -39,7 +39,7 @@ owners have confirmed the list and landed the area's standards.
 Area             | Owners        | Approvers                                                                            | Enforced
 ---------------- | ------------- | ------------------------------------------------------------------------------------ | --------
 benchmarks       |               | @etienneperot @zkoopmans                                                             | 
-build_tooling    |               |                                                                                      | 
+build_tooling    | @relkochta    | @parth-opensrc @relkochta @rexren-gif                                                | 
 checkpointing    |               | @ayushr2 @manninglucas @nixprime                                                     | 
 fuse             |               | @manninglucas                                                                        | 
 gofer            |               | @ayushr2 @manninglucas @nixprime                                                     | 
