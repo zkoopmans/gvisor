@@ -341,8 +341,8 @@ areas:
     # subtrees below are listed for legibility; /pkg/sentry already covers
     # them.
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, manninglucas, nixprime]
+    owners: [fvoznika]
+    approvers: [ayushr2, fvoznika, konstantin-s-bogom, milantracy, nixprime, parth-opensrc, shailend-g, xinzhong]
     paths:
       - /pkg/atomicbitops
       - /pkg/sentry
@@ -356,6 +356,46 @@ areas:
       - /pkg/sleep
       - /pkg/sync
       - /pkg/syncevent
+      - /test/syscalls/linux/alarm*
+      - /test/syscalls/linux/bad*
+      - /test/syscalls/linux/capabilities*
+      - /test/syscalls/linux/cgroup*
+      - /test/syscalls/linux/clock_*
+      - /test/syscalls/linux/concurrency*
+      - /test/syscalls/linux/exec*
+      - /test/syscalls/linux/exit*
+      - /test/syscalls/linux/fork*
+      - /test/syscalls/linux/futex*
+      - /test/syscalls/linux/getrandom*
+      - /test/syscalls/linux/getrusage*
+      - /test/syscalls/linux/itimer*
+      - /test/syscalls/linux/kill*
+      - /test/syscalls/linux/landlock*
+      - /test/syscalls/linux/pause*
+      - /test/syscalls/linux/personality*
+      - /test/syscalls/linux/pidfd*
+      - /test/syscalls/linux/prctl*
+      - /test/syscalls/linux/priority*
+      - /test/syscalls/linux/rlimits*
+      - /test/syscalls/linux/rtsignal*
+      - /test/syscalls/linux/sched*
+      - /test/syscalls/linux/seccomp*
+      - /test/syscalls/linux/setgid*
+      - /test/syscalls/linux/setns*
+      - /test/syscalls/linux/sigaction*
+      - /test/syscalls/linux/sigprocmask*
+      - /test/syscalls/linux/sigstop*
+      - /test/syscalls/linux/sigtimedwait*
+      - /test/syscalls/linux/sysinfo*
+      - /test/syscalls/linux/syslog*
+      - /test/syscalls/linux/tgkill*
+      - /test/syscalls/linux/time*
+      - /test/syscalls/linux/tkill*
+      - /test/syscalls/linux/uidgid*
+      - /test/syscalls/linux/uname*
+      - /test/syscalls/linux/unshare*
+      - /test/syscalls/linux/vfork*
+      - /test/syscalls/linux/wait*
       - /vdso
   - name: shim
     enforced_review: false

@@ -5,22 +5,22 @@ The current maintainers of the gVisor project are listed below.
 
 Name                 | GitHub ID                                                    | Company/Organization | Areas (* = owner)
 -------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------
-Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp
+Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp, sentry*
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, gpu, mm*, sentry, vfs*
 Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, gofer, gpu, kubernetes*, libs, shim, vfs
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer*, gpu*, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
-Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, sentry, tpu*, vfs
-Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
-Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | mm, platforms*
+Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, tpu*, vfs
+Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, sentry, shim*, tpu
+Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | mm, platforms*, sentry
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing, gpu, tpu
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, gpu, kubernetes, libs*, platforms, runsc, tpu
-Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
-Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, libs, networking, runsc
+Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | sentry
+Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, libs, networking, runsc, sentry
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, libs, networking, release_pipeline*
 Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, libs, networking, observability, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, libs, observability*, runsc, shim, vfs
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, libs, observability*, runsc, sentry, shim, vfs
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | gpu, mm, networking, platforms
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, checkpointing, kubernetes
@@ -36,30 +36,30 @@ before merge (see CODEOWNERS): either because it is security- or
 release-sensitive and its approver list is deliberately short, or because its
 owners have confirmed the list and landed the area's standards.
 
-Area             | Owners              | Approvers                                                                                | Enforced
----------------- | ------------------- | ---------------------------------------------------------------------------------------- | --------
-benchmarks       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                    | 
-build_tooling    | @relkochta          | @parth-opensrc @relkochta @rexren-gif                                                    | 
-checkpointing    | @manninglucas       | @aaltinaydev @etienneperot @manninglucas @nybidari @rexren-gif @riverafernando @trantoji | 
-fuse             | @manninglucas       | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                    | 
-gofer            | @ayushr2            | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                    | 
-gpu              | @ayushr2            | @aaltinaydev @ayushr2 @kerumeto @nixprime @parth-opensrc @trantoji @zkoopmans            | 
-kubernetes       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                    | 
-libs             | @aaltinaydev        | @aaltinaydev @parth-opensrc @relkochta @rexren-gif @xinzhong @zkoopmans                  | 
-mm               | @nixprime           | @ayushr2 @kerumeto @konstantin-s-bogom @nixprime                                         | 
-networking       | @nybidari           | @carzh @kerumeto @nybidari @parth-opensrc @relkochta @rexren-gif                         | 
-observability    | @xinzhong           | @etienneperot @fvoznika @rexren-gif @xinzhong                                            | 
-platforms        | @konstantin-s-bogom | @aaltinaydev @kerumeto @konstantin-s-bogom                                               | 
-release_pipeline | @relkochta          | @etienneperot @relkochta                                                                 | yes
-runsc            | @etienneperot       | @aaltinaydev @carzh @etienneperot @manninglucas @parth-opensrc @rexren-gif @xinzhong     | 
-sandboxexec      | @manninglucas       | @carzh @etienneperot @manninglucas @milantracy                                           | 
-seccomp          | @etienneperot       | @etienneperot @fvoznika                                                                  | yes
-sentry           |                     | @ayushr2 @manninglucas @nixprime                                                         | 
-shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                 | 
-tests            |                     |                                                                                          | 
-tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                         | 
-vfs              | @nixprime           | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                    | 
-website          |                     | @etienneperot                                                                            | 
+Area             | Owners              | Approvers                                                                                         | Enforced
+---------------- | ------------------- | ------------------------------------------------------------------------------------------------- | --------
+benchmarks       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                             | 
+build_tooling    | @relkochta          | @parth-opensrc @relkochta @rexren-gif                                                             | 
+checkpointing    | @manninglucas       | @aaltinaydev @etienneperot @manninglucas @nybidari @rexren-gif @riverafernando @trantoji          | 
+fuse             | @manninglucas       | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                             | 
+gofer            | @ayushr2            | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                             | 
+gpu              | @ayushr2            | @aaltinaydev @ayushr2 @kerumeto @nixprime @parth-opensrc @trantoji @zkoopmans                     | 
+kubernetes       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                             | 
+libs             | @aaltinaydev        | @aaltinaydev @parth-opensrc @relkochta @rexren-gif @xinzhong @zkoopmans                           | 
+mm               | @nixprime           | @ayushr2 @kerumeto @konstantin-s-bogom @nixprime                                                  | 
+networking       | @nybidari           | @carzh @kerumeto @nybidari @parth-opensrc @relkochta @rexren-gif                                  | 
+observability    | @xinzhong           | @etienneperot @fvoznika @rexren-gif @xinzhong                                                     | 
+platforms        | @konstantin-s-bogom | @aaltinaydev @kerumeto @konstantin-s-bogom                                                        | 
+release_pipeline | @relkochta          | @etienneperot @relkochta                                                                          | yes
+runsc            | @etienneperot       | @aaltinaydev @carzh @etienneperot @manninglucas @parth-opensrc @rexren-gif @xinzhong              | 
+sandboxexec      | @manninglucas       | @carzh @etienneperot @manninglucas @milantracy                                                    | 
+seccomp          | @etienneperot       | @etienneperot @fvoznika                                                                           | yes
+sentry           | @fvoznika           | @ayushr2 @fvoznika @konstantin-s-bogom @milantracy @nixprime @parth-opensrc @shailend-g @xinzhong | 
+shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                          | 
+tests            |                     |                                                                                                   | 
+tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                                  | 
+vfs              | @nixprime           | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                             | 
+website          |                     | @etienneperot                                                                                     | 
 
 ## Emeritus Maintainers
 
