@@ -226,8 +226,8 @@ areas:
       - /tools/tracereplay
   - name: platforms
     enforced_review: false
-    owners: []
-    approvers: [konstantin-s-bogom, nixprime]
+    owners: [konstantin-s-bogom]
+    approvers: [aaltinaydev, kerumeto, konstantin-s-bogom]
     paths:
       - /pkg/ring0
       - /pkg/sentry/platform
@@ -236,6 +236,22 @@ areas:
       - /pkg/sentry/platform/slimvm
       - /pkg/sentry/platform/systrap
       - /pkg/sigframe
+      - /test/syscalls/linux/32bit*
+      - /test/syscalls/linux/affinity*
+      - /test/syscalls/linux/arch_prctl*
+      - /test/syscalls/linux/exceptions*
+      - /test/syscalls/linux/fpsig*
+      - /test/syscalls/linux/fpstate*
+      - /test/syscalls/linux/getcpu*
+      - /test/syscalls/linux/kcov*
+      - /test/syscalls/linux/pointer_auth*
+      - /test/syscalls/linux/ptrace*
+      - /test/syscalls/linux/rseq*
+      - /test/syscalls/linux/sigaltstack*
+      - /test/syscalls/linux/sigreturn*
+      - /test/syscalls/linux/sysret*
+      - /test/syscalls/linux/vdso*
+      - /test/syscalls/linux/vsyscall*
   - name: release_pipeline
     # Sensitive: builds and signs what users run. Short list by design.
     enforced_review: true
