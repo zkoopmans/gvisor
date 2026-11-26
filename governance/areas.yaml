@@ -248,8 +248,8 @@ areas:
       - /tools/github
   - name: runsc
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, etienneperot, fvoznika, manninglucas]
+    owners: [etienneperot]
+    approvers: [aaltinaydev, carzh, etienneperot, manninglucas, parth-opensrc, rexren-gif, xinzhong]
     paths:
       - /runsc
       - /runsc/container
