@@ -209,8 +209,8 @@ areas:
       - /tools/xdp
   - name: observability
     enforced_review: false
-    owners: []
-    approvers: [etienneperot, fvoznika, xinzhong]
+    owners: [xinzhong]
+    approvers: [etienneperot, fvoznika, rexren-gif, xinzhong]
     paths:
       - /examples/seccheck
       - /pkg/eventchannel

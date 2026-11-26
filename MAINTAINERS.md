@@ -19,8 +19,8 @@ Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)           
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
 Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, runsc
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, release_pipeline*
-Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability, runsc, shim
+Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, observability, runsc
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | observability*, runsc, shim
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | 
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, kubernetes
@@ -48,7 +48,7 @@ kubernetes       | @zkoopmans    | @aaltinaydev @etienneperot @riverafernando @z
 libs             |               |                                                                                      | 
 mm               |               | @ayushr2 @nixprime                                                                   | 
 networking       |               | @manninglucas @nybidari                                                              | 
-observability    |               | @etienneperot @fvoznika @xinzhong                                                    | 
+observability    | @xinzhong     | @etienneperot @fvoznika @rexren-gif @xinzhong                                        | 
 platforms        |               | @konstantin-s-bogom @nixprime                                                        | 
 release_pipeline | @relkochta    | @etienneperot @relkochta                                                             | yes
 runsc            | @etienneperot | @aaltinaydev @carzh @etienneperot @manninglucas @parth-opensrc @rexren-gif @xinzhong | 
