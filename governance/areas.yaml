@@ -91,13 +91,18 @@ areas:
   - name: gofer
     # Host boundary: the gofer protocol (lisafs/p9), the gofer process, and its client.
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, manninglucas, nixprime]
+    owners: [ayushr2]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /pkg/lisafs
       - /pkg/p9
       - /pkg/sentry/fsimpl/gofer
       - /runsc/gofer
+      - /test/syscalls/linux/chroot*
+      - /test/syscalls/linux/host_pty*
+      - /test/syscalls/linux/mount*
+      - /test/syscalls/linux/overlay*
+      - /test/syscalls/linux/pivot_root*
   - name: gpu
     enforced_review: false
     owners: []
