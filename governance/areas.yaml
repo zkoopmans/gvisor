@@ -126,8 +126,8 @@ areas:
       - /webhook
   - name: libs
     enforced_review: false
-    owners: []
-    approvers: []
+    owners: [aaltinaydev]
+    approvers: [aaltinaydev, parth-opensrc, relkochta, rexren-gif, xinzhong, zkoopmans]
     paths:
       - /pkg/abi
       - /pkg/binary

@@ -7,7 +7,7 @@ Name                 | GitHub ID                                                
 -------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------
 Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, gpu, mm*, sentry, vfs*
-Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, gofer, gpu, kubernetes*, shim, vfs
+Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, gofer, gpu, kubernetes*, libs, shim, vfs
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer*, gpu*, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
@@ -15,12 +15,12 @@ Lucas Manning        | [@manninglucas](https://github.com/manninglucas)         
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | mm, platforms*
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing, gpu, tpu
-Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, gpu, kubernetes, platforms, runsc, tpu
+Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, gpu, kubernetes, libs*, platforms, runsc, tpu
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
-Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, networking, runsc
-Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, networking, release_pipeline*
-Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, networking, observability, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, observability*, runsc, shim, vfs
+Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, libs, networking, runsc
+Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, libs, networking, release_pipeline*
+Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, libs, networking, observability, runsc
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, libs, observability*, runsc, shim, vfs
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | gpu, mm, networking, platforms
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, checkpointing, kubernetes
@@ -45,7 +45,7 @@ fuse             | @manninglucas       | @ayushr2 @manninglucas @nixprime @xinzh
 gofer            | @ayushr2            | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                    | 
 gpu              | @ayushr2            | @aaltinaydev @ayushr2 @kerumeto @nixprime @parth-opensrc @trantoji @zkoopmans            | 
 kubernetes       | @zkoopmans          | @aaltinaydev @etienneperot @riverafernando @zkoopmans                                    | 
-libs             |                     |                                                                                          | 
+libs             | @aaltinaydev        | @aaltinaydev @parth-opensrc @relkochta @rexren-gif @xinzhong @zkoopmans                  | 
 mm               | @nixprime           | @ayushr2 @kerumeto @konstantin-s-bogom @nixprime                                         | 
 networking       | @nybidari           | @carzh @kerumeto @nybidari @parth-opensrc @relkochta @rexren-gif                         | 
 observability    | @xinzhong           | @etienneperot @fvoznika @rexren-gif @xinzhong                                            | 
