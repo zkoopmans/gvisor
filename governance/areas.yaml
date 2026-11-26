@@ -523,7 +523,7 @@ areas:
     # and accuracy. The owner holds no other area.
     enforced_review: false
     owners: []
-    approvers: [etienneperot]
+    approvers: [etienneperot, konstantin-s-bogom, zkoopmans]
     paths:
       - /g3doc
       - /images/jekyll

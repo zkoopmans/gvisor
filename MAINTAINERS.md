@@ -7,13 +7,13 @@ Name                 | GitHub ID                                                
 -------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------
 Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp, sentry*
 Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, gpu, mm*, sentry, vfs*
-Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, gofer, gpu, kubernetes*, libs, shim, vfs
+Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, gofer, gpu, kubernetes*, libs, shim, vfs, website
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer*, gpu*, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
 Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, tpu*, vfs
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, sentry, shim*, tpu
-Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | mm, platforms*, sentry
+Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | mm, platforms*, sentry, website
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing, gpu, tpu
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, gpu, kubernetes, libs*, platforms, runsc, tpu
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | sentry
@@ -59,7 +59,7 @@ shim             | @milantracy         | @etienneperot @milantracy @nybidari @xi
 tests            |                     | @carzh @parth-opensrc @relkochta @rexren-gif @xinzhong                                            | 
 tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                                  | 
 vfs              | @nixprime           | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                             | 
-website          |                     | @etienneperot                                                                                     | 
+website          |                     | @etienneperot @konstantin-s-bogom @zkoopmans                                                      | 
 
 ## Emeritus Maintainers
 
