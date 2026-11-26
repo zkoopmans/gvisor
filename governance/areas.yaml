@@ -174,8 +174,8 @@ areas:
       - /pkg/zip
   - name: mm
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, nixprime]
+    owners: [nixprime]
+    approvers: [ayushr2, kerumeto, konstantin-s-bogom, nixprime]
     paths:
       - /pkg/memutil
       - /pkg/safecopy
@@ -186,6 +186,22 @@ areas:
       - /pkg/sentry/pgalloc
       - /pkg/sentry/usage
       - /pkg/usermem
+      - /test/syscalls/linux/brk*
+      - /test/syscalls/linux/fault*
+      - /test/syscalls/linux/madvise*
+      - /test/syscalls/linux/membarrier*
+      - /test/syscalls/linux/memfd*
+      - /test/syscalls/linux/memory_accounting*
+      - /test/syscalls/linux/mempolicy*
+      - /test/syscalls/linux/mincore*
+      - /test/syscalls/linux/mlock*
+      - /test/syscalls/linux/mmap*
+      - /test/syscalls/linux/mremap*
+      - /test/syscalls/linux/msync*
+      - /test/syscalls/linux/munmap*
+      - /test/syscalls/linux/partial_bad_buffer*
+      - /test/syscalls/linux/process_vm_read_write*
+      - /test/syscalls/linux/shm*
   - name: networking
     enforced_review: false
     owners: [nybidari]
