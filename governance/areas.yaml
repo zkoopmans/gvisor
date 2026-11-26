@@ -378,8 +378,8 @@ areas:
       - /test/util
   - name: tpu
     enforced_review: false
-    owners: []
-    approvers: [manninglucas, milantracy]
+    owners: [manninglucas]
+    approvers: [aaltinaydev, manninglucas, milantracy, trantoji]
     paths:
       - /images/tpu
       - /pkg/sentry/devices/tpuproxy

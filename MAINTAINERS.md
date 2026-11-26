@@ -11,11 +11,11 @@ Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)               
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer, gpu, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
-Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, sentry, tpu, vfs
+Lucas Manning        | [@manninglucas](https://github.com/manninglucas)             | Google               | checkpointing*, fuse*, gofer, runsc, sandboxexec*, sentry, tpu*, vfs
 Jing Chen            | [@milantracy](https://github.com/milantracy)                 | Google               | sandboxexec, shim*, tpu
 Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bogom) | Google               | platforms*
-Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing
-Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, kubernetes, platforms, runsc
+Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing, tpu
+Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, kubernetes, platforms, runsc, tpu
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | 
 Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, networking, runsc
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, networking, release_pipeline*
@@ -57,7 +57,7 @@ seccomp          | @etienneperot       | @etienneperot @fvoznika                
 sentry           |                     | @ayushr2 @manninglucas @nixprime                                                         | 
 shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                 | 
 tests            |                     |                                                                                          | 
-tpu              |                     | @manninglucas @milantracy                                                                | 
+tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                         | 
 vfs              |                     | @ayushr2 @manninglucas @nixprime                                                         | 
 website          |                     | @etienneperot                                                                            | 
 
