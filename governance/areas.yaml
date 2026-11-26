@@ -81,12 +81,13 @@ areas:
       - /tools/go_stateify
   - name: fuse
     enforced_review: false
-    owners: []
-    approvers: [manninglucas]
+    owners: [manninglucas]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /images/fuse
       - /pkg/sentry/fsimpl/fuse
       - /test/fuse_host
+      - /test/syscalls/linux/fuse*
   - name: gofer
     # Host boundary: the gofer protocol (lisafs/p9), the gofer process, and its client.
     enforced_review: false
