@@ -6,8 +6,8 @@ The current maintainers of the gVisor project are listed below.
 Name                 | GitHub ID                                                    | Company/Organization | Areas (* = owner)
 -------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------
 Fabricio Voznika     | [@fvoznika](https://github.com/fvoznika)                     | Google               | observability, seccomp
-Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, mm*, sentry, vfs
-Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, kubernetes*, shim
+Jamie Liu            | [@nixprime](https://github.com/nixprime)                     | Google               | fuse, gofer, mm*, sentry, vfs*
+Zach Koopmans        | [@zkoopmans](https://github.com/zkoopmans)                   | Google               | benchmarks*, fuse, kubernetes*, shim, vfs
 Ayush Ranjan         | [@ayushr2](https://github.com/ayushr2)                       | Modal                | fuse, gofer, gpu, mm, sentry, vfs
 Nayana Bidari        | [@nybidari](https://github.com/nybidari)                     | Google               | checkpointing, networking*, shim
 Etienne Perot        | [@etienneperot](https://github.com/etienneperot)             | Google               | benchmarks, checkpointing, kubernetes, observability, release_pipeline, runsc*, sandboxexec, seccomp*, shim, website
@@ -20,7 +20,7 @@ Shailend Chand       | [@shailend-g](https://github.com/shailend-g)             
 Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, networking, runsc
 Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, networking, release_pipeline*
 Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, networking, observability, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, observability*, runsc, shim
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, observability*, runsc, shim, vfs
 Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | mm, networking, platforms
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, checkpointing, kubernetes
@@ -58,7 +58,7 @@ sentry           |                     | @ayushr2 @manninglucas @nixprime       
 shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                 | 
 tests            |                     |                                                                                          | 
 tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                         | 
-vfs              |                     | @ayushr2 @manninglucas @nixprime                                                         | 
+vfs              | @nixprime           | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                    | 
 website          |                     | @etienneperot                                                                            | 
 
 ## Emeritus Maintainers

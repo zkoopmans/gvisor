@@ -403,8 +403,8 @@ areas:
       - /tools/tpu
   - name: vfs
     enforced_review: false
-    owners: []
-    approvers: [ayushr2, manninglucas, nixprime]
+    owners: [nixprime]
+    approvers: [ayushr2, manninglucas, nixprime, xinzhong, zkoopmans]
     paths:
       - /pkg/erofs
       - /pkg/fspath
@@ -413,6 +413,66 @@ areas:
       - /pkg/sentry/fsutil
       - /pkg/sentry/vfs
       - /test/fsstress
+      - /test/syscalls/linux/access*
+      - /test/syscalls/linux/aio*
+      - /test/syscalls/linux/chdir*
+      - /test/syscalls/linux/chmod*
+      - /test/syscalls/linux/chown*
+      - /test/syscalls/linux/close_range*
+      - /test/syscalls/linux/copy_file_range*
+      - /test/syscalls/linux/creat*
+      - /test/syscalls/linux/deleted*
+      - /test/syscalls/linux/dev*
+      - /test/syscalls/linux/dup*
+      - /test/syscalls/linux/epoll*
+      - /test/syscalls/linux/eventfd*
+      - /test/syscalls/linux/fadvise64*
+      - /test/syscalls/linux/fallocate*
+      - /test/syscalls/linux/fchdir*
+      - /test/syscalls/linux/fcntl*
+      - /test/syscalls/linux/fifo*
+      - /test/syscalls/linux/file_base*
+      - /test/syscalls/linux/flock*
+      - /test/syscalls/linux/fsync*
+      - /test/syscalls/linux/getdents*
+      - /test/syscalls/linux/inotify*
+      - /test/syscalls/linux/io_uring*
+      - /test/syscalls/linux/ioctl*
+      - /test/syscalls/linux/keys*
+      - /test/syscalls/linux/link*
+      - /test/syscalls/linux/lseek*
+      - /test/syscalls/linux/mkdir*
+      - /test/syscalls/linux/mknod*
+      - /test/syscalls/linux/mq*
+      - /test/syscalls/linux/msgqueue*
+      - /test/syscalls/linux/open*
+      - /test/syscalls/linux/pipe*
+      - /test/syscalls/linux/poll*
+      - /test/syscalls/linux/posix_acl*
+      - /test/syscalls/linux/ppoll*
+      - /test/syscalls/linux/pread*
+      - /test/syscalls/linux/proc*
+      - /test/syscalls/linux/pselect*
+      - /test/syscalls/linux/pty*
+      - /test/syscalls/linux/pwrite*
+      - /test/syscalls/linux/read*
+      - /test/syscalls/linux/rename*
+      - /test/syscalls/linux/select*
+      - /test/syscalls/linux/semaphore*
+      - /test/syscalls/linux/sendfile*
+      - /test/syscalls/linux/signalfd*
+      - /test/syscalls/linux/splice*
+      - /test/syscalls/linux/stat*
+      - /test/syscalls/linux/sticky*
+      - /test/syscalls/linux/symlink*
+      - /test/syscalls/linux/sync*
+      - /test/syscalls/linux/sysfs*
+      - /test/syscalls/linux/timerfd*
+      - /test/syscalls/linux/truncate*
+      - /test/syscalls/linux/unlink*
+      - /test/syscalls/linux/utimes*
+      - /test/syscalls/linux/write*
+      - /test/syscalls/linux/xattr*
   - name: website
     # Not a code area: the owner is the product lead; review is about message
     # and accuracy. The owner holds no other area.
