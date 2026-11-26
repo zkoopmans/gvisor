@@ -407,7 +407,7 @@ areas:
   - name: tests
     enforced_review: false
     owners: []
-    approvers: []
+    approvers: [carzh, parth-opensrc, relkochta, rexren-gif, xinzhong]
     paths:
       - /images/arch-systemd
       - /images/arm-qemu

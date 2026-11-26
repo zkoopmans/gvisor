@@ -17,11 +17,11 @@ Konstantin Bogomolov | [@konstantin-s-bogom](https://github.com/konstantin-s-bog
 Jimmy Tran           | [@trantoji](https://github.com/trantoji)                     | Google               | checkpointing, gpu, tpu
 Anil Altinay         | [@aaltinaydev](https://github.com/aaltinaydev)               | Google               | benchmarks, checkpointing, gpu, kubernetes, libs*, platforms, runsc, tpu
 Shailend Chand       | [@shailend-g](https://github.com/shailend-g)                 | Google               | sentry
-Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, libs, networking, runsc, sentry
-Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, libs, networking, release_pipeline*
-Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, libs, networking, observability, runsc
-Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, libs, observability*, runsc, sentry, shim, vfs
-Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec
+Parth Sarthi         | [@parth-opensrc](https://github.com/parth-opensrc)           | Google               | build_tooling, gpu, libs, networking, runsc, sentry, tests
+Ryan El Kochta       | [@relkochta](https://github.com/relkochta)                   | Google               | build_tooling*, libs, networking, release_pipeline*, tests
+Rex Ren              | [@rexren-gif](https://github.com/rexren-gif)                 | Google               | build_tooling, checkpointing, libs, networking, observability, runsc, tests
+Xin Zhong            | [@xinzhong](https://github.com/xinzhong)                     | Google               | fuse, gofer, libs, observability*, runsc, sentry, shim, tests, vfs
+Caroline Zhu         | [@carzh](https://github.com/carzh)                           | Google               | networking, runsc, sandboxexec, tests
 Alexander Cueva      | [@kerumeto](https://github.com/kerumeto)                     | Google               | gpu, mm, networking, platforms
 Fernando Rivera      | [@riverafernando](https://github.com/riverafernando)         | Google               | benchmarks, checkpointing, kubernetes
 
@@ -56,7 +56,7 @@ sandboxexec      | @manninglucas       | @carzh @etienneperot @manninglucas @mil
 seccomp          | @etienneperot       | @etienneperot @fvoznika                                                                           | yes
 sentry           | @fvoznika           | @ayushr2 @fvoznika @konstantin-s-bogom @milantracy @nixprime @parth-opensrc @shailend-g @xinzhong | 
 shim             | @milantracy         | @etienneperot @milantracy @nybidari @xinzhong @zkoopmans                                          | 
-tests            |                     |                                                                                                   | 
+tests            |                     | @carzh @parth-opensrc @relkochta @rexren-gif @xinzhong                                            | 
 tpu              | @manninglucas       | @aaltinaydev @manninglucas @milantracy @trantoji                                                  | 
 vfs              | @nixprime           | @ayushr2 @manninglucas @nixprime @xinzhong @zkoopmans                                             | 
 website          |                     | @etienneperot                                                                                     | 
